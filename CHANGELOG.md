@@ -13,6 +13,11 @@ All notable changes to this project are documented here. The format is based on
   construction (only `(task → clean result)` records; no sub-agent transcript can leak in).
 - **Clarify fork.** Sub-agents ask clarifying questions answered in parallel by isolated forks seeded
   with a compacted snapshot of the master context, folded into one self-contained refined prompt.
+- **Auto-compaction.** Once a ReAct sub-agent's transcript passes a token budget
+  (`compaction_token_threshold`, default 150k), a `pre_model_hook` feeds the model the base prompt +
+  a running summary of what has been done + the recent turns, so a long exploitation runs to
+  completion instead of overflowing the context window. The full transcript stays in state, so the
+  finding-harvest never loses a `report_finding` artifact.
 - **Continuation judge.** When the master would naturally stop (planner out of work), a judge agent
   decides autonomously whether the engagement is genuinely complete or should push further — replacing
   the human "here is what I did; want me to continue?" prompt — and injects concrete follow-up tasks

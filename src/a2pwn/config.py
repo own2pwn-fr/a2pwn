@@ -85,6 +85,10 @@ class A2pwnConfig(BaseModel):
     # whether the engagement is genuinely complete or should push further. This caps how many times
     # the judge may override "done" and re-open the engagement, so it cannot loop forever.
     max_continuations: int = 2
+    # Auto-compaction: once a ReAct sub-agent's transcript passes this many approx tokens, feed the
+    # model the base prompt + a running summary + recent turns so a long exploitation runs to
+    # completion instead of overflowing the context window. 0 disables it.
+    compaction_token_threshold: int = 150_000
     checkpoint_uri: str | None = None  # None => SqliteSaver default box path
     # One-time authorization acknowledgement (the CLI ToS gate). Distinct from per-dispatch approval.
     disclaimer_ack: bool = False

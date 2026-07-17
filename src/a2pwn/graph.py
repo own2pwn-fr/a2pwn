@@ -448,8 +448,10 @@ def build_subagent_graph(
 ) -> CompiledStateGraph:
     """Compile the stateless sub-agent subgraph (``checkpointer=False`` HARD)."""
     clarifier = build_clarifier(cfg.models)
-    executor = build_executor(cfg.models, tools, _active_tools(cfg, tools))
-    verifier = build_verifier(cfg.models, tools)
+    executor = build_executor(
+        cfg.models, tools, _active_tools(cfg, tools), cfg.compaction_token_threshold
+    )
+    verifier = build_verifier(cfg.models, tools, cfg.compaction_token_threshold)
     fbm = FlowBatchManager(client)
 
     def _clarify(state: SubAgentState) -> dict:

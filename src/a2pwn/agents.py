@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 import a2pwn.prompts as P
 from a2pwn.backends import make_model
+from a2pwn.compaction import make_compaction_hook
 from a2pwn.config import RoleModels
 from a2pwn.models import MasterContextView, QAPair
 
@@ -61,7 +62,10 @@ def build_clarifier(cfg: RoleModels) -> Runnable:
 
 
 def build_executor(
-    cfg: RoleModels, tools: list[BaseTool], active_exploit_tools: list[str]
+    cfg: RoleModels,
+    tools: list[BaseTool],
+    active_exploit_tools: list[str],
+    compaction_tokens: int = 150_000,
 ) -> CompiledStateGraph:
     """ReAct executor.
 
@@ -69,7 +73,8 @@ def build_executor(
     scope/active guard hard-blocks the call), NOT via ``interrupt_before`` — the sub-agent graph is
     compiled ``checkpointer=False`` so an ``interrupt_before`` here could never fire. When active
     exploitation is not authorised we additionally disclose the blocked tools in the prompt so the
-    model does not waste turns attempting them.
+    model does not waste turns attempting them. A ``pre_model_hook`` auto-compacts the transcript
+    past ``compaction_tokens`` so a long exploitation runs to completion.
     """
     prompt = P.EXECUTOR_SYS
     if active_exploit_tools:
@@ -78,20 +83,26 @@ def build_executor(
             "\n\nACTIVE EXPLOITATION IS NOT AUTHORISED for this engagement. The following tools are "
             f"hard-blocked at the tool layer and MUST NOT be called: {blocked}."
         )
+    model = make_model(cfg.executor)
     return create_react_agent(
-        make_model(cfg.executor),
+        model,
         tools=tools,
         prompt=prompt,
+        pre_model_hook=make_compaction_hook(model, max_tokens=compaction_tokens),
         name="executor",
     )
 
 
-def build_verifier(cfg: RoleModels, tools: list[BaseTool]) -> CompiledStateGraph:
+def build_verifier(
+    cfg: RoleModels, tools: list[BaseTool], compaction_tokens: int = 150_000
+) -> CompiledStateGraph:
     """Adversarial verifier on the Opus-class role-model (distinct from the executor)."""
+    model = make_model(cfg.verifier)
     return create_react_agent(
-        make_model(cfg.verifier),
+        model,
         tools=tools,
         prompt=P.ADVERSARIAL_SYS,
+        pre_model_hook=make_compaction_hook(model, max_tokens=compaction_tokens),
         name="verifier",
     )
 

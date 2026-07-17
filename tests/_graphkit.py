@@ -231,8 +231,8 @@ def build_sub(monkeypatch, cfg, client, *, clarifier, executor, fork=None, colla
     import a2pwn.graph as g
 
     monkeypatch.setattr(g, "build_clarifier", lambda models: clarifier)
-    monkeypatch.setattr(g, "build_executor", lambda models, tools, active: executor)
-    monkeypatch.setattr(g, "build_verifier", lambda models, tools: _Dummy())
+    monkeypatch.setattr(g, "build_executor", lambda models, tools, active, *a: executor)
+    monkeypatch.setattr(g, "build_verifier", lambda models, tools, *a: _Dummy())
     return g.build_subagent_graph(cfg, client, fork or FakeFork(), tools=[], collab=collab)
 
 
