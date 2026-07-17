@@ -126,6 +126,7 @@ def build_executor(
     client: Any = None,
     collab: Any = None,
     skills: list | None = None,
+    max_turns: int = 40,
 ) -> Any:
     """Build the executor. On the ``claude-code`` subscription backend, use the native SDK
     tool-calling loop (:class:`_SdkExecutor`) — prompted-JSON tool-calling makes that model distrust
@@ -136,7 +137,7 @@ def build_executor(
     ``interrupt_before``); we also disclose the blocked tools in the prompt so no turns are wasted.
     """
     if cfg.executor.provider == "claude-code" and client is not None:
-        return _SdkExecutor(cfg, client, collab, skills, active_exploit_tools)
+        return _SdkExecutor(cfg, client, collab, skills, active_exploit_tools, max_turns=max_turns)
     model = make_model(cfg.executor)
     return create_react_agent(
         model,
@@ -203,15 +204,11 @@ class MasterFork:
     async def answer(self, question: str, ctx: MasterContextView) -> QAPair:
         """Answer ONE question re-seeded with the compacted snapshot only."""
         compact = ctx.compact()
-        messages = P.render_messages(
-            P.MASTER_FORK_SYS, {"question": question, "context": compact}
-        )
+        messages = P.render_messages(P.MASTER_FORK_SYS, {"question": question, "context": compact})
         reply = await self._model.ainvoke(messages)
         return QAPair(question=question, answer=_message_text(reply))
 
-    async def answer_all(
-        self, questions: list[str], ctx: MasterContextView
-    ) -> list[QAPair]:
+    async def answer_all(self, questions: list[str], ctx: MasterContextView) -> list[QAPair]:
         """Answer every question in parallel (used outside the graph; in-graph uses Send)."""
         return await asyncio.gather(*[self.answer(q, ctx) for q in questions])
 

@@ -461,6 +461,7 @@ def build_subagent_graph(
         client=client,
         collab=collab,
         skills=skills,
+        max_turns=cfg.executor_max_turns,
     )
     verifier = build_verifier(cfg.models, tools, cfg.compaction_token_threshold)
     fbm = FlowBatchManager(client)

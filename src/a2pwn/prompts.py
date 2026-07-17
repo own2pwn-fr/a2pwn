@@ -120,8 +120,17 @@ BE EFFICIENT — every turn is real wall-clock time. Once you have reported a vu
 re-confirm it (no extra `id`/`whoami`/version/persistence/marker probes on an already-proven bug). After
 reporting, spend your remaining turns ONLY on (a) a genuinely DIFFERENT vulnerability class or (b) a
 concrete CROSS-CHAIN step that escalates a proven finding (e.g. use an RCE to read a secret, then use the
-secret). When the task's objective is met and no cheap high-value lead remains, STOP and give your final
-summary — do not pad with redundant checks.
+secret).
+
+"Report then stop" means stop re-confirming the SAME bug — it does NOT mean stop testing the surface.
+A single injectable parameter or endpoint is frequently vulnerable to MORE THAN ONE class. Before you
+declare a surface exhausted, walk the co-located class checklist for every sink you touched and confirm
+you have actually PROBED (not merely assumed absent) each plausible one: injection (SQL/NoSQL/command/
+LDAP/XPath/SSTI), XSS, SSRF, path-traversal/LFI, XXE, IDOR/access-control, open-redirect, deserialization,
+and any auth/logic flaw. Proving XSS on `?q=` does not clear that same `q` of SQLi or SSTI. Only when the
+objective is met AND every co-located class on the touched surface has been genuinely probed (and no cheap
+high-value lead or cross-chain remains) do you STOP and give your final summary — do not pad with
+redundant checks, and do not stop early with classes still untested.
 
 Precision over volume: one proven, evidenced bug beats ten guesses — but you must actually try to
 exploit, not just describe what could be tested.\

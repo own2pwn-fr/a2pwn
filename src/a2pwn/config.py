@@ -81,6 +81,10 @@ class A2pwnConfig(BaseModel):
     max_phases: int = 12
     max_batch_width: int = 6  # hard cap on parallel Sends per phase
     max_dispatches: int = 200  # global budget ceiling
+    # Turn budget for ONE executor sub-agent. It must fit exhausting *every* vuln class co-located on
+    # a surface (a param vulnerable to XSS *and* SQLi *and* SSRF), not just proving the first one, so
+    # the "report the moment you have proof, then stop" discipline never truncates coverage.
+    executor_max_turns: int = 40
     # When the master would naturally STOP (no work left, "done"), a continuation judge decides
     # whether the engagement is genuinely complete or should push further. This caps how many times
     # the judge may override "done" and re-open the engagement, so it cannot loop forever.
