@@ -23,6 +23,10 @@ from a2pwn.models import FlowBatchRef
 
 _PROTOCOL_VERSION = "2024-11-05"
 _CLIENT_INFO = {"name": "a2pwn", "version": "0.1.0"}
+# Max bytes for a single MCP stdout line. burpwn caps a stored body at ~8 MiB; a req_show can
+# carry request + response bodies plus JSON escaping, so allow generous headroom (64 MiB) above
+# asyncio's default 64 KiB StreamReader limit.
+_STDOUT_LINE_LIMIT = 64 * 1024 * 1024
 
 _log = logging.getLogger("a2pwn.burpwn")
 
@@ -68,9 +72,15 @@ class BurpwnClient:
     single stdout channel stays coherent under concurrent callers.
     """
 
-    def __init__(self, session: str, request_timeout: float | None = None):
+    def __init__(
+        self,
+        session: str,
+        request_timeout: float | None = None,
+        command: list[str] | None = None,
+    ):
         self.session = session
-        self._argv = ["burpwn", "mcp", "--session", session]
+        # Overridable for tests (spawn a fake stdio MCP server); defaults to the real burpwn MCP.
+        self._argv = command or ["burpwn", "mcp", "--session", session]
         self._proc: asyncio.subprocess.Process | None = None
         self._id = 0
         self._req_lock = asyncio.Lock()
@@ -96,6 +106,11 @@ class BurpwnClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # A single MCP response line (e.g. req_show with a full captured response body,
+                # up to burpwn's multi-MiB BODY_CAP, JSON-escaped) far exceeds asyncio's default
+                # 64 KiB StreamReader limit — readline() would raise LimitOverrunError
+                # ("Separator is not found, and chunk exceed the limit") and wedge the tool call.
+                limit=_STDOUT_LINE_LIMIT,
             )
             # Continuously drain stderr so >64KB of burpwn logging cannot fill the OS
             # pipe buffer and wedge the child's stdout responses (pipe-buffer deadlock).
