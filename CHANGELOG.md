@@ -4,13 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-07-17
+
+First release. Validated end to end against the sanctioned BrokenCrystals lab: a single autonomous
+run found, chained and independently verified 11 findings (8 critical / 3 high), led by a
+cross-chained RCE → leaked Keycloak secret → forged admin token → Admin-API takeover.
 
 ### Added
 
 - **Orchestration core.** Two-graph LangGraph design: a dispatch-only `MASTER` and stateless
   `SUB-AGENT` children, with a structural fork boundary that keeps the master history clean by
   construction (only `(task → clean result)` records; no sub-agent transcript can leak in).
+- **Native SDK executor.** On the Claude Code subscription backend the executor drives the target
+  through the `claude-agent-sdk`'s native in-process tool loop (trusted `tool_use`/`tool_result`),
+  so the model exploits to depth instead of treating a replayed text transcript as prompt injection.
+- **Live TUI.** A colored `rich` dashboard (default on an interactive terminal): header with
+  target/model/phase/budget/elapsed, a panel of the concurrent sub-agent dispatches and their current
+  activity, a findings panel that fills in by severity as candidates are confirmed and verified, a
+  live tool-call feed, and a final summary with report/HAR paths. `--plain` for log output.
+- **Docker image.** `own2pwnfr/a2pwn` bundles a2pwn, all deps, the burpwn sandbox and a Claude Code
+  CLI; run with `--privileged` and either a mounted `~/.claude` or an `ANTHROPIC_API_KEY`.
 - **Clarify fork.** Sub-agents ask clarifying questions answered in parallel by isolated forks seeded
   with a compacted snapshot of the master context, folded into one self-contained refined prompt.
 - **Auto-compaction.** Once a ReAct sub-agent's transcript passes a token budget
