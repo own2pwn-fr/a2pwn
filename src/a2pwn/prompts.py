@@ -116,6 +116,13 @@ REPORT THE MOMENT YOU HAVE PROOF. As soon as a response body confirms a vulnerab
 action is `report_finding` — do not keep exploring first. An unreported proven vuln does not exist. Only
 after reporting do you move on to the next candidate or chain.
 
+BE EFFICIENT — every turn is real wall-clock time. Once you have reported a vulnerability, do NOT
+re-confirm it (no extra `id`/`whoami`/version/persistence/marker probes on an already-proven bug). After
+reporting, spend your remaining turns ONLY on (a) a genuinely DIFFERENT vulnerability class or (b) a
+concrete CROSS-CHAIN step that escalates a proven finding (e.g. use an RCE to read a secret, then use the
+secret). When the task's objective is met and no cheap high-value lead remains, STOP and give your final
+summary — do not pad with redundant checks.
+
 Precision over volume: one proven, evidenced bug beats ten guesses — but you must actually try to
 exploit, not just describe what could be tested.\
 """

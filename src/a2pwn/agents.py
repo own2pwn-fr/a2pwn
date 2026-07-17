@@ -81,7 +81,7 @@ class _SdkExecutor:
     transcript as prompt injection (the failure mode of the prompted-JSON path over the subscription).
     """
 
-    def __init__(self, cfg: RoleModels, client, collab, skills, active_exploit_tools, max_turns=40):
+    def __init__(self, cfg: RoleModels, client, collab, skills, active_exploit_tools, max_turns=30):
         self._model = cfg.executor.model or "sonnet"
         self._prompt = _executor_prompt(active_exploit_tools)
         self._client = client
