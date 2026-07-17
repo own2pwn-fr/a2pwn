@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import operator
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -54,6 +55,8 @@ from a2pwn.oracles import VerificationOracle, differential, run_oracle, two_iden
 # The compiled child subgraph, threaded in by ``build_master_graph``. ``run_subagent``
 # references it here so the master graph never wires it as a node (clean-history guard).
 SUBAGENT_GRAPH: CompiledStateGraph | None = None
+
+_log = logging.getLogger("a2pwn")
 
 
 # --------------------------------------------------------------------------- #
@@ -242,7 +245,7 @@ def route_dispatch(state: MasterState) -> list[Send] | str:
 # --------------------------------------------------------------------------- #
 # fork boundary
 # --------------------------------------------------------------------------- #
-def run_subagent(payload: SubAgentInput) -> dict:
+async def run_subagent(payload: SubAgentInput) -> dict:
     """FORK BOUNDARY. Invoke the stateless child and return ONLY curated updates.
 
     The child's clarify Q&A, ReAct transcript, verifier critique and retries live and
@@ -254,7 +257,7 @@ def run_subagent(payload: SubAgentInput) -> dict:
     if sub is None:  # pragma: no cover - build_master_graph always sets it
         raise RuntimeError("SUBAGENT_GRAPH is not initialised; build the master graph first")
     thread_id = f"{payload.master_ctx.engagement.name}:{payload.dispatch_id}"
-    out = sub.invoke(
+    out = await sub.ainvoke(
         {
             "intent": payload.intent,
             "spec": payload.spec,
@@ -355,8 +358,10 @@ def _harvest(messages: list[BaseMessage]) -> tuple[list[Finding], list[FlowBatch
     return findings, batches
 
 
-def _invoke_agent(agent: Any, prompt: str) -> dict:
-    result = agent.invoke({"messages": [HumanMessage(content=prompt)]})
+async def _invoke_agent(agent: Any, prompt: str) -> dict:
+    # Async invocation: the ReAct executor's tools (burpwn/oracle/skill) are async-only,
+    # so the whole sub-agent graph must run async or ToolNode raises on sync invocation.
+    result = await agent.ainvoke({"messages": [HumanMessage(content=prompt)]})
     return result if isinstance(result, dict) else {"messages": []}
 
 
@@ -368,13 +373,12 @@ def _last_text(result: dict) -> str:
     return content if isinstance(content, str) else str(content)
 
 
-def _verifier_notes(verifier: Any, rejected: list[Finding], not_done: list[str]) -> str:
+async def _verifier_notes(verifier: Any, rejected: list[Finding], not_done: list[str]) -> str:
     """Best-effort adversarial narrative from the independent verifier role-model.
 
     The deterministic oracle already decided accept/reject; this only enriches the
     critique text and is skipped whenever the verifier cannot be cheaply invoked."""
-    invoke = getattr(verifier, "invoke", None)
-    if invoke is None or (not rejected and not not_done):
+    if getattr(verifier, "ainvoke", None) is None or (not rejected and not not_done):
         return ""
     prompt = (
         "As the independent adversarial verifier, summarise why these candidates were "
@@ -383,8 +387,8 @@ def _verifier_notes(verifier: Any, rejected: list[Finding], not_done: list[str])
         + "\n".join(f"- {g}" for g in not_done)
     )
     try:
-        return _last_text(_invoke_agent(verifier, prompt))
-    except Exception:
+        return _last_text(await _invoke_agent(verifier, prompt))
+    except Exception:  # noqa: BLE001 - narrative enrichment is best-effort
         return ""
 
 
@@ -404,8 +408,8 @@ def build_subagent_graph(
     def _clarify(state: SubAgentState) -> dict:
         return {"clarify_round": state.get("clarify_round", 0) + 1}
 
-    def _clarify_edge(state: SubAgentState) -> list[Send] | str:
-        questions = clarifier.invoke(_clarify_ctx(state))
+    async def _clarify_edge(state: SubAgentState) -> list[Send] | str:
+        questions = await clarifier.ainvoke(_clarify_ctx(state))
         aug = {
             "questions": list(questions or []),
             "clarify_round": state.get("clarify_round", 0),
@@ -414,8 +418,8 @@ def build_subagent_graph(
         }
         return need_clarify(aug)
 
-    def _answer_one(payload: dict) -> dict:
-        qa = _run(fork.answer(payload["question"], payload["ctx"]))
+    async def _answer_one(payload: dict) -> dict:
+        qa = await fork.answer(payload["question"], payload["ctx"])
         return {"clarifications": [qa]}
 
     def _compose(state: SubAgentState) -> dict:
@@ -443,7 +447,7 @@ def build_subagent_graph(
         )
         return {"refined_prompt": "\n\n".join(lines)}
 
-    def _execute(state: SubAgentState) -> dict:
+    async def _execute(state: SubAgentState) -> dict:
         prompt = state.get("refined_prompt") or state["master_ctx"].objective
         critique = state.get("critique")
         if critique is not None and not critique.accepted:
@@ -452,7 +456,7 @@ def build_subagent_graph(
                 "\n\nVERIFIER REJECTED THE PRIOR ATTEMPT. Address every gap and gather"
                 f" real captured evidence:\n{critique.notes}\n{gaps}"
             )
-        result = _invoke_agent(executor, prompt)
+        result = await _invoke_agent(executor, prompt)
         messages = list(result.get("messages", []))
         findings = list(result.get("candidate_findings", []))
         batches = list(result.get("flow_batches", []))
@@ -488,21 +492,21 @@ def build_subagent_graph(
                 return None
         return None
 
-    def _adjudicate(candidate: Finding) -> tuple[bool, str]:
+    async def _adjudicate(candidate: Finding) -> tuple[bool, str]:
         batch = candidate.flow_batch
         if not batch.flow_ids:
             return False, f"REJECT {candidate.key}: empty flow batch — capture alarm"
-        ok, reason = _run(fbm.assert_capture(batch, batch.exec_ids))
+        ok, reason = await fbm.assert_capture(batch, batch.exec_ids)
         if not ok:
             return False, reason
-        if _run(fbm.tls_passthru_blocked(batch)):
+        if await fbm.tls_passthru_blocked(batch):
             return False, f"BLOCKED {candidate.key}: tls-passthru target — MITM blocked, not testable"
-        res = _run(_maybe_oracle(candidate))
+        res = await _maybe_oracle(candidate)
         if res is not None and not res.confirmed:
             return False, f"REJECT {candidate.key}: oracle {candidate.oracle_kind} did not re-derive ({res.evidence})"
         return True, ""
 
-    def _verify(state: SubAgentState) -> dict:
+    async def _verify(state: SubAgentState) -> dict:
         round_ = state.get("verify_round", 0) + 1
         candidates = state.get("candidate_findings", [])
         confirmed: list[Finding] = []
@@ -510,7 +514,7 @@ def build_subagent_graph(
         not_done: list[str] = []
         capture_ok = True
         for c in candidates:
-            ok, reason = _adjudicate(c)
+            ok, reason = await _adjudicate(c)
             if ok:
                 confirmed.append(c.model_copy(update={"confirmed": True}))
             else:
@@ -521,7 +525,7 @@ def build_subagent_graph(
         accepted = not rejected
         notes = f"verified {len(confirmed)}/{len(candidates)} candidate(s); round {round_}"
         if rejected:
-            adversarial = _verifier_notes(verifier, rejected, not_done)
+            adversarial = await _verifier_notes(verifier, rejected, not_done)
             if adversarial:
                 notes = f"{notes}. {adversarial}"
         report = VerifierReport(
@@ -652,8 +656,12 @@ def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
         }
         messages = P.render_messages(P.MASTER_PLAN_SYS, ctx)
         out = _run(planner.with_structured_output(_PlanOut).ainvoke(messages))
-        return list(out.tasks)
-    except Exception:
+        tasks = list(out.tasks)
+        if not tasks:
+            _log.warning("planner returned no tasks (empty structured output)")
+        return tasks
+    except Exception as exc:
+        _log.warning("planner failed, ending run cleanly: %s", exc, exc_info=True)
         return []
 
 

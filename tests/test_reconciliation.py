@@ -24,13 +24,13 @@ def _payload(cfg, candidate):
     )
 
 
-def test_independent_verify_promotes_to_independently_verified(monkeypatch, fake_client):
+async def test_independent_verify_promotes_to_independently_verified(monkeypatch, fake_client):
     cfg = make_cfg()
     candidate = make_finding(confirmed=True, flow_ids=(101,))
     # A fresh child reproduces the candidate with a real captured batch.
     _wire(monkeypatch, fake_client, cfg, FakeExecutor(exec_result([make_finding(flow_ids=(201,))])))
 
-    out = g.run_subagent(_payload(cfg, candidate))
+    out = await g.run_subagent(_payload(cfg, candidate))
 
     assert out["verify_queue"] == []  # a verify dispatch never re-enqueues verification
     assert len(out["findings"]) == 1
@@ -39,13 +39,13 @@ def test_independent_verify_promotes_to_independently_verified(monkeypatch, fake
     assert promoted.independently_verified is True
 
 
-def test_failed_verify_does_not_downgrade_prior_finding(monkeypatch, fake_client):
+async def test_failed_verify_does_not_downgrade_prior_finding(monkeypatch, fake_client):
     cfg = make_cfg()
     candidate = make_finding(confirmed=True, flow_ids=(101,))
     # Reproduction fails (no captured batch) -> the child promotes nothing.
     _wire(monkeypatch, fake_client, cfg, FakeExecutor(exec_result([make_finding(flow_ids=())])))
 
-    out = g.run_subagent(_payload(cfg, candidate))
+    out = await g.run_subagent(_payload(cfg, candidate))
     assert out["findings"] == []
 
     # Reconciliation into master state keeps the previously confirmed finding intact.
@@ -54,13 +54,13 @@ def test_failed_verify_does_not_downgrade_prior_finding(monkeypatch, fake_client
     assert reconciled[0].confirmed is True
 
 
-def test_task_dispatch_enqueues_confirmed_for_independent_verify(monkeypatch, fake_client):
+async def test_task_dispatch_enqueues_confirmed_for_independent_verify(monkeypatch, fake_client):
     cfg = make_cfg()
     _wire(monkeypatch, fake_client, cfg, FakeExecutor(exec_result([make_finding(flow_ids=(301,))])))
 
     data = sub_input(cfg, intent="task")
     payload = SubAgentInput(dispatch_id="0-task-0", intent="task", spec=None, master_ctx=data["master_ctx"])
-    out = g.run_subagent(payload)
+    out = await g.run_subagent(payload)
 
     assert len(out["findings"]) == 1
     assert out["findings"][0].confirmed is True

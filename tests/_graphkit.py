@@ -26,7 +26,7 @@ class _Dummy:
 
 
 class FakeClarifier:
-    """`.invoke(ctx) -> list[str]` — questions decided by an injected callable."""
+    """`.ainvoke(ctx) -> list[str]` — questions decided by an injected callable."""
 
     def __init__(self, questions_fn):
         self._fn = questions_fn
@@ -36,9 +36,12 @@ class FakeClarifier:
         self.calls.append(ctx)
         return list(self._fn(ctx))
 
+    async def ainvoke(self, ctx: dict, *a: Any, **k: Any) -> list[str]:
+        return self.invoke(ctx)
+
 
 class FakeExecutor:
-    """`.invoke(state) -> dict` returning canned ReAct outputs, one per call."""
+    """`.ainvoke(state) -> dict` returning canned ReAct outputs, one per call."""
 
     def __init__(self, results: Any):
         self._results = results if isinstance(results, list) else [results]
@@ -50,6 +53,9 @@ class FakeExecutor:
         out = self._results[min(self._i, len(self._results) - 1)]
         self._i += 1
         return out
+
+    async def ainvoke(self, state: dict, *a: Any, **k: Any) -> dict:
+        return self.invoke(state)
 
 
 class FakeFork:

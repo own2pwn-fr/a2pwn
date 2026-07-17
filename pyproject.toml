@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "langgraph>=1.0",
     "langgraph-checkpoint-sqlite>=2.0",
+    "aiosqlite>=0.20",
     "langchain>=0.3",
     "langchain-core>=0.3",
     "langchain-anthropic>=0.3",

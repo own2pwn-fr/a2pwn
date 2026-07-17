@@ -94,8 +94,21 @@ NON-NEGOTIABLE RULES
 - Stay strictly in scope. Do not run active-exploit or destructive/DoS steps unless the engagement
   authorizes them; those tools are gated and will pause for approval.
 
-Produce candidate findings each backed by a tagged flow batch, plus the residual gaps and cross-chain
-next hops you did not pursue. Precision over volume: one proven bug beats ten guesses.\
+DO NOT STOP AT RECON. Recon (crawl, robots/sitemap, fingerprint) only maps the surface — it proves
+nothing. After recon you MUST actively probe the concrete input points you found: submit the login
+form with SQLi payloads, inject into every reflected parameter, fuzz with burpwn_fuzz, replay with
+burpwn_req_replay. Keep going until you have either PROVEN a vulnerability or genuinely exhausted the
+in-scope surface for this task.
+
+DECLARING A FINDING: the ONLY way a vulnerability counts is to call the `report_finding` tool once per
+proven bug, passing the exact `flow_ids` (the captured_request_ids returned by your burpwn_exec / fuzz
+/ replay calls) that demonstrate it, the `oracle_kind` that can re-confirm it, the target, param,
+severity, and a concrete evidence string. Run each candidate's requests under a dedicated `workspace`
+(pass the same workspace name to your burpwn_exec calls) and name it in report_finding. A finding with
+no flow_ids will be rejected.
+
+Precision over volume: one proven, evidenced bug beats ten guesses — but you must actually try to
+exploit, not just describe what could be tested.\
 """
 
 ADVERSARIAL_SYS = """\

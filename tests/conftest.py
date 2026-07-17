@@ -194,10 +194,11 @@ def fake_client() -> FakeBurpwnClient:
 
 
 @pytest.fixture
-def tmp_saver(tmp_path):
-    from langgraph.checkpoint.sqlite import SqliteSaver
+async def tmp_saver(tmp_path):
+    # Async saver: the graphs are driven with ainvoke/astream (sub-agent tools are async-only).
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-    with SqliteSaver.from_conn_string(str(tmp_path / "runs.db")) as saver:
+    async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "runs.db")) as saver:
         yield saver
 
 

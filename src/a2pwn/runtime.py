@@ -11,12 +11,10 @@ from __future__ import annotations
 import logging
 import os
 import re
-import sqlite3
 from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
@@ -28,7 +26,7 @@ from a2pwn.collaborator import Collaborator
 from a2pwn.config import A2pwnConfig
 from a2pwn.graph import build_master_graph, build_subagent_graph
 from a2pwn.report import Report, build_report
-from a2pwn.tools import burpwn_tools, oracle_tools
+from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools
 
 _log = logging.getLogger("a2pwn")
 
@@ -55,18 +53,23 @@ def run_out_dir(cfg: A2pwnConfig, thread_id: str) -> Path:
     return out
 
 
-def _make_checkpointer(cfg: A2pwnConfig) -> BaseCheckpointSaver:
-    """SqliteSaver single-box default (``~/.local/share/a2pwn/runs.db``) or PostgresSaver."""
+async def _make_checkpointer(cfg: A2pwnConfig) -> BaseCheckpointSaver:
+    """Async checkpointer (``run_engagement`` drives the graph with ``astream``): AsyncSqliteSaver
+    single-box default (``~/.local/share/a2pwn/runs.db``) or AsyncPostgresSaver. The underlying
+    connection is kept open for the process lifetime, as the sync path did."""
     if cfg.checkpoint_uri:
-        from langgraph.checkpoint.postgres import PostgresSaver
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-        saver = PostgresSaver.from_conn_string(cfg.checkpoint_uri).__enter__()
-        saver.setup()
+        saver = await AsyncPostgresSaver.from_conn_string(cfg.checkpoint_uri).__aenter__()
+        await saver.setup()
         return saver
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
     db_path = _state_dir() / "runs.db"
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    saver = SqliteSaver(conn)
-    saver.setup()
+    conn = await aiosqlite.connect(str(db_path))
+    saver = AsyncSqliteSaver(conn)
+    await saver.setup()
     return saver
 
 
@@ -88,8 +91,14 @@ def _seed_skills(cfg: A2pwnConfig) -> list:
 # --------------------------------------------------------------------------- #
 # bootstrap                                                                    #
 # --------------------------------------------------------------------------- #
-async def bootstrap(cfg: A2pwnConfig) -> tuple[BurpwnClient, CompiledStateGraph]:
-    """Preflight burpwn, spawn the session/MCP client, and compile both graphs."""
+async def bootstrap(
+    cfg: A2pwnConfig,
+) -> tuple[BurpwnClient, CompiledStateGraph, BaseCheckpointSaver]:
+    """Preflight burpwn, spawn the session/MCP client, and compile both graphs.
+
+    Returns the client, the compiled master graph, and the checkpointer (the caller owns
+    closing both the client and the checkpointer so their background threads don't hang exit).
+    """
     try:
         report = BurpwnClient.cli_doctor()
         if isinstance(report, dict) and report.get("ok") is False:
@@ -103,7 +112,7 @@ async def bootstrap(cfg: A2pwnConfig) -> tuple[BurpwnClient, CompiledStateGraph]
         _log.info("session new(%s): %s", cfg.engagement.session, exc)
 
     client = BurpwnClient(cfg.engagement.session)
-    checkpointer = _make_checkpointer(cfg)
+    checkpointer = await _make_checkpointer(cfg)
     collab = Collaborator(client, cfg.engagement.oob_listener)
     fork = MasterFork(cfg.models)
 
@@ -111,11 +120,26 @@ async def bootstrap(cfg: A2pwnConfig) -> tuple[BurpwnClient, CompiledStateGraph]
         as_langchain_tools(_seed_skills(cfg), client, collab)
         + burpwn_tools(client)
         + oracle_tools(collab, client)
+        + finding_tools(client)
     )
 
     subgraph = build_subagent_graph(cfg, client, fork, tools, collab)
     graph = build_master_graph(cfg, subgraph, client, checkpointer)
-    return client, graph
+    return client, graph, checkpointer
+
+
+async def _close_checkpointer(checkpointer: BaseCheckpointSaver) -> None:
+    """Close the checkpointer's backing connection so its worker thread doesn't hang exit."""
+    conn = getattr(checkpointer, "conn", None)
+    closer = getattr(conn, "close", None)
+    if closer is None:
+        return
+    try:
+        result = closer()
+        if hasattr(result, "__await__"):
+            await result
+    except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+        _log.debug("checkpointer close failed: %s", exc)
 
 
 def bootstrap_node(state: dict) -> dict:
@@ -188,7 +212,7 @@ def _approve_interrupt(cfg: A2pwnConfig, snap: Any) -> bool:
 # --------------------------------------------------------------------------- #
 async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str) -> Report:
     """Drive the master graph to completion and build the evidence-grounded report."""
-    client, graph = await bootstrap(cfg)
+    client, graph, checkpointer = await bootstrap(cfg)
     budget = DispatchBudget(
         max_dispatches=cfg.max_dispatches,
         max_batch_width=cfg.max_batch_width,
@@ -231,4 +255,5 @@ async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str) -> Re
         report = await build_report(final, client, str(out_dir))
     finally:
         await client.close()
+        await _close_checkpointer(checkpointer)
     return report

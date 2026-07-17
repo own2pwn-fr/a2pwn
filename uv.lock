@@ -17,6 +17,7 @@ name = "a2pwn"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiosqlite" },
     { name = "anyio" },
     { name = "claude-agent-sdk" },
     { name = "httpx" },
@@ -69,6 +70,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiosqlite", specifier = ">=0.20" },
     { name = "anyio", specifier = ">=4.4" },
     { name = "claude-agent-sdk", specifier = ">=0.2" },
     { name = "httpx", specifier = ">=0.27" },
