@@ -139,12 +139,15 @@ class _Dashboard:
         self.round = 0
         self.spent = 0
         self.max = 0
+        self.max_phases = 0
+        self.stopping = False  # soft-stop (first Ctrl-C) requested
 
         # dispatch id -> record dict
         self.dispatches: dict[str, dict[str, Any]] = {}
         self.done: deque[dict[str, Any]] = deque(maxlen=_MAX_DONE_ROWS)
-        # ordered finding rows keyed by (vuln_class, target)
-        self.findings: dict[tuple[str, str], dict[str, Any]] = {}
+        # ordered finding rows keyed by (vuln_class, target, param) so distinct-param findings on the
+        # same surface are not collapsed (matches report.py / render_summary).
+        self.findings: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.feed: deque[Text] = deque(maxlen=_MAX_FEED)
         self.logs: deque[str] = deque(maxlen=4)
 
@@ -181,6 +184,10 @@ class _Dashboard:
         self.round = int(ev.get("round") or 0)
         self.spent = int(ev.get("spent") or 0)
         self.max = int(ev.get("max") or 0)
+        self.max_phases = int(ev.get("max_phases") or self.max_phases)
+
+    def _on_stopping(self, ev: dict[str, Any]) -> None:
+        self.stopping = True
 
     def _on_dispatch_start(self, ev: dict[str, Any]) -> None:
         did = str(ev.get("id") or "?")
@@ -215,7 +222,8 @@ class _Dashboard:
         target = str(ev.get("target") or "?")
         status = str(ev.get("status") or "candidate")
         severity = str(ev.get("severity") or "info")
-        key = (vuln, target)
+        param = str(ev.get("param") or "*")
+        key = (vuln, target, param)
         prev = self.findings.get(key)
         if prev is not None and _STATUS_RANK.get(status, 0) < _STATUS_RANK.get(prev["status"], 0):
             # keep the highest status already seen, but a worse severity should not downgrade
@@ -225,6 +233,7 @@ class _Dashboard:
         self.findings[key] = {
             "vuln_class": vuln,
             "target": target,
+            "param": param,
             "status": status,
             "severity": severity,
         }
@@ -288,11 +297,12 @@ class _Dashboard:
             ("   model ", "dim"),
             (_truncate(self.model, 24), "white"),
         )
+        phase_prog = f"{self.round}/{self.max_phases}" if self.max_phases else str(self.round)
         phase = Text.assemble(
             ("phase ", "dim"),
-            (_truncate(self.phase, 22), f"bold {_ACCENT}"),
-            (f"  round {self.round}", "white"),
-            ("   budget ", "dim"),
+            (phase_prog, f"bold {_ACCENT}"),
+            (f"  {_truncate(self.phase, 18)}", "white"),
+            ("   cost cap ", "dim"),
             budget_bar,
             ("   ⏱ ", "dim"),
             (elapsed, "bold white"),
@@ -333,7 +343,9 @@ class _Dashboard:
                     (f"  ({rec['n_findings']} findings)", "dim"),
                 ),
             )
-        title = Text.assemble(("⚡ Dispatches ", f"bold {_ACCENT}"), (f"{len(self.dispatches)} active", "dim"))
+        title = Text.assemble(
+            ("⚡ Dispatches ", f"bold {_ACCENT}"), (f"{len(self.dispatches)} active", "dim")
+        )
         return Panel(table, title=title, title_align="left", box=ROUNDED, border_style="grey37")
 
     def render_findings(self) -> Panel:
@@ -399,9 +411,14 @@ class _Dashboard:
             ("    severity", "dim"),
         )
         parts.append_text(sev_txt)
-        if self.logs:
+        if self.stopping:
+            parts.append(
+                "    ⏸ arrêt propre demandé — finalisation du rapport (Ctrl-C encore pour forcer)",
+                style="bold yellow",
+            )
+        elif self.logs:
             parts.append("    " + self.logs[-1], style="dim italic")
-        return Panel(parts, box=ROUNDED, border_style=_ACCENT, padding=(0, 1))
+        return Panel(parts, box=ROUNDED, border_style="yellow" if self.stopping else _ACCENT, padding=(0, 1))
 
     def render(self) -> Layout:
         layout = Layout()
@@ -570,45 +587,83 @@ async def _demo() -> None:  # pragma: no cover - manual visual check
     queue: asyncio.Queue = asyncio.Queue()
 
     async def feed() -> None:
-        await queue.put({"kind": "engagement", "target": "https://ginandjuice.shop",
-                         "model": "claude-opus-4", "objective": "Full-scope web pentest"})
+        await queue.put(
+            {
+                "kind": "engagement",
+                "target": "https://ginandjuice.shop",
+                "model": "claude-opus-4",
+                "objective": "Full-scope web pentest",
+            }
+        )
         dispatches = [f"d{i}-{name}" for i, name in enumerate(("sqli", "ssrf", "idor", "xss"))]
         vulns = ["sql_injection", "ssrf", "idor", "reflected_xss", "auth_bypass"]
         for rnd in range(1, 4):
-            await queue.put({"kind": "phase", "phase": "planning", "round": rnd,
-                             "spent": rnd * 4, "max": 20})
+            await queue.put({"kind": "phase", "phase": "planning", "round": rnd, "spent": rnd * 4, "max": 20})
             await asyncio.sleep(0.4)
             for did in dispatches[: rnd + 1]:
                 intent = "verify" if "xss" in did else "task"
-                await queue.put({"kind": "dispatch_start", "id": did, "intent": intent,
-                                 "task": f"probe {did.split('-')[1]} on /api"})
+                await queue.put(
+                    {
+                        "kind": "dispatch_start",
+                        "id": did,
+                        "intent": intent,
+                        "task": f"probe {did.split('-')[1]} on /api",
+                    }
+                )
                 await asyncio.sleep(0.15)
             for _ in range(6):
                 did = random.choice(dispatches[: rnd + 1])
                 stage = random.choice(("exploit", "verify", "clarify"))
-                await queue.put({"kind": "activity", "dispatch": did, "stage": stage,
-                                 "text": f"burpwn_exec curl -si https://ginandjuice.shop/api/x?q={random.randint(1,99)}"})
-                await queue.put({"kind": "thought", "dispatch": did,
-                                 "text": "response length differs, likely injectable"})
+                await queue.put(
+                    {
+                        "kind": "activity",
+                        "dispatch": did,
+                        "stage": stage,
+                        "text": f"burpwn_exec curl -si https://ginandjuice.shop/api/x?q={random.randint(1, 99)}",
+                    }
+                )
+                await queue.put(
+                    {"kind": "thought", "dispatch": did, "text": "response length differs, likely injectable"}
+                )
                 await asyncio.sleep(0.25)
             for did in dispatches[: rnd + 1]:
                 v = random.choice(vulns)
                 sev = random.choice(("critical", "high", "medium", "low", "info"))
-                await queue.put({"kind": "finding", "status": "candidate", "vuln_class": v,
-                                 "severity": sev, "target": f"https://ginandjuice.shop/{v}"})
+                await queue.put(
+                    {
+                        "kind": "finding",
+                        "status": "candidate",
+                        "vuln_class": v,
+                        "severity": sev,
+                        "target": f"https://ginandjuice.shop/{v}",
+                    }
+                )
                 await asyncio.sleep(0.1)
-                await queue.put({"kind": "finding", "status": "verified", "vuln_class": v,
-                                 "severity": sev, "target": f"https://ginandjuice.shop/{v}"})
-                await queue.put({"kind": "dispatch_end", "id": did,
-                                 "status": random.choice(("confirmed", "partial", "no_finding")),
-                                 "n_findings": random.randint(0, 3)})
+                await queue.put(
+                    {
+                        "kind": "finding",
+                        "status": "verified",
+                        "vuln_class": v,
+                        "severity": sev,
+                        "target": f"https://ginandjuice.shop/{v}",
+                    }
+                )
+                await queue.put(
+                    {
+                        "kind": "dispatch_end",
+                        "id": did,
+                        "status": random.choice(("confirmed", "partial", "no_finding")),
+                        "n_findings": random.randint(0, 3),
+                    }
+                )
                 await asyncio.sleep(0.15)
         await queue.put({"kind": "log", "level": "warning", "text": "budget nearly exhausted"})
         await queue.put({"kind": "done", "report": "report.md", "har": [], "n_verified": 3})
 
     task = asyncio.create_task(feed())
-    await run_tui(queue, target="https://ginandjuice.shop", model="claude-opus-4",
-                  objective="Full-scope web pentest")
+    await run_tui(
+        queue, target="https://ginandjuice.shop", model="claude-opus-4", objective="Full-scope web pentest"
+    )
     await task
 
 

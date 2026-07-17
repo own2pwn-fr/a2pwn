@@ -186,7 +186,7 @@ def _install_fake_run(monkeypatch, tmp_path, fake_client, build_report):
 
 
 async def test_run_engagement_closes_client_and_checkpointer(monkeypatch, tmp_path, fake_client):
-    async def _fake_report(final, client, out_dir):
+    async def _fake_report(final, client, out_dir, **kw):
         return Report(engagement="eng")
 
     cfg, fake_graph, fake_ck = _install_fake_run(monkeypatch, tmp_path, fake_client, _fake_report)
@@ -201,7 +201,7 @@ async def test_run_engagement_closes_client_and_checkpointer(monkeypatch, tmp_pa
 
 
 async def test_run_engagement_cleans_up_even_when_report_fails(monkeypatch, tmp_path, fake_client):
-    async def _boom(final, client, out_dir):
+    async def _boom(final, client, out_dir, **kw):
         raise RuntimeError("report exploded")
 
     cfg, _fake_graph, fake_ck = _install_fake_run(monkeypatch, tmp_path, fake_client, _boom)
@@ -212,6 +212,40 @@ async def test_run_engagement_cleans_up_even_when_report_fails(monkeypatch, tmp_
     # teardown still ran despite the mid-run error (finally block, independent closes).
     assert fake_client.closed is True
     assert fake_ck.conn.closed is True
+
+
+def test_list_runs_reads_report_metadata(monkeypatch, tmp_path):
+    import json
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    base = tmp_path / "a2pwn" / "runs"
+    # a run with a report.json …
+    (base / "acme").mkdir(parents=True)
+    (base / "acme" / "report.json").write_text(
+        json.dumps(
+            {
+                "findings": [{"vuln_class": "xss"}, {"vuln_class": "ssrf"}],
+                "confirmed_findings": [{"vuln_class": "sqli"}],
+                "stats": {"by_severity": {"high": 2}},
+                "objective": "audit",
+                "targets": ["https://app.example.com"],
+            }
+        )
+    )
+    # … and a bare run directory without a report yet.
+    (base / "pending").mkdir(parents=True)
+
+    runs = {r["thread_id"]: r for r in runtime.list_runs()}
+    assert runs["acme"]["has_report"] is True
+    assert runs["acme"]["verified"] == 2
+    assert runs["acme"]["confirmed"] == 1
+    assert runs["acme"]["targets"] == ["https://app.example.com"]
+    assert runs["pending"]["has_report"] is False
+
+
+def test_list_runs_empty_when_no_base(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    assert runtime.list_runs() == []
 
 
 async def test_close_checkpointer_handles_missing_conn():

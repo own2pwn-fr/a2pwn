@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`state_change` oracle** — a deterministic proof path for business-logic / CSRF findings (a
+  targeted value provably appears/disappears/changes across a before/after pair), replacing the
+  abstaining `llm_rubric` the kernel always rejected.
+- **Seven new detection skills** — command-injection, nosql-injection, ldap-xpath-injection,
+  file-upload, graphql, authentication, csrf (25 → 32 skills).
+- **Opt-in wall-clock deadline** (`max_wall_secs`): a whole-engagement time cap that still builds the
+  report from what was proven.
+- **Structured report output.** Alongside `report.md`, every run now writes `report.json`
+  (full `Report` model), `report.sarif` (valid SARIF 2.1.0, driver `a2pwn`, one result per finding
+  with `proofTier`) and a self-contained `report.html` (inline CSS, all user/finding text escaped).
+  `--format md,json,sarif,html` selects which to write (md+json always). The `Report` now carries
+  engagement metadata (objective, targets, model labels, dispatches spent, started-at, duration) and
+  the written `report_paths`.
+- **Confirmed-not-reproduced tier.** Findings the oracle CONFIRMED but that the independent-verify
+  dispatch could not replay (races / one-shot tokens / TOCTOU) are no longer silently dropped: they
+  are surfaced in a distinct, clearly-labelled `Report.confirmed_findings` tier across md/json/sarif/
+  html. The strict `findings` tier stays independently-verified-only.
+- **Run-plan panel.** `a2pwn run` prints targets / objective / active-exploit (red when ON) / dos /
+  executor+verifier models / caps / output dir **before** the authorization gate (a compact
+  one-liner under `--yes`).
+- **`a2pwn list`** enumerates prior runs (verified / confirmed-only counts, severity tally, objective,
+  last updated). **`a2pwn resume --name X [--objective …]`** re-drives an existing thread id (the
+  checkpointer resumes), recovering targets/objective from the prior run's `report.json`.
+- **`--max-wall-secs`** flag maps to `cfg.max_wall_secs`.
+- **TUI/plain polish.** Live findings dedup key now includes `param`; the header shows phase
+  `round/max_phases` as the primary progress with the dispatch spend relabelled a "cost cap" gauge;
+  the first Ctrl-C shows a graceful-finalize notice; `--plain` now prints the full findings summary.
+
+### Fixed (latent bugs)
+
+- **OOB oracle was dead.** The collaborator was constructed but its in-sandbox listener was never
+  started, so the `oob` oracle — the strongest 0-FP signal — could never confirm a blind
+  SSRF/XXE/deserialization/SQLi. It is now started at bootstrap and stopped on teardown (serialised
+  behind a lock).
+- **`marker` oracle auto-confirmed.** A full-text hit always matched the injection request's own
+  echo of the marker; it now requires the marker in the **response** of a *different* flow that did
+  not inject it (genuine stored / second-order propagation).
+- **Verify fan-out ignored the caps.** The independent-verify branch emitted one sub-agent per
+  queued finding regardless of `max_batch_width` / remaining budget; it is now clamped like the task
+  branch, with the overflow carried to the next phase.
+- **burpwn liveness.** Every MCP call is now bounded by a read timeout (`exec` gets a generous,
+  exec-aware bound); a crashed `burpwn mcp` is detected via a returncode health-check and
+  transparently respawned (crash-loop guarded); over-limit / EOF / broken-pipe lines degrade to a
+  clean error instead of wedging; the `burpwn --json` CLI calls got a timeout.
+- **Postgres checkpointer** now exits its async context manager symmetrically (was leaking pooled
+  connections).
+
+### Changed (detection quality)
+
+- **`timing` oracle** requires the slowest sample to exceed the baseline (median of the rest) by a
+  large fraction of the threshold — rejecting jitter and uniformly-slow endpoints instead of
+  confirming on a single slow response.
+- **`two_identity` oracle** accepts an optional anonymous/unauthorised control that must be denied,
+  so a *public* resource can no longer masquerade as an IDOR.
+- **`differential` oracle** length-delta noise floor raised off 1 byte.
+- **Executor coverage.** "Report the moment you have proof, then stop" no longer truncates a surface:
+  the executor must walk a co-located vuln-class checklist for every sink it touched before declaring
+  it exhausted, and the per-sub-agent turn budget is configurable (`executor_max_turns`, default 40).
+
 ## [0.1.0] — 2026-07-17
 
 First release. Validated end to end against the sanctioned BrokenCrystals lab: a single autonomous

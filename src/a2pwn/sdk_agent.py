@@ -254,8 +254,12 @@ async def run_sdk_agent(
         )
         findings.append(finding)
         progress.emit(
-            "finding", status="candidate", vuln_class=finding.vuln_class,
-            severity=finding.severity, target=finding.target,
+            "finding",
+            status="candidate",
+            vuln_class=finding.vuln_class,
+            severity=finding.severity,
+            target=finding.target,
+            param=finding.param,
         )
         summary = (
             f"recorded candidate {finding.key} (severity={finding.severity}, "

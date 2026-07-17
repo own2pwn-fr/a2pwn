@@ -93,7 +93,23 @@ uv sync
 uv run a2pwn run --target https://ginandjuice.shop --objective "audit the shop end to end" --yes
 ```
 
-Findings and a per-batch HAR export land under the run directory.
+Findings land under the run directory as `report.md` plus machine-readable `report.json`,
+`report.sarif` (GitHub code-scanning / CI) and a self-contained `report.html`, alongside a per-batch
+HAR export. Pick the set with `--format md,json,sarif,html`. A **Run plan** panel (targets,
+objective, active-exploit state, models, budgets, output dir) prints before the authorization gate.
+
+The report separates two proof tiers: **verified** findings (independently reproduced from a clean
+slate) and **confirmed-but-not-reproduced** ones — oracle-proven but not replayable (races, one-shot
+OTP/tokens, TOCTOU) — which are surfaced for manual re-check instead of being dropped.
+
+```bash
+uv run a2pwn list                        # prior runs: verified/confirmed counts, severity tally
+uv run a2pwn resume --name <run>         # resume an interrupted run from its checkpoint
+uv run a2pwn run ... --max-wall-secs 3600  # optional whole-engagement wall-clock cap
+```
+
+`a2pwn run` also self-guards: every burpwn call is bounded by a timeout, a crashed sandbox is
+respawned, and the first Ctrl-C finalizes the report gracefully (a second forces the abort).
 
 ### Docker (batteries included)
 

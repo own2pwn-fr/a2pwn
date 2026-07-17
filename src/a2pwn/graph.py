@@ -616,6 +616,7 @@ def build_subagent_graph(
                     vuln_class=c.vuln_class,
                     severity=c.severity,
                     target=c.target,
+                    param=c.param,
                 )
             else:
                 rejected.append(c)
@@ -626,6 +627,7 @@ def build_subagent_graph(
                     vuln_class=c.vuln_class,
                     severity=c.severity,
                     target=c.target,
+                    param=c.param,
                 )
                 if "ALARM" in reason or "capture" in reason.lower():
                     capture_ok = False
@@ -796,7 +798,12 @@ def _make_plan_node(planner: Any):
     async def _plan_node(state: MasterState) -> dict:
         b = state["budget"]
         progress.emit(
-            "phase", phase="plan", round=state.get("round", 0), spent=_spent(state), max=b.max_dispatches
+            "phase",
+            phase="plan",
+            round=state.get("round", 0),
+            spent=_spent(state),
+            max=b.max_dispatches,
+            max_phases=b.max_phases,
         )
         pending = list(state.get("pending") or [])
         if not pending and not _pending_verify(state):

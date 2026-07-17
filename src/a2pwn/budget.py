@@ -1,6 +1,7 @@
 """Global dispatch budget + TaskStop kill switch + hard-cap helpers (cost/termination safety)."""
 
 import signal
+import sys
 import threading
 from typing import Any
 
@@ -67,6 +68,17 @@ def install_stop_handler(budget_ref: DispatchBudget) -> None:
         state["count"] += 1
         budget_ref.stopped = True
         STOP.set()  # process-wide signal the graph routers actually read
+        if state["count"] == 1:
+            # First Ctrl-C: user-visible confirmation that a graceful finalize is under way. The TUI
+            # footer picks up the "stopping" event; plain runs get the stderr line.
+            from a2pwn import progress
+
+            progress.emit("stopping")
+            print(
+                "\n⏸ arrêt propre demandé — finalisation du rapport (Ctrl-C encore pour forcer).",
+                file=sys.stderr,
+                flush=True,
+            )
         if state["count"] >= 2:
             if callable(previous):
                 previous(signum, frame)

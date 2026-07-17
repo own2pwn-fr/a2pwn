@@ -9,10 +9,13 @@ authorization ``interrupt_before`` gate and resuming once approved, then renderi
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +57,47 @@ def run_out_dir(cfg: A2pwnConfig, thread_id: str) -> Path:
     out = _state_dir() / "runs" / _safe(thread_id)
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def list_runs() -> list[dict]:
+    """Enumerate prior run directories under ``<state>/runs``, newest first.
+
+    Each entry carries the ``thread_id`` (directory name), its path, mtime, and — when a
+    ``report.json`` is present — the verified / confirmed-only counts, severity tally and objective.
+    Display-only: the CLI ``list`` command renders these; no model or burpwn is touched."""
+    base = _state_dir() / "runs"
+    if not base.exists():
+        return []
+    runs: list[dict] = []
+    for d in base.iterdir():
+        if not d.is_dir():
+            continue
+        info: dict = {
+            "thread_id": d.name,
+            "path": str(d),
+            "has_report": False,
+            "verified": 0,
+            "confirmed": 0,
+            "by_severity": {},
+            "objective": "",
+            "mtime": d.stat().st_mtime,
+        }
+        rj = d / "report.json"
+        if rj.exists():
+            try:
+                data = json.loads(rj.read_text(encoding="utf-8"))
+                info["has_report"] = True
+                info["verified"] = len(data.get("findings", []) or [])
+                info["confirmed"] = len(data.get("confirmed_findings", []) or [])
+                info["by_severity"] = (data.get("stats") or {}).get("by_severity", {}) or {}
+                info["objective"] = data.get("objective", "") or ""
+                info["targets"] = list(data.get("targets", []) or [])
+                info["mtime"] = rj.stat().st_mtime
+            except Exception as exc:  # noqa: BLE001 - a corrupt report.json must not break the listing
+                _log.debug("list_runs: unreadable report.json in %s: %s", d, exc)
+        runs.append(info)
+    runs.sort(key=lambda r: r.get("mtime") or 0.0, reverse=True)
+    return runs
 
 
 async def _make_checkpointer(cfg: A2pwnConfig) -> BaseCheckpointSaver:
@@ -275,11 +319,28 @@ def _approve_interrupt(cfg: A2pwnConfig, snap: Any) -> bool:
 # --------------------------------------------------------------------------- #
 # engagement runner                                                            #
 # --------------------------------------------------------------------------- #
-async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str, *, tui: bool = False) -> Report:
+def _model_meta(cfg: A2pwnConfig) -> dict:
+    """Executor/verifier backend labels threaded into the report metadata."""
+    ex, ver = cfg.models.executor, cfg.models.verifier
+    return {
+        "executor": f"{ex.provider}:{ex.model or 'sonnet'}",
+        "verifier": f"{ver.provider}:{ver.model or 'opus'}",
+    }
+
+
+async def run_engagement(
+    cfg: A2pwnConfig,
+    objective: str,
+    thread_id: str,
+    *,
+    tui: bool = False,
+    formats: list[str] | None = None,
+) -> Report:
     """Drive the master graph to completion and build the evidence-grounded report.
 
     With ``tui=True`` a live :mod:`rich` dashboard runs concurrently, fed by the display-only
-    :mod:`a2pwn.progress` event bus (which never touches graph state, so clean-history holds)."""
+    :mod:`a2pwn.progress` event bus (which never touches graph state, so clean-history holds).
+    ``formats`` selects which report artifacts are written (md+json always)."""
     client: BurpwnClient | None = None
     checkpointer: BaseCheckpointSaver | None = None
     out_dir = run_out_dir(cfg, thread_id)
@@ -289,6 +350,9 @@ async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str, *, tu
         progress.set_sink(queue)
     model_label = f"{cfg.models.executor.provider} · {cfg.models.executor.model or 'sonnet'}"
     targets_label = ", ".join(cfg.engagement.targets)
+    models_meta = _model_meta(cfg)
+    started_at = datetime.now(UTC).isoformat(timespec="seconds")
+    t0 = time.monotonic()
     try:
         client, graph, checkpointer = await bootstrap(cfg)
         budget = DispatchBudget(
@@ -347,7 +411,15 @@ async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str, *, tu
             else:
                 await _drive_loop()
             final = (await graph.aget_state(config)).values
-            return await build_report(final, client, str(out_dir))
+            return await build_report(
+                final,
+                client,
+                str(out_dir),
+                models=models_meta,
+                started_at=started_at,
+                duration_secs=time.monotonic() - t0,
+                formats=formats,
+            )
 
         if queue is not None:
             from a2pwn import tui as tuimod

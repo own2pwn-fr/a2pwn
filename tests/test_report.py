@@ -3,6 +3,8 @@ is exported exactly once per distinct evidence workspace."""
 
 from __future__ import annotations
 
+import json
+
 from a2pwn.config import EngagementSpec
 from a2pwn.models import Finding, FlowBatchRef
 from a2pwn.report import build_report, render_markdown
@@ -187,3 +189,70 @@ async def test_cross_chains_and_markdown(fake_client, tmp_path):
     assert "critical" in md.lower()
     # most-severe finding renders first
     assert md.index("rce") < md.index("xss")
+
+
+async def test_confirmed_not_reproduced_tier_split(fake_client, tmp_path):
+    # A confirmed-but-not-independently-verified finding must land in the SEPARATE confirmed tier
+    # (never the strict verified tier) and be rendered across json/sarif/html.
+    _record_har(fake_client)
+    findings = [
+        _finding("xss", "https://app.example.com/s", "q", workspace="xss-poc"),  # verified
+        _finding(
+            "sqli",
+            "https://app.example.com/id",
+            "id",
+            workspace="sqli-poc",
+            severity="critical",
+            independently_verified=False,  # oracle-confirmed, not reproduced -> tier 2
+            confirmed=True,
+        ),
+    ]
+    state = {"engagement": _engagement(), "findings": findings, "objective": "audit the shop"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    # strict tier keeps only the verified finding; the confirmed-only sqli is quarantined.
+    assert {f.vuln_class for f in report.findings} == {"xss"}
+    assert {f.vuln_class for f in report.confirmed_findings} == {"sqli"}
+    assert report.stats["total_findings"] == 1
+    assert report.stats["confirmed_only"] == 1
+    # metadata threaded through from the terminal state.
+    assert report.objective == "audit the shop"
+    assert report.targets == ["https://app.example.com"]
+
+    # all four artifacts written and discoverable via report_paths.
+    for key in ("md", "json", "sarif", "html"):
+        assert key in report.report_paths
+        assert (tmp_path / f"report.{key}").exists()
+
+    # JSON carries both tiers distinctly.
+    data = json.loads((tmp_path / "report.json").read_text())
+    assert [f["vuln_class"] for f in data["findings"]] == ["xss"]
+    assert [f["vuln_class"] for f in data["confirmed_findings"]] == ["sqli"]
+
+    # SARIF: the confirmed-only sqli is present and tagged as not reproduced.
+    sarif = json.loads((tmp_path / "report.sarif").read_text())
+    results = sarif["runs"][0]["results"]
+    tiers = {r["ruleId"]: r["properties"]["proofTier"] for r in results}
+    assert tiers == {"xss": "verified", "sqli": "confirmed_not_reproduced"}
+    assert sarif["version"] == "2.1.0"
+
+    # HTML: both classes appear, the confirmed tier is clearly labelled.
+    html_doc = (tmp_path / "report.html").read_text()
+    assert "sqli" in html_doc and "xss" in html_doc
+    assert "not independently reproduced" in html_doc.lower()
+
+
+async def test_format_selection_gates_sarif_and_html(fake_client, tmp_path):
+    _record_har(fake_client)
+    findings = [_finding("xss", "https://app.example.com/s", "q", workspace="xss-poc")]
+    state = {"engagement": _engagement(), "findings": findings, "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path), formats=["md", "json"])
+
+    # md + json always written; sarif/html suppressed when not requested.
+    assert set(report.report_paths) == {"md", "json"}
+    assert (tmp_path / "report.md").exists()
+    assert (tmp_path / "report.json").exists()
+    assert not (tmp_path / "report.sarif").exists()
+    assert not (tmp_path / "report.html").exists()
