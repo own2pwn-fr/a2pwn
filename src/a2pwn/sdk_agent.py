@@ -35,6 +35,7 @@ from claude_agent_sdk import (
     tool,
 )
 
+from a2pwn import progress
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
 from a2pwn.models import Finding, FlowBatchRef
 from a2pwn.oracles import VerificationOracle, run_oracle
@@ -77,9 +78,9 @@ def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_") or "skill"
 
 
-def _head(text: str) -> str:
+def _head(text: str, n: int = _HEAD) -> str:
     text = " ".join(str(text).split())
-    return text if len(text) <= _HEAD else text[:_HEAD] + "…"
+    return text if len(text) <= n else text[:n] + "…"
 
 
 async def run_sdk_agent(
@@ -252,6 +253,10 @@ async def run_sdk_agent(
             enables=list(enables or []),
         )
         findings.append(finding)
+        progress.emit(
+            "finding", status="candidate", vuln_class=finding.vuln_class,
+            severity=finding.severity, target=finding.target,
+        )
         summary = (
             f"recorded candidate {finding.key} (severity={finding.severity}, "
             f"oracle={oracle_kind}, flows={flow_ids or 'NONE — will be rejected'})"
@@ -446,11 +451,15 @@ async def run_sdk_agent(
                 for block in msg.content or []:
                     if isinstance(block, ToolUseBlock):
                         tool_calls += 1
+                        tname = block.name.split("__")[-1]
+                        arg_head = _head(json.dumps(block.input, default=str), 90)
                         transcript.append(f"tool {block.name} {_head(json.dumps(block.input, default=str))}")
+                        progress.emit("activity", stage="exploit", text=f"{tname} {arg_head}")
                     elif isinstance(block, TextBlock):
                         if block.text and block.text.strip():
                             summary = block.text
                             transcript.append(f"say {_head(block.text)}")
+                            progress.emit("thought", text=_head(block.text, 140))
             elif isinstance(msg, ResultMessage):
                 if getattr(msg, "result", None):
                     summary = msg.result

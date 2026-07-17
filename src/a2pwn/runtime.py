@@ -8,6 +8,7 @@ authorization ``interrupt_before`` gate and resuming once approved, then renderi
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -19,6 +20,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
+from a2pwn import progress
 from a2pwn.agents import MasterFork
 from a2pwn.budget import DispatchBudget, install_stop_handler
 from a2pwn.burpwn import BurpwnClient
@@ -251,12 +253,22 @@ def _approve_interrupt(cfg: A2pwnConfig, snap: Any) -> bool:
 # --------------------------------------------------------------------------- #
 # engagement runner                                                            #
 # --------------------------------------------------------------------------- #
-async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str) -> Report:
-    """Drive the master graph to completion and build the evidence-grounded report."""
+async def run_engagement(
+    cfg: A2pwnConfig, objective: str, thread_id: str, *, tui: bool = False
+) -> Report:
+    """Drive the master graph to completion and build the evidence-grounded report.
+
+    With ``tui=True`` a live :mod:`rich` dashboard runs concurrently, fed by the display-only
+    :mod:`a2pwn.progress` event bus (which never touches graph state, so clean-history holds)."""
     client: BurpwnClient | None = None
     checkpointer: BaseCheckpointSaver | None = None
     out_dir = run_out_dir(cfg, thread_id)
     config = {"configurable": {"thread_id": thread_id}}
+    queue: asyncio.Queue | None = asyncio.Queue() if tui else None
+    if queue is not None:
+        progress.set_sink(queue)
+    model_label = f"{cfg.models.executor.provider} · {cfg.models.executor.model or 'sonnet'}"
+    targets_label = ", ".join(cfg.engagement.targets)
     try:
         client, graph, checkpointer = await bootstrap(cfg)
         budget = DispatchBudget(
@@ -282,23 +294,49 @@ async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str) -> Re
             "continuations": 0,
         }
 
-        while True:
-            async for chunk in graph.astream(
-                stream_input, config, stream_mode=["updates", "messages"], subgraphs=True
-            ):
-                _emit_telemetry(chunk)
-            snap = await graph.aget_state(config)
-            if not snap.next:
-                break
-            if not _approve_interrupt(cfg, snap):
-                _log.warning("dispatch declined by operator; routing to report")
-                budget.stopped = True
-                break
-            stream_input = Command(resume=True) if _has_dynamic_interrupt(snap) else None
+        async def _drive() -> Report:
+            si = stream_input
+            while True:
+                async for chunk in graph.astream(
+                    si, config, stream_mode=["updates", "messages"], subgraphs=True
+                ):
+                    _emit_telemetry(chunk)
+                snap = await graph.aget_state(config)
+                if not snap.next:
+                    break
+                if not _approve_interrupt(cfg, snap):
+                    _log.warning("dispatch declined by operator; routing to report")
+                    budget.stopped = True
+                    break
+                si = Command(resume=True) if _has_dynamic_interrupt(snap) else None
+            final = (await graph.aget_state(config)).values
+            return await build_report(final, client, str(out_dir))
 
-        final = (await graph.aget_state(config)).values
-        report = await build_report(final, client, str(out_dir))
+        if queue is not None:
+            from a2pwn import tui as tuimod
+
+            progress.emit("engagement", target=targets_label, model=model_label, objective=objective)
+            tui_task = asyncio.create_task(
+                tuimod.run_tui(queue, target=targets_label, model=model_label, objective=objective)
+            )
+            try:
+                report = await _drive()
+                progress.emit(
+                    "done",
+                    report=str(out_dir / "report.md"),
+                    har=list(report.har_paths),
+                    n_verified=len(report.findings),
+                )
+            except BaseException:
+                queue.put_nowait(None)  # stop the live view even on failure
+                raise
+            finally:
+                await tui_task
+        else:
+            report = await _drive()
     finally:
+        if queue is not None:
+            progress.clear_sink()
         # Close each subsystem independently so one failing close never orphans the other's worker
         # thread. The checkpoint is already durable, so the run stays resumable by thread_id.
         if client is not None:

@@ -22,10 +22,11 @@ def _text(res) -> str:
 
 
 def _stub_run(monkeypatch, sink: dict):
-    async def _fake_run(cfg, objective, thread_id):
+    async def _fake_run(cfg, objective, thread_id, *, tui=False):
         sink["cfg"] = cfg
         sink["objective"] = objective
         sink["thread_id"] = thread_id
+        sink["tui"] = tui
         return Report(engagement="a2pwn")
 
     monkeypatch.setattr(cli, "run_engagement", _fake_run)

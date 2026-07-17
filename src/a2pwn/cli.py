@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 
 import typer
 
@@ -73,12 +74,18 @@ def run(
     max_dispatches: int = typer.Option(200, "--max-dispatches", help="Global dispatch budget ceiling."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactively acknowledge authorization."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose telemetry logging."),
+    plain: bool = typer.Option(False, "--plain", help="Disable the live TUI; log telemetry instead."),
 ) -> None:
     """Run an autonomous, adversarially-verified engagement against the given targets."""
+    # The live TUI owns the terminal, so only enable it on an interactive stdout that isn't verbose
+    # or step-through (which need the raw log / an input prompt).
+    use_tui = not plain and not verbose and not step_through and sys.stdout.isatty()
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if use_tui:  # silence the log stream so it doesn't fight the Live view
+        logging.getLogger("a2pwn").setLevel(logging.WARNING)
     # Third-party debug logs (aiosqlite/httpx/checkpoint serde) drown the telemetry — cap them.
     for noisy in ("aiosqlite", "httpx", "httpcore", "urllib3", "asyncio",
                   "langgraph.checkpoint.serde.jsonplus", "claude_agent_sdk"):
@@ -126,7 +133,7 @@ def run(
         raise typer.Exit(2) from exc
 
     try:
-        report = asyncio.run(run_engagement(cfg, objective, thread_id=name))
+        report = asyncio.run(run_engagement(cfg, objective, thread_id=name, tui=use_tui))
     except BurpwnMissingError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
@@ -135,11 +142,16 @@ def run(
     md_path = out_dir / "report.md"
     md_path.write_text(render_markdown(report), encoding="utf-8")
 
-    typer.echo("")
-    typer.echo(f"Report:  {md_path}")
-    for har in report.har_paths:
-        typer.echo(f"HAR:     {har}")
-    typer.echo(f"Findings (independently verified): {len(report.findings)}")
+    if use_tui:
+        from a2pwn import tui
+
+        tui.render_summary(report, str(out_dir))
+    else:
+        typer.echo("")
+        typer.echo(f"Report:  {md_path}")
+        for har in report.har_paths:
+            typer.echo(f"HAR:     {har}")
+        typer.echo(f"Findings (independently verified): {len(report.findings)}")
 
 
 def main() -> None:

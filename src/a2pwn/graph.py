@@ -25,6 +25,7 @@ from langgraph.types import Send
 from pydantic import BaseModel, Field
 
 import a2pwn.prompts as P
+from a2pwn import progress
 from a2pwn.agents import (
     MasterFork,
     build_clarifier,
@@ -268,6 +269,9 @@ async def run_subagent(payload: SubAgentInput) -> dict:
         else None
     )
     attempts = {attempt_key: 1} if attempt_key else {}
+    _label = payload.spec.task if payload.spec else (payload.candidate.key if payload.candidate else "verify")
+    progress.emit("dispatch_start", id=payload.dispatch_id, intent=payload.intent, task=_label)
+    _tok = progress.set_dispatch(payload.dispatch_id)
     try:
         out = await sub.ainvoke(
             {
@@ -293,6 +297,8 @@ async def run_subagent(payload: SubAgentInput) -> dict:
             exc,
             exc_info=True,
         )
+        progress.reset_dispatch(_tok)
+        progress.emit("dispatch_end", id=payload.dispatch_id, status="blocked", n_findings=0)
         clean = CleanResult(
             dispatch_id=payload.dispatch_id,
             status="blocked",
@@ -305,8 +311,12 @@ async def run_subagent(payload: SubAgentInput) -> dict:
             "verify_attempts": attempts,
             "budget": DispatchBudget(spent=1),
         }
+    progress.reset_dispatch(_tok)
     clean = out["clean_result"].model_copy(update={"dispatch_id": payload.dispatch_id})
     confirmed = [f for f in clean.findings if f.confirmed]
+    progress.emit(
+        "dispatch_end", id=payload.dispatch_id, status=clean.status, n_findings=len(confirmed)
+    )
     verify_q = (
         [f for f in confirmed if not f.independently_verified]
         if payload.intent == "task"
@@ -523,6 +533,7 @@ def build_subagent_graph(
                 "\n\nVERIFIER REJECTED THE PRIOR ATTEMPT. Address every gap and gather"
                 f" real captured evidence:\n{critique.notes}\n{gaps}"
             )
+        progress.emit("activity", stage="exploit", text="executing")
         result = await _invoke_agent(executor, prompt)
         messages = list(result.get("messages", []))
         findings = list(result.get("candidate_findings", []))
@@ -599,13 +610,23 @@ def build_subagent_graph(
         rejected: list[Finding] = []
         not_done: list[str] = []
         capture_ok = True
+        if candidates:
+            progress.emit("activity", stage="verify", text=f"adjudicating {len(candidates)} candidate(s)")
         for c in candidates:
             ok, reason = await _adjudicate(c)
             if ok:
                 confirmed.append(c.model_copy(update={"confirmed": True}))
+                progress.emit(
+                    "finding", status="confirmed", vuln_class=c.vuln_class,
+                    severity=c.severity, target=c.target,
+                )
             else:
                 rejected.append(c)
                 not_done.append(reason)
+                progress.emit(
+                    "finding", status="rejected", vuln_class=c.vuln_class,
+                    severity=c.severity, target=c.target,
+                )
                 if "ALARM" in reason or "capture" in reason.lower():
                     capture_ok = False
         accepted = not rejected
@@ -773,6 +794,10 @@ def _make_bootstrap(cfg: A2pwnConfig):
 
 def _make_plan_node(planner: Any):
     async def _plan_node(state: MasterState) -> dict:
+        b = state["budget"]
+        progress.emit(
+            "phase", phase="plan", round=state.get("round", 0), spent=b.spent, max=b.max_dispatches
+        )
         pending = list(state.get("pending") or [])
         if not pending and not _pending_verify(state):
             pending = await propose_tasks(planner, state)
