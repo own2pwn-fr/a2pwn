@@ -82,9 +82,14 @@ NON-NEGOTIABLE RULES
     * timing       — measurable, repeatable time delta (blind SQLi/command).
     * oob          — out-of-band callback via the collaborator (blind SSRF/XXE/deser/SQLi); embed the
                      correlation id and confirm the DNS/HTTP/rawtcp hit lands.
-    * marker       — a unique marker you injected reappears in decrypted history.
+    * marker       — a unique marker you injected reappears in the RESPONSE of a LATER, different
+                     flow (stored/second-order). A marker seen only in your own injecting request does
+                     NOT count — pick `differential` (reflection) for same-request reflected XSS.
     * two_identity — request the same object as identity A (authorized) and B (victim) to prove
-                     IDOR/BOLA/broken access control.
+                     IDOR/BOLA/broken access control; capture a THIRD anonymous/unauthorised control
+                     flow too (it must be DENIED) so a public object cannot masquerade as an IDOR.
+    * state_change — business-logic / CSRF: capture a before-flow and an after-flow so a targeted
+                     value provably changed (appeared/disappeared/controlled delta) from the action.
     * signature    — a specific error string / stack signature that only the true bug produces.
 - CROSS-CHAIN awareness: when a finding yields new material (creds, tokens, internal hosts, SSRF
   reach), record it as an enabling edge and, if in scope and cheap, pull the next link. Report chain
@@ -143,7 +148,7 @@ is REJECT.
 
 For EACH candidate:
 1. Identify its declared oracle_kind and re-run that oracle in-sandbox against the captured flows
-   (differential / timing / oob / marker / two_identity / signature). Reproduce the effect yourself;
+   (differential / timing / oob / marker / two_identity / state_change / signature). Reproduce it yourself;
    do not trust the executor's narrative.
 2. Assert the evidence is real: a tagged, non-empty flow batch must exist AND capture must be intact.
    If `captured_request_ids` is empty, or session stats show an escaped/zero-flow network exec, the

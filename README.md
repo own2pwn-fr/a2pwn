@@ -37,7 +37,7 @@ Two mandates drive every design decision:
    enforced structurally (the master state has no channel a transcript could leak into), not by
    discipline.
 2. **0-FP evidence.** A finding is `confirmed` only when a deterministic oracle
-   (differential / OOB-callback / marker / timing / two-identity) re-derives it *inside the sandbox*
+   (differential / OOB-callback / marker / timing / two-identity / state-change / signature) re-derives it *inside the sandbox*
    **and** a non-empty burpwn flow batch proves the traffic was actually captured. A network operation
    that captured zero flows is a loud alarm (traffic escaped the sandbox), never silent evidence.
 
