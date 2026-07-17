@@ -56,3 +56,34 @@ async def test_report_finding_bad_enums_default_safely(fake_client):
     )
     assert msg.artifact.severity == "medium"
     assert msg.artifact.oracle_kind == "signature"
+
+
+async def test_report_finding_threads_oracle_inputs_and_exec_ids(fake_client):
+    tool = finding_tools(fake_client)[0]
+    msg = await tool.ainvoke(
+        {
+            "args": {
+                "vuln_class": "ssrf",
+                "severity": "high",
+                "target": "https://app.example.com/fetch",
+                "param": "url",
+                "evidence": "blind SSRF confirmed by OOB callback",
+                "flow_ids": [21],
+                "oracle_kind": "oob",
+                "exec_ids": ["exec-9"],
+                "oracle_signals": ["nslookup", "http-hit"],
+                "correlation_id": "corr-abc123",
+                "oracle_expect": {"threshold_ms": 5000},
+            },
+            "id": "call-3",
+            "name": "report_finding",
+            "type": "tool_call",
+        }
+    )
+    finding = msg.artifact
+    # oracle inputs threaded onto the Finding so the verifier can faithfully replay it
+    assert finding.oracle_signals == ["nslookup", "http-hit"]
+    assert finding.correlation_id == "corr-abc123"
+    assert finding.oracle_expect == {"threshold_ms": 5000}
+    # exec ids threaded onto the flow batch so the sandbox-escape alarm can attribute them
+    assert finding.flow_batch.exec_ids == ["exec-9"]

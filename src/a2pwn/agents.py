@@ -3,8 +3,8 @@
 Three role agents plus one isolated-fork answerer implement the clean-history mandate:
 
 * clarifier — cheap model, structured ``list[str]`` of open questions (or ``[]``).
-* executor — a ReAct agent that drives burpwn; active-exploit tools are gated by
-  ``interrupt_before`` so authorization pauses the graph before a destructive call.
+* executor — a ReAct agent that drives burpwn; active-exploit tools are gated
+  DETERMINISTICALLY in the tool wrappers (a checkpointerless child cannot ``interrupt_before``).
 * verifier — an independent, Opus-class ReAct agent that re-derives every candidate.
 * MasterFork — answers ONE clarify question re-seeded with the *compacted* context only;
   the master planner is never re-invoked, so forks cannot blow up the parent context.
@@ -63,12 +63,25 @@ def build_clarifier(cfg: RoleModels) -> Runnable:
 def build_executor(
     cfg: RoleModels, tools: list[BaseTool], active_exploit_tools: list[str]
 ) -> CompiledStateGraph:
-    """ReAct executor; active-exploit tools pause the graph for authorization."""
+    """ReAct executor.
+
+    Active-exploitation gating is enforced DETERMINISTICALLY in the tool wrappers (the burpwn
+    scope/active guard hard-blocks the call), NOT via ``interrupt_before`` — the sub-agent graph is
+    compiled ``checkpointer=False`` so an ``interrupt_before`` here could never fire. When active
+    exploitation is not authorised we additionally disclose the blocked tools in the prompt so the
+    model does not waste turns attempting them.
+    """
+    prompt = P.EXECUTOR_SYS
+    if active_exploit_tools:
+        blocked = ", ".join(sorted(active_exploit_tools))
+        prompt = (prompt or "") + (
+            "\n\nACTIVE EXPLOITATION IS NOT AUTHORISED for this engagement. The following tools are "
+            f"hard-blocked at the tool layer and MUST NOT be called: {blocked}."
+        )
     return create_react_agent(
         make_model(cfg.executor),
         tools=tools,
-        prompt=P.EXECUTOR_SYS,
-        interrupt_before=active_exploit_tools,
+        prompt=prompt,
         name="executor",
     )
 

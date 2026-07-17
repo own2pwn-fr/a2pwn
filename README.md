@@ -12,7 +12,10 @@
 > [!WARNING]
 > **Authorized testing only.** a2pwn actively probes and exploits the targets you give it. Run it
 > **only** against systems you own or have explicit written permission to test. You are responsible
-> for staying within scope and the law.
+> for staying within scope and the law. a2pwn helps: it registers your in-scope hosts with the burpwn
+> sandbox at startup and the tool wrappers deterministically refuse traffic to out-of-scope hosts
+> (including cloud metadata like `169.254.169.254`) — but scope enforcement is a backstop, not a
+> substitute for your authorization.
 
 ## What it is
 
@@ -57,8 +60,21 @@ Findings and a per-batch HAR export land under the run directory.
 ### Requirements
 
 - [burpwn](https://github.com/own2pwn-fr/burpwn) on `PATH` (the sandbox + intercepting proxy). Run
-  `burpwn doctor` once to confirm the host supports rootless user/network namespaces.
+  `burpwn doctor` once to confirm the host supports rootless user/network namespaces. a2pwn
+  preflights this and aborts immediately with an install hint if the binary is missing — it never
+  starts spending model calls on a run that cannot capture traffic.
 - A model backend (see below). The default needs a working Claude Code login — nothing else.
+
+### Authorization & scope
+
+- Authorization is a **one-time** acknowledgement taken upfront (`--yes` or an interactive
+  `I AGREE`); by default the run then proceeds autonomously.
+- Pass `--step-through` to interactively approve **each** dispatch instead (upfront ack still
+  required). This is the honest per-dispatch gate — the default is upfront-only, not per-dispatch.
+- In-scope hosts come from `--target` (repeatable). They are registered with burpwn and enforced by
+  the tool layer, so a hallucinated/redirected/injected URL cannot drive off-scope traffic.
+- `--dos` is **advisory only**: it is surfaced to the planner/executor prompts as guidance and is
+  not a deterministic tool-layer block.
 
 ## Backends
 
@@ -113,10 +129,11 @@ MASTER graph  (dispatch-only; never touches a target)
 - **Skills** (`skills/`) are curated, self-describing security knowledge — Claude-Code-faithful
   frontmatter plus a2pwn extensions (tags, tools, payload sources, a `verify.py` oracle). Sub-agents
   discover them by an FTS/tag prefilter, then load the relevant one(s).
-- **Payloads** are *referenced* from pinned vendored sources
+- **Payloads** are *referenced* (for attribution), never copied, from pinned vendored sources
   ([PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings) MIT,
-  [HackTricks](https://github.com/HackTricks-wiki/hacktricks) CC-BY-SA, nuclei-templates MIT) — never
-  copied. Run `git submodule update --init` to populate `vendor/`. See `ATTRIBUTION.md`.
+  [HackTricks](https://github.com/HackTricks-wiki/hacktricks) CC-BY-SA, nuclei-templates MIT). They
+  are populated only in a **checkout** via `git submodule update --init`; the `uvx` wheel does not
+  bundle `vendor/`. See `ATTRIBUTION.md`.
 - **Tools** (nuclei, katana, hydra, nmap, ffuf, sqlmap, subfinder, httpx, webcrack…) run *through*
   `burpwn exec` so their traffic is captured. Tools that can't be captured (e.g. Docker in its own
   netns) run with a warning and never claim evidence.

@@ -1,9 +1,16 @@
 """Global dispatch budget + TaskStop kill switch + hard-cap helpers (cost/termination safety)."""
 
 import signal
+import threading
 from typing import Any
 
 from pydantic import BaseModel
+
+# Process-wide TaskStop signal. ``install_stop_handler`` sets it on SIGINT; the master graph's
+# routers (``route_dispatch`` / ``integrate_next``) check ``STOP.is_set()`` so a Ctrl-C reaches the
+# graph even though the DispatchBudget carried in state is a per-phase snapshot the signal handler
+# cannot reach in place. Tests may ``STOP.set()`` / ``STOP.clear()`` around a routing assertion.
+STOP = threading.Event()
 
 
 class DispatchBudget(BaseModel):
@@ -17,6 +24,9 @@ class DispatchBudget(BaseModel):
     spent: int = 0
     max_batch_width: int = 6
     max_phases: int = 12
+    # Cap on independent-verify attempts per finding key across phases; once exhausted a
+    # persistently-unverifiable candidate is dropped from the verify queue (confirmed-only).
+    max_verify_attempts: int = 2
     stopped: bool = False  # TaskStop kill switch (set by CLI signal / interrupt)
 
     def charge(self, n: int = 1) -> "DispatchBudget":
@@ -24,10 +34,13 @@ class DispatchBudget(BaseModel):
 
     @property
     def exhausted(self) -> bool:
-        return self.stopped or self.spent >= self.max_dispatches
+        return self.stopped or STOP.is_set() or self.spent >= self.max_dispatches
 
     def clamp_batch(self, tasks: list) -> list:
-        return tasks[: self.max_batch_width]
+        """Cap a phase's parallel Sends to the batch width AND the remaining hard budget, so a
+        phase never dispatches past ``max_dispatches``."""
+        remaining = max(0, self.max_dispatches - self.spent)
+        return tasks[: min(self.max_batch_width, remaining)]
 
 
 def install_stop_handler(budget_ref: DispatchBudget) -> None:
@@ -42,6 +55,7 @@ def install_stop_handler(budget_ref: DispatchBudget) -> None:
     def _handler(signum: int, frame: Any) -> None:
         state["count"] += 1
         budget_ref.stopped = True
+        STOP.set()  # process-wide signal the graph routers actually read
         if state["count"] >= 2:
             if callable(previous):
                 previous(signum, frame)

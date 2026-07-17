@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,42 @@ def _seed_skills(cfg: A2pwnConfig) -> list:
 
 
 # --------------------------------------------------------------------------- #
+# preflight / scope                                                            #
+# --------------------------------------------------------------------------- #
+class BurpwnMissingError(RuntimeError):
+    """burpwn is not installed / not on PATH — raised before any model is constructed."""
+
+
+def ensure_burpwn_available() -> None:
+    """Fail fast (before spending LLM calls) when the burpwn binary is not on ``PATH``.
+
+    burpwn is a hard requirement: without it every sandbox tool call raises ``FileNotFoundError``
+    lazily inside the ReAct loop, producing a slow, confusing, cost-incurring empty engagement.
+    """
+    if shutil.which("burpwn") is None:
+        raise BurpwnMissingError(
+            "burpwn is not installed or not on PATH. a2pwn drives ALL traffic through the burpwn "
+            "sandbox, so it cannot run without it. Install it from "
+            "https://github.com/own2pwn-fr/burpwn and run `burpwn doctor` to verify the host "
+            "supports rootless user/network namespaces, then re-run."
+        )
+
+
+def _scope_hosts(cfg: A2pwnConfig) -> list[str]:
+    """In-scope host list for burpwn scope enforcement: parse hosts from ``in_scope`` (falling back
+    to ``targets``), de-duplicated and order-preserving."""
+    from a2pwn.scope import host_of
+
+    raw = cfg.engagement.in_scope or cfg.engagement.targets
+    hosts: list[str] = []
+    for token in raw:
+        host = host_of(token)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+# --------------------------------------------------------------------------- #
 # bootstrap                                                                    #
 # --------------------------------------------------------------------------- #
 async def bootstrap(
@@ -99,6 +136,8 @@ async def bootstrap(
     Returns the client, the compiled master graph, and the checkpointer (the caller owns
     closing both the client and the checkpointer so their background threads don't hang exit).
     """
+    ensure_burpwn_available()
+
     try:
         report = BurpwnClient.cli_doctor()
         if isinstance(report, dict) and report.get("ok") is False:
@@ -112,6 +151,14 @@ async def bootstrap(
         _log.info("session new(%s): %s", cfg.engagement.session, exc)
 
     client = BurpwnClient(cfg.engagement.session)
+    # Deterministic scope enforcement: tell burpwn itself which hosts are in scope so it can contain
+    # traffic, backing the per-tool argv guards in tools/burpwn_tools.py. Best-effort: the proxy
+    # daemon may not be up until the first exec, so a failure here is logged, not fatal.
+    for host in _scope_hosts(cfg):
+        try:
+            await client.intercept_scope(host=host)
+        except Exception as exc:  # noqa: BLE001 - scope narrowing is best-effort at bootstrap
+            _log.debug("intercept_scope(%s) failed (continuing): %s", host, exc)
     checkpointer = await _make_checkpointer(cfg)
     collab = Collaborator(client, cfg.engagement.oob_listener)
     fork = MasterFork(cfg.models)
@@ -140,18 +187,6 @@ async def _close_checkpointer(checkpointer: BaseCheckpointSaver) -> None:
             await result
     except Exception as exc:  # noqa: BLE001 - best-effort cleanup
         _log.debug("checkpointer close failed: %s", exc)
-
-
-def bootstrap_node(state: dict) -> dict:
-    """Seed the canonical master state at graph entry (START -> bootstrap -> plan)."""
-    budget = state.get("budget") or DispatchBudget()
-    return {
-        "engagement": state["engagement"],
-        "objective": state["objective"],
-        "budget": budget,
-        "phase": "recon",
-        "round": 0,
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -196,9 +231,14 @@ def _has_dynamic_interrupt(snap: Any) -> bool:
 
 
 def _approve_interrupt(cfg: A2pwnConfig, snap: Any) -> bool:
-    if cfg.engagement.active_exploit_allowed:
-        return True
-    if cfg.engagement.authorization_acknowledged or cfg.disclaimer_ack:
+    """Decide whether to resume past the master's per-dispatch interrupt.
+
+    Authorization is a ONE-TIME acknowledgement taken upfront by the CLI gate; it is NOT a
+    per-dispatch approval. Only interactive step-through mode (``cfg.step_through``) prompts the
+    operator before each dispatch — otherwise approval is upfront-only and the run resumes
+    autonomously (the honest semantics the disclaimer now documents).
+    """
+    if not cfg.step_through:
         return True
     prompt = f"Approve dispatch against {cfg.engagement.targets}? [y/N] "
     try:
@@ -212,31 +252,33 @@ def _approve_interrupt(cfg: A2pwnConfig, snap: Any) -> bool:
 # --------------------------------------------------------------------------- #
 async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str) -> Report:
     """Drive the master graph to completion and build the evidence-grounded report."""
-    client, graph, checkpointer = await bootstrap(cfg)
-    budget = DispatchBudget(
-        max_dispatches=cfg.max_dispatches,
-        max_batch_width=cfg.max_batch_width,
-        max_phases=cfg.max_phases,
-    )
-    install_stop_handler(budget)
-
-    config = {"configurable": {"thread_id": thread_id}}
-    stream_input: Any = {
-        "engagement": cfg.engagement,
-        "objective": objective,
-        "budget": budget,
-        "history": [],
-        "pending": [],
-        "deferred": [],
-        "dispatch_results": [],
-        "findings": [],
-        "verify_queue": [],
-        "phase": "recon",
-        "round": 0,
-    }
+    client: BurpwnClient | None = None
+    checkpointer: BaseCheckpointSaver | None = None
     out_dir = run_out_dir(cfg, thread_id)
-
+    config = {"configurable": {"thread_id": thread_id}}
     try:
+        client, graph, checkpointer = await bootstrap(cfg)
+        budget = DispatchBudget(
+            max_dispatches=cfg.max_dispatches,
+            max_batch_width=cfg.max_batch_width,
+            max_phases=cfg.max_phases,
+        )
+        install_stop_handler(budget)
+
+        stream_input: Any = {
+            "engagement": cfg.engagement,
+            "objective": objective,
+            "budget": budget,
+            "history": [],
+            "pending": [],
+            "deferred": [],
+            "dispatch_results": [],
+            "findings": [],
+            "verify_queue": [],
+            "phase": "recon",
+            "round": 0,
+        }
+
         while True:
             async for chunk in graph.astream(
                 stream_input, config, stream_mode=["updates", "messages"], subgraphs=True
@@ -254,6 +296,13 @@ async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str) -> Re
         final = (await graph.aget_state(config)).values
         report = await build_report(final, client, str(out_dir))
     finally:
-        await client.close()
-        await _close_checkpointer(checkpointer)
+        # Close each subsystem independently so one failing close never orphans the other's worker
+        # thread. The checkpoint is already durable, so the run stays resumable by thread_id.
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown, never mask the real error
+                _log.debug("client close failed: %s", exc)
+        if checkpointer is not None:
+            await _close_checkpointer(checkpointer)
     return report

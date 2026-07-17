@@ -36,10 +36,11 @@ class FakeClient:
         return {"flows": flows, "count": len(flows)}
 
     async def exec(self, argv, workspace=None, timeout_secs=None) -> dict:
+        # The launch exec is a *backgrounding* shell that returns immediately (the listener
+        # is detached), so it must NOT block — blocking here is the deadlock we fixed.
         self.exec_calls.append((argv, workspace, timeout_secs))
         self.exec_started.set()
-        await asyncio.Event().wait()  # a real listener blocks until cancelled
-        return {}
+        return {"exit_code": 0}
 
 
 # --------------------------------------------------------------------------- in-sandbox
@@ -113,19 +114,80 @@ def test_new_correlation_is_16_hex():
 # --------------------------------------------------------------------------- lifecycle
 
 
-async def test_start_in_sandbox_and_stop():
+async def test_start_in_sandbox_launches_detached_and_stop():
     fc = FakeClient({}, [])
     collab = Collaborator(fc)
-    await collab.start_in_sandbox(protocols=("dns", "http", "rawtcp"))
-    await asyncio.wait_for(fc.exec_started.wait(), timeout=1.0)
+    await asyncio.wait_for(collab.start_in_sandbox(protocols=("dns", "http", "rawtcp")), timeout=1.0)
+    assert fc.exec_started.is_set()
 
     argv, workspace, timeout_secs = fc.exec_calls[0]
-    assert argv[:3] == ["python", "-m", "a2pwn._oob_listener"]
-    assert "--protocols" in argv
-    assert timeout_secs is not None
+    # Launched through a throwaway backgrounding shell — NOT a foreground exec that would
+    # hold the request lock for the listener's whole TTL and starve poll().
+    assert argv[0] == "sh" and argv[1] == "-c"
+    wrapper = argv[2]
+    assert "a2pwn._oob_listener" in wrapper
+    assert "--protocols" in wrapper
+    assert "&" in wrapper  # backgrounded so the exec returns immediately
+    assert collab_mod._LAUNCH_TOKEN in wrapper
+    # launch timeout is short and independent of the (up to an hour) listener TTL
+    assert timeout_secs is not None and timeout_secs <= 60
 
-    await collab.stop()  # cancels the blocked exec task
-    assert collab._task is None
+    # idempotent: a second start does not relaunch the sink
+    await collab.start_in_sandbox()
+    assert len(fc.exec_calls) == 1
+
+    await collab.stop()
+    assert collab._started is False
+    # stop issues a best-effort pkill of the listener
+    assert any("pkill" in str(call[0]) for call in fc.exec_calls)
+
+
+class _LockedFakeClient:
+    """Models BurpwnClient's single request lock. A *foreground* exec would hold the lock
+    for its child's whole life; req_search/req_list need the same lock. So a listener run in
+    the foreground starves poll(). A backgrounding launch exec must return at once instead."""
+
+    def __init__(self, flows_by_proto: dict[str, list[dict]], search_ids: list[int]) -> None:
+        self._flows = flows_by_proto
+        self._search_ids = search_ids
+        self._lock = asyncio.Lock()
+        self.listener_running = False
+
+    async def exec(self, argv, workspace=None, timeout_secs=None) -> dict:
+        joined = " ".join(str(a) for a in argv)
+        if "&" in joined or "setsid" in joined:  # backgrounded -> returns without holding the lock
+            self.listener_running = True
+            return {"exit_code": 0}
+        async with self._lock:  # a foreground long-lived listener pins the lock forever
+            await asyncio.Event().wait()
+        return {}
+
+    async def req_search(self, query: str) -> list[int]:
+        async with self._lock:
+            return list(self._search_ids)
+
+    async def req_list(self, protocol=None, **kwargs) -> dict:
+        async with self._lock:
+            flows = self._flows.get(protocol, [])
+            return {"flows": flows, "count": len(flows)}
+
+
+async def test_poll_runs_concurrently_with_live_listener():
+    # Regression for the deadlock: poll() must reach req_search/req_list while the listener
+    # is alive. With the old foreground-exec design this times out on the request lock.
+    cid = "deadbeefdeadbeef"
+    fc = _LockedFakeClient(
+        flows_by_proto={"dns": [{"id": 5, "protocol": "dns", "sni": f"{cid}.oob.test"}]},
+        search_ids=[5],
+    )
+    collab = Collaborator(fc)
+    await asyncio.wait_for(collab.start_in_sandbox(protocols=("dns",)), timeout=1.0)
+    assert fc.listener_running is True
+
+    hits = await asyncio.wait_for(
+        collab.poll(cid, timeout_secs=2, protocols=("dns",)), timeout=5.0
+    )
+    assert [h.flow_id for h in hits] == [5]
 
 
 # --------------------------------------------------------------------------- external

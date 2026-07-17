@@ -5,6 +5,7 @@ import a2pwn.graph as g
 from _graphkit import (
     FakeClarifier,
     FakeExecutor,
+    arm_differential,
     build_sub,
     exec_result,
     make_cfg,
@@ -14,6 +15,10 @@ from _graphkit import (
 from a2pwn.models import TaskSpec
 
 _NO_QUESTIONS = FakeClarifier(lambda ctx: [])
+
+
+async def _no_tasks(planner, state):
+    return []
 
 
 def test_child_compiled_without_checkpointer(monkeypatch, fake_client):
@@ -27,14 +32,15 @@ def test_child_compiled_without_checkpointer(monkeypatch, fake_client):
 
 def _build_master(monkeypatch, fake_client, tmp_saver):
     cfg = make_cfg(active=True)
+    arm_differential(fake_client)  # fail-closed adjudicator needs a positive oracle verdict
     sub = build_sub(
         monkeypatch,
         cfg,
         fake_client,
         clarifier=_NO_QUESTIONS,
-        executor=FakeExecutor(exec_result([make_finding(flow_ids=(101,))])),
+        executor=FakeExecutor(exec_result([make_finding(flow_ids=(101, 102), exec_ids=("e-ok",))])),
     )
-    monkeypatch.setattr(g, "propose_tasks", lambda planner, state: [])
+    monkeypatch.setattr(g, "propose_tasks", _no_tasks)  # async: master plan node awaits it
     graph = g.build_master_graph(cfg, sub, fake_client, tmp_saver)
     return cfg, graph
 

@@ -29,8 +29,23 @@ All notable changes to this project are documented here. The format is based on
   vendored sources, and tool wrappers that always run through `burpwn exec`.
 - **Cost/termination safety.** Global dispatch budget, `TaskStop` kill switch, and hard caps on
   clarify/verify rounds, phases and batch width.
+- **Deterministic scope enforcement.** In-scope hosts (from `--target`) are registered with the
+  burpwn sandbox at bootstrap (`intercept_scope`) and enforced by the tool wrappers, so a
+  hallucinated/redirected/injected URL cannot drive off-scope traffic (incl. cloud metadata).
 - **CLI.** `a2pwn run` with a ToS/authorization acknowledgement gate, SQLite checkpointing by default
   (Postgres drop-in), streamed telemetry and resume.
+
+### Changed
+
+- **burpwn preflight.** `a2pwn run` (and `bootstrap`) now check `burpwn` is on `PATH` and abort with
+  an actionable install message *before* constructing models or spending LLM calls, instead of
+  failing lazily deep inside the ReAct loop.
+- **Honest approval semantics.** Authorization is a one-time upfront acknowledgement; per-dispatch
+  approval is now opt-in via `--step-through` (previously the ack silently auto-approved every
+  interrupt). `--dos` is documented as advisory/prompt-only (not a tool-layer block).
+- **Robust teardown.** `run_engagement` closes the burpwn client and the checkpointer independently
+  in `finally`, so a failing client close no longer orphans the checkpointer's worker thread; the
+  checkpoint stays durable and the run resumable by thread id.
 
 ### Notes
 

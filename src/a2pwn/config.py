@@ -47,7 +47,12 @@ class RoleModels(BaseModel):
             self.executor.provider,
             self.executor.model,
         ):
-            raise ValueError("verifier model must differ from executor (adversarial independence)")
+            spec = f"{self.executor.provider}:{self.executor.model}"
+            raise ValueError(
+                f"verifier backend ({spec}) must differ from the executor ({spec}) for adversarial "
+                "independence — override --verifier-model or --executor-model "
+                "(e.g. keep the executor default and pass --verifier-model opus)."
+            )
         return self
 
 
@@ -59,6 +64,8 @@ class EngagementSpec(BaseModel):
     in_scope: list[str] = Field(default_factory=list)
     authorization_acknowledged: bool = False
     active_exploit_allowed: bool = False
+    # Advisory only: dos_allowed is surfaced to the planner/executor prompts as guidance; a2pwn does
+    # NOT deterministically block DoS-class traffic at the tool layer, so DoS restraint is prompt-only.
     dos_allowed: bool = False
     oob_listener: str | None = None  # external collaborator base (host:port) if provided
     session: str  # burpwn session name (== name by default)
@@ -75,4 +82,9 @@ class A2pwnConfig(BaseModel):
     max_batch_width: int = 6  # hard cap on parallel Sends per phase
     max_dispatches: int = 200  # global budget ceiling
     checkpoint_uri: str | None = None  # None => SqliteSaver default box path
+    # One-time authorization acknowledgement (the CLI ToS gate). Distinct from per-dispatch approval.
     disclaimer_ack: bool = False
+    # Interactive step-through: prompt the operator to approve EACH dispatch. Off by default, so
+    # approval is upfront-only (the one-time ack) and the run proceeds autonomously. Only takes effect
+    # when active exploitation is not pre-authorized (active_exploit_allowed=False keeps the gate).
+    step_through: bool = False

@@ -12,8 +12,6 @@ there is physically no parent channel a transcript could leak into.
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import logging
 import operator
 from typing import Annotated, Any, Literal, TypedDict
@@ -35,7 +33,7 @@ from a2pwn.agents import (
     freeze_context,
 )
 from a2pwn.backends import make_model
-from a2pwn.budget import DispatchBudget
+from a2pwn.budget import STOP, DispatchBudget
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
 from a2pwn.config import A2pwnConfig
 from a2pwn.models import (
@@ -50,31 +48,13 @@ from a2pwn.models import (
     TaskSpec,
     VerifierReport,
 )
-from a2pwn.oracles import VerificationOracle, differential, run_oracle, two_identity
+from a2pwn.oracles import VerificationOracle, run_oracle
 
 # The compiled child subgraph, threaded in by ``build_master_graph``. ``run_subagent``
 # references it here so the master graph never wires it as a node (clean-history guard).
 SUBAGENT_GRAPH: CompiledStateGraph | None = None
 
 _log = logging.getLogger("a2pwn")
-
-
-# --------------------------------------------------------------------------- #
-# async bridge
-# --------------------------------------------------------------------------- #
-def _run(coro: Any) -> Any:
-    """Drive a coroutine to completion from a synchronous graph node.
-
-    LangGraph runs plain-``def`` nodes; the burpwn client / collaborator / fork are
-    async. When no loop is running we simply ``asyncio.run``; when one is (the graph
-    was driven async), we hop to a worker thread with its own loop so we never nest.
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
 
 
 # --------------------------------------------------------------------------- #
@@ -98,6 +78,14 @@ def merge_findings(left: list[Finding], right: list[Finding]) -> list[Finding]:
         if cur is None or f.rank() >= cur.rank():
             by_key[f.key] = f
     return list(by_key.values())
+
+
+def _merge_attempts(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
+    """Sum independent-verify attempt counts per finding key (parallel-Send safe)."""
+    out: dict[str, int] = dict(left or {})
+    for key, n in (right or {}).items():
+        out[key] = out.get(key, 0) + n
+    return out
 
 
 def _merge_budget(acc: DispatchBudget, inc: DispatchBudget) -> DispatchBudget:
@@ -127,6 +115,8 @@ class MasterState(TypedDict):
     dispatch_results: Annotated[list[CleanResult], operator.add]
     findings: Annotated[list[Finding], merge_findings]
     verify_queue: Annotated[list[Finding], operator.add]
+    # finding.key -> count of independent-verify dispatches spent on it (capped drain).
+    verify_attempts: Annotated[dict[str, int], _merge_attempts]
     phase: str
     round: int
     budget: Annotated[DispatchBudget, _merge_budget]
@@ -182,11 +172,21 @@ def _promoted_keys(state: MasterState) -> set[str]:
 
 
 def _pending_verify(state: MasterState) -> list[Finding]:
+    """Confirmed findings still owed an independent-verify dispatch.
+
+    Drops (a) findings already promoted to independently-verified, (b) duplicates, and
+    (c) findings whose independent-verify attempts hit ``budget.max_verify_attempts`` — a
+    persistently-unverifiable candidate stops being re-dispatched every phase and is kept
+    confirmed-only, instead of thrashing the queue until the phase/budget cap.
+    """
     promoted = _promoted_keys(state)
+    attempts = state.get("verify_attempts", {}) or {}
+    budget = state.get("budget")
+    cap = budget.max_verify_attempts if budget is not None else 2
     seen: set[str] = set()
     out: list[Finding] = []
     for f in state.get("verify_queue", []):
-        if f.key in promoted or f.key in seen:
+        if f.key in promoted or f.key in seen or attempts.get(f.key, 0) >= cap:
             continue
         seen.add(f.key)
         out.append(f)
@@ -229,12 +229,12 @@ def _select_dispatch(
 def route_dispatch(state: MasterState) -> list[Send] | str:
     """Conditional edge after ``plan``: fan out Sends, or route to ``report``.
 
-    Guard first: an exhausted budget (spend cap or TaskStop) or hitting the phase cap
-    routes straight to the report. Otherwise emit one ``Send`` per selected invocation;
-    an empty selection also ends the run.
+    Guard first: a TaskStop (``STOP`` event set by SIGINT), an exhausted budget (spend cap
+    or ``stopped`` flag) or hitting the phase cap routes straight to the report. Otherwise
+    emit one ``Send`` per selected invocation; an empty selection also ends the run.
     """
     budget = state["budget"]
-    if budget.exhausted or state["round"] >= budget.max_phases:
+    if STOP.is_set() or budget.exhausted or state["round"] >= budget.max_phases:
         return "report"
     _mode, inputs, _deferred = _select_dispatch(state)
     if not inputs:
@@ -257,23 +257,51 @@ async def run_subagent(payload: SubAgentInput) -> dict:
     if sub is None:  # pragma: no cover - build_master_graph always sets it
         raise RuntimeError("SUBAGENT_GRAPH is not initialised; build the master graph first")
     thread_id = f"{payload.master_ctx.engagement.name}:{payload.dispatch_id}"
-    out = await sub.ainvoke(
-        {
-            "intent": payload.intent,
-            "spec": payload.spec,
-            "candidate": payload.candidate,
-            "master_ctx": payload.master_ctx,
-            "clarifications": [],
-            "refined_prompt": "",
-            "messages": [],
-            "candidate_findings": [],
-            "flow_batches": [],
-            "critique": None,
-            "verify_round": 0,
-            "clarify_round": 0,
-        },
-        config={"configurable": {"thread_id": thread_id}},
+    # A verify dispatch counts as one independent-verify attempt for its candidate key even when
+    # it fails/errors, so a persistently-unverifiable finding drains from the queue (capped).
+    attempt_key = (
+        payload.candidate.key
+        if payload.intent == "verify" and payload.candidate is not None
+        else None
     )
+    attempts = {attempt_key: 1} if attempt_key else {}
+    try:
+        out = await sub.ainvoke(
+            {
+                "intent": payload.intent,
+                "spec": payload.spec,
+                "candidate": payload.candidate,
+                "master_ctx": payload.master_ctx,
+                "clarifications": [],
+                "refined_prompt": "",
+                "messages": [],
+                "candidate_findings": [],
+                "flow_batches": [],
+                "critique": None,
+                "verify_round": 0,
+                "clarify_round": 0,
+            },
+            config={"configurable": {"thread_id": thread_id}},
+        )
+    except Exception as exc:  # noqa: BLE001 - isolate a failing child: degrade, never abort the batch
+        _log.warning(
+            "sub-agent dispatch %s failed, degrading to a blocked result: %s",
+            payload.dispatch_id,
+            exc,
+            exc_info=True,
+        )
+        clean = CleanResult(
+            dispatch_id=payload.dispatch_id,
+            status="blocked",
+            summary=f"dispatch error: {exc}",
+        )
+        return {
+            "dispatch_results": [clean],
+            "findings": [],
+            "verify_queue": [],
+            "verify_attempts": attempts,
+            "budget": DispatchBudget(spent=1),
+        }
     clean = out["clean_result"].model_copy(update={"dispatch_id": payload.dispatch_id})
     confirmed = [f for f in clean.findings if f.confirmed]
     verify_q = (
@@ -285,6 +313,7 @@ async def run_subagent(payload: SubAgentInput) -> dict:
         "dispatch_results": [clean],
         "findings": confirmed,
         "verify_queue": verify_q,
+        "verify_attempts": attempts,
         "budget": DispatchBudget(spent=1),
     }
 
@@ -292,14 +321,29 @@ async def run_subagent(payload: SubAgentInput) -> dict:
 # --------------------------------------------------------------------------- #
 # subagent nodes
 # --------------------------------------------------------------------------- #
+# Tools that generate real, potentially-destructive network traffic. The deterministic block lives
+# in the tool wrappers (BURPWN scope/active guard); this set drives the executor prompt disclosure
+# and any tagging, and is keyed on an ``is_active``/``destructive`` marker with a name fallback for
+# the concrete tool names (the old ``exploit_*`` prefix matched nothing).
+_ACTIVE_TOOL_NAMES = frozenset(
+    {"burpwn_exec", "burpwn_fuzz", "burpwn_req_replay", "burpwn_intercept_forward"}
+)
+
+
+def _is_active_tool(t: Any) -> bool:
+    if getattr(t, "is_active", False) or getattr(t, "destructive", False):
+        return True
+    meta = getattr(t, "metadata", None)
+    if isinstance(meta, dict) and (meta.get("active") or meta.get("destructive")):
+        return True
+    return getattr(t, "name", "") in _ACTIVE_TOOL_NAMES
+
+
 def _active_tools(cfg: A2pwnConfig, tools: list) -> list[str]:
+    """Names of active-exploitation tools to gate when the engagement did not pre-authorise them."""
     if cfg.engagement.active_exploit_allowed:
         return []
-    return [
-        t.name
-        for t in tools
-        if getattr(t, "name", "").startswith("exploit_") or "active" in getattr(t, "name", "")
-    ]
+    return [t.name for t in tools if _is_active_tool(t)]
 
 
 def _clarify_ctx(state: SubAgentState) -> dict:
@@ -409,6 +453,10 @@ def build_subagent_graph(
         return {"clarify_round": state.get("clarify_round", 0) + 1}
 
     async def _clarify_edge(state: SubAgentState) -> list[Send] | str:
+        # Short-circuit: once the round cap is exhausted the clarifier's answer is discarded
+        # anyway, so skip the wasted LLM call and compose the prompt directly.
+        if state.get("clarify_round", 0) > cfg.max_clarify_rounds:
+            return "compose_prompt"
         questions = await clarifier.ainvoke(_clarify_ctx(state))
         aug = {
             "questions": list(questions or []),
@@ -472,27 +520,36 @@ def build_subagent_graph(
             "flow_batches": batches,
         }
 
-    async def _maybe_oracle(candidate: Finding):
+    def _oracle_inputs(candidate: Finding) -> tuple[VerificationOracle, dict]:
+        """Build the finding's real oracle spec + live ctx for the deterministic adjudicator."""
         fids = candidate.flow_batch.flow_ids
-        if candidate.oracle_kind == "differential" and len(fids) >= 2:
-            return await differential(client, fids[0], fids[1], {"signal": "any"})
-        if candidate.oracle_kind == "two_identity" and len(fids) >= 2:
-            return await two_identity(client, fids[0], fids[1])
-        if candidate.oracle_kind in {"marker", "oob", "timing", "signature"}:
-            spec = VerificationOracle(kind=candidate.oracle_kind)
-            ctx = {
-                "client": client,
-                "collab": collab,
-                "flow_id": candidate.flow_batch.key_flow,
-                "correlation_id": None,
-            }
-            try:
-                return await run_oracle(spec, ctx)
-            except Exception:
-                return None
-        return None
+        key_flow = candidate.flow_batch.key_flow
+        expect = dict(candidate.oracle_expect or {})
+        spec = VerificationOracle(
+            kind=candidate.oracle_kind,
+            signals=list(candidate.oracle_signals),
+            correlation_id=candidate.correlation_id,
+            expect=expect,
+        )
+        ctx = {
+            "client": client,
+            "collaborator": collab,
+            "collab": collab,
+            "flow_id": key_flow if key_flow is not None else (fids[0] if fids else None),
+            "flow_a": fids[0] if len(fids) >= 1 else None,
+            "flow_b": fids[1] if len(fids) >= 2 else None,
+            "a_ref": fids[0] if len(fids) >= 1 else None,
+            "b_ref": fids[1] if len(fids) >= 2 else None,
+            "attack_id": expect.get("attack_id"),
+            "threshold_ms": expect.get("threshold_ms", 5000),
+            "correlation_id": candidate.correlation_id,
+        }
+        return spec, ctx
 
     async def _adjudicate(candidate: Finding) -> tuple[bool, str]:
+        """FAIL-CLOSED adjudication. Confirm ONLY when the capture is provably real AND the
+        finding's own deterministic oracle re-derives it. A missing/unmapped kind, an oracle
+        error, or a ``None`` verdict all REJECT with a reason — never swallowed to a pass."""
         batch = candidate.flow_batch
         if not batch.flow_ids:
             return False, f"REJECT {candidate.key}: empty flow batch — capture alarm"
@@ -501,9 +558,19 @@ def build_subagent_graph(
             return False, reason
         if await fbm.tls_passthru_blocked(batch):
             return False, f"BLOCKED {candidate.key}: tls-passthru target — MITM blocked, not testable"
-        res = await _maybe_oracle(candidate)
-        if res is not None and not res.confirmed:
-            return False, f"REJECT {candidate.key}: oracle {candidate.oracle_kind} did not re-derive ({res.evidence})"
+        spec, ctx = _oracle_inputs(candidate)
+        try:
+            res = await run_oracle(spec, ctx)
+        except Exception as exc:  # noqa: BLE001 - fail-closed: any oracle error REJECTS
+            return False, f"REJECT {candidate.key}: oracle {candidate.oracle_kind} errored ({exc})"
+        if res is None:  # defensive; run_oracle's contract is to never return None
+            return False, f"REJECT {candidate.key}: oracle {candidate.oracle_kind} returned no verdict"
+        if not res.confirmed:
+            return (
+                False,
+                f"REJECT {candidate.key}: oracle {candidate.oracle_kind} did not re-derive "
+                f"({res.evidence})",
+            )
         return True, ""
 
     async def _verify(state: SubAgentState) -> dict:
@@ -644,9 +711,12 @@ class _PlanOut(BaseModel):
     tasks: list[TaskSpec] = Field(default_factory=list)
 
 
-def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
+async def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
     """Ask the master planner for fresh TaskSpecs. Degrades to ``[]`` on any error so a
-    missing/offline model ends the run cleanly instead of hanging."""
+    missing/offline model ends the run cleanly instead of hanging.
+
+    Async so the whole engagement runs on the single ``astream``-owned loop — no
+    ``asyncio.run``-per-call touching the long-lived client from a worker thread."""
     try:
         ctx = {
             "objective": state["objective"],
@@ -655,7 +725,7 @@ def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
             "findings": state.get("findings", []),
         }
         messages = P.render_messages(P.MASTER_PLAN_SYS, ctx)
-        out = _run(planner.with_structured_output(_PlanOut).ainvoke(messages))
+        out = await planner.with_structured_output(_PlanOut).ainvoke(messages)
         tasks = list(out.tasks)
         if not tasks:
             _log.warning("planner returned no tasks (empty structured output)")
@@ -667,12 +737,15 @@ def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
 
 def _make_bootstrap(cfg: A2pwnConfig):
     def _bootstrap_node(state: MasterState) -> dict:
-        updates: dict = {"phase": "recon", "round": 0}
+        # Seed verify_attempts so the reducer channel is initialised even when the runner's
+        # stream input omits it (it is written per verify dispatch by run_subagent).
+        updates: dict = {"phase": "recon", "round": 0, "verify_attempts": {}}
         if not state.get("budget"):
             updates["budget"] = DispatchBudget(
                 max_dispatches=cfg.max_dispatches,
                 max_batch_width=cfg.max_batch_width,
                 max_phases=cfg.max_phases,
+                max_verify_attempts=cfg.max_verify_rounds,
             )
         return updates
 
@@ -680,10 +753,10 @@ def _make_bootstrap(cfg: A2pwnConfig):
 
 
 def _make_plan_node(planner: Any):
-    def _plan_node(state: MasterState) -> dict:
+    async def _plan_node(state: MasterState) -> dict:
         pending = list(state.get("pending") or [])
         if not pending and not _pending_verify(state):
-            pending = propose_tasks(planner, state)
+            pending = await propose_tasks(planner, state)
         parallel, deferred = partition_pending(pending)
         clamped = state["budget"].clamp_batch(parallel)
         overflow = parallel[len(clamped):]
@@ -692,7 +765,7 @@ def _make_plan_node(planner: Any):
     return _plan_node
 
 
-def _integrate_node(state: MasterState) -> dict:
+async def _integrate_node(state: MasterState) -> dict:
     processed = len(state.get("history", []))
     new_results = state.get("dispatch_results", [])[processed:]
     records: list[DispatchRecord] = []
@@ -723,16 +796,18 @@ def _integrate_node(state: MasterState) -> dict:
 
 
 def integrate_next(state: MasterState) -> Literal["continue", "done"]:
-    """Loop for another phase while there is work and budget; otherwise report."""
+    """Loop for another phase while there is work and budget; otherwise report.
+
+    A TaskStop (``STOP`` set by SIGINT) or an exhausted/phase-capped budget ends the run."""
     budget = state["budget"]
-    if budget.exhausted or state["round"] >= budget.max_phases:
+    if STOP.is_set() or budget.exhausted or state["round"] >= budget.max_phases:
         return "done"
     if state.get("pending") or _pending_verify(state):
         return "continue"
     return "done"
 
 
-def _report_node(state: MasterState) -> dict:
+async def _report_node(state: MasterState) -> dict:
     """Terminal marker; ``runtime.build_report`` promotes the verified findings and
     exports the per-workspace HAR from the final state."""
     return {"phase": "report"}

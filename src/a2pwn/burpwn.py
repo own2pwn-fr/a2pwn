@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -22,6 +23,8 @@ from a2pwn.models import FlowBatchRef
 
 _PROTOCOL_VERSION = "2024-11-05"
 _CLIENT_INFO = {"name": "a2pwn", "version": "0.1.0"}
+
+_log = logging.getLogger("a2pwn.burpwn")
 
 
 class BurpwnError(RuntimeError):
@@ -65,7 +68,7 @@ class BurpwnClient:
     single stdout channel stays coherent under concurrent callers.
     """
 
-    def __init__(self, session: str):
+    def __init__(self, session: str, request_timeout: float | None = None):
         self.session = session
         self._argv = ["burpwn", "mcp", "--session", session]
         self._proc: asyncio.subprocess.Process | None = None
@@ -73,6 +76,10 @@ class BurpwnClient:
         self._req_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._started = False
+        # Per-request read timeout (seconds); None disables it so long-running network
+        # execs (sqlmap/nmap/…) are not cut off. Set it to fail a wedged server fast.
+        self._request_timeout = request_timeout
+        self._stderr_task: asyncio.Task | None = None
 
     # ---- lifecycle --------------------------------------------------------
     async def _ensure_started(self) -> None:
@@ -90,6 +97,9 @@ class BurpwnClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
+            # Continuously drain stderr so >64KB of burpwn logging cannot fill the OS
+            # pipe buffer and wedge the child's stdout responses (pipe-buffer deadlock).
+            self._stderr_task = asyncio.ensure_future(self._drain_stderr())
             await self._request(
                 "initialize",
                 {
@@ -101,12 +111,31 @@ class BurpwnClient:
             await self._notify("notifications/initialized", {})
             self._started = True
 
+    async def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    return
+                _log.debug("burpwn[stderr] %s", line.decode(errors="replace").rstrip())
+        except (asyncio.CancelledError, ValueError):  # ValueError: transport closed
+            return
+        except Exception as exc:  # noqa: BLE001 - draining must never crash the client
+            _log.debug("burpwn stderr drain stopped: %s", exc)
+
     async def close(self) -> None:
         proc = self._proc
         if proc is None:
             return
         self._proc = None
         self._started = False
+        task = self._stderr_task
+        self._stderr_task = None
+        if task is not None:
+            task.cancel()
         if proc.returncode is None:
             try:
                 proc.terminate()
@@ -128,22 +157,36 @@ class BurpwnClient:
 
     async def _recv(self) -> dict:
         assert self._proc is not None and self._proc.stdout is not None
-        line = await self._proc.stdout.readline()
-        if not line:
-            raise BurpwnError("burpwn mcp server closed the stream")
-        return json.loads(line.decode())
+        # Skip blank / non-JSON stdout lines (a stray log leaking to stdout must not
+        # kill the in-flight call) — keep reading until a valid JSON object or EOF.
+        while True:
+            line = await self._proc.stdout.readline()
+            if not line:
+                raise BurpwnError("burpwn mcp server closed the stream")
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                _log.debug("burpwn: skipping non-JSON stdout line: %s", text[:200])
+                continue
 
     async def _notify(self, method: str, params: dict) -> None:
         async with self._req_lock:
             await self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
-    async def _request(self, method: str, params: dict) -> dict:
+    async def _request(self, method: str, params: dict, timeout: float | None = None) -> dict:
+        timeout = timeout if timeout is not None else self._request_timeout
         async with self._req_lock:
             self._id += 1
             rid = self._id
             await self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
             while True:
-                resp = await self._recv()
+                try:
+                    resp = await asyncio.wait_for(self._recv(), timeout=timeout)
+                except TimeoutError as exc:
+                    raise BurpwnError(f"{method}: timed out after {timeout}s") from exc
                 if resp.get("id") != rid:
                     continue  # skip server notifications / unrelated ids
                 if "error" in resp:
@@ -359,20 +402,75 @@ class FlowBatchManager:
             }
         )
 
+    @staticmethod
+    def _exec_id_set(value: Any) -> set[str]:
+        """Extract exec ids from a session_stats field that may be a list of id
+        strings/ints or a list of ``{exec_id/id: ...}`` dicts (defensive on shape)."""
+        out: set[str] = set()
+        if isinstance(value, list):
+            for e in value:
+                if isinstance(e, dict):
+                    eid = e.get("exec_id", e.get("id"))
+                    if eid is not None:
+                        out.add(str(eid))
+                elif isinstance(e, (str, int)):
+                    out.add(str(e))
+        return out
+
     async def assert_capture(self, ref: FlowBatchRef, exec_ids: list[str]) -> tuple[bool, str]:
+        """Prove the batch's target traffic was actually MITM'd/contained.
+
+        Consults ``session_stats``: any exec whose id appears in ``escaped_execs`` (traffic
+        left the sandbox) or ``network_zero_flow_execs`` (a network exec that captured no
+        flow) is a loud ALARM. Only returns ``(True, "")`` when capture is provably real —
+        never merely because ``exec_ids`` happens to be empty.
+        """
         stats = await self.client.session_stats()
-        escaped = {e.get("exec_id") for e in stats.get("escaped_execs", [])}
-        offenders = [eid for eid in exec_ids if eid in escaped]
+        escaped = self._exec_id_set(stats.get("escaped_execs"))
+        zero_flow = self._exec_id_set(stats.get("network_zero_flow_execs"))
+        bad = escaped | zero_flow
+
+        ids = [str(e) for e in (exec_ids or ref.exec_ids or [])]
+        offenders = [eid for eid in ids if eid in bad]
         if offenders:
             return (
                 False,
                 "ALARM: traffic escaped the sandbox — network exec(s) "
-                f"{offenders} captured 0 flows; evidence rejected",
+                f"{offenders} captured 0 flows / escaped capture; evidence rejected",
+            )
+        if ids:
+            # Every attributed exec captured flows and none escaped.
+            return True, ""
+        # No exec ids to attribute this batch to. Capture is provable only via the
+        # sealed flows, and only if nothing escaped the sandbox in this session.
+        if escaped:
+            return (
+                False,
+                "ALARM: unattributable capture — no exec ids on the batch while the "
+                f"session reports escaped network exec(s) {sorted(escaped)}; evidence rejected",
+            )
+        if not ref.flow_ids:
+            return (
+                False,
+                "cannot prove capture: batch has neither exec ids nor captured flows",
             )
         return True, ""
 
-    async def tls_passthru_blocked(self, ref: FlowBatchRef) -> bool:
-        res = await self.client.req_list(workspace_id=ref.workspace_id, protocol="tls-passthru")
+    async def tls_passthru_blocked(self, ref: FlowBatchRef, target: str | None = None) -> bool:
+        """True when the target's MITM is blocked (cert-pinned/QUIC ``tls-passthru``).
+
+        Scoped to ``target``'s host when given so an incidental pinned/CDN passthru flow to
+        an unrelated third party in the same workspace does not falsely block a captured
+        finding; falls back to the whole workspace when no target host is available.
+        """
+        host = None
+        if target:
+            from a2pwn.scope import host_of
+
+            host = host_of(target)
+        res = await self.client.req_list(
+            workspace_id=ref.workspace_id, protocol="tls-passthru", host=host
+        )
         return bool(res.get("flows"))
 
     @staticmethod

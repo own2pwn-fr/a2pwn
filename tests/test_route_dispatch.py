@@ -79,3 +79,30 @@ def test_route_skips_already_promoted_verify_candidates():
     # verify_queue still lists it, but findings shows it promoted -> drained, no task pending
     state = make_master_state(cfg, findings=(verified,), verify_queue=(verified,))
     assert route_dispatch(state) == "report"
+
+
+def test_route_drops_persistently_unverifiable_candidate_after_cap():
+    cfg = make_cfg()
+    candidate = make_finding(confirmed=True, flow_ids=(1,))
+    # Confirmed-but-never-independently-verified: after max_verify_attempts failed reproductions
+    # it must stop being re-dispatched every phase (kept confirmed-only), not thrash the queue.
+    state = make_master_state(cfg, findings=(candidate,), verify_queue=(candidate,))
+    cap = state["budget"].max_verify_attempts
+    state["verify_attempts"] = {candidate.key: cap}
+    assert route_dispatch(state) == "report"
+
+    # One attempt below the cap it is still owed a verify dispatch.
+    state["verify_attempts"] = {candidate.key: cap - 1}
+    out = route_dispatch(state)
+    assert isinstance(out, list)
+    assert all(s.arg.intent == "verify" for s in out)
+
+
+def test_route_clamps_batch_to_remaining_hard_budget():
+    cfg = make_cfg(max_batch_width=6)
+    tasks = tuple(_task(f"t{i}", f"https://t/{i}") for i in range(5))
+    # Only one dispatch of hard budget remains -> a phase may not dispatch past it.
+    state = make_master_state(cfg, pending=tasks, budget=make_budget(cfg, max_dispatches=2, spent=1))
+    out = route_dispatch(state)
+    assert isinstance(out, list)
+    assert len(out) == 1

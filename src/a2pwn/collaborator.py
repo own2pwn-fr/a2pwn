@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import socket
 import time
 import uuid
@@ -43,6 +44,10 @@ _REAL_TO_LOGICAL: dict[str, str] = {
 }
 _MATCH_FIELDS = ("authority", "path", "sni", "host")
 _POLL_INTERVAL = 1.0
+# marker echoed by the backgrounding shell so the launch exec has observable output
+_LAUNCH_TOKEN = "oob-listener-launched"  # noqa: S105 - not a secret, a log sentinel
+# the backgrounding launch exec returns at once; keep its timeout short and independent of the TTL
+_LAUNCH_TIMEOUT_SECS = 15
 
 
 def _detect_local_ip() -> str:
@@ -87,7 +92,7 @@ class Collaborator:
         self._client = client
         self._external_base = external_base or None
         self._host_cache: str | None = None
-        self._task: asyncio.Task | None = None
+        self._started = False
         self._workspace = os.environ.get("A2PWN_OOB_WORKSPACE", "oob") or None
         self._dns_port = int(os.environ.get("A2PWN_OOB_DNS_PORT", "53"))
         self._http_port = int(os.environ.get("A2PWN_OOB_HTTP_PORT", "80"))
@@ -116,11 +121,8 @@ class Collaborator:
 
     # ------------------------------------------------------------------ lifecycle
 
-    async def start_in_sandbox(self, protocols=("dns", "rawtcp", "http")) -> None:
-        """Launch the stdlib sink inside the sandbox; its callbacks become captured flows."""
-        if self._task is not None and not self._task.done():
-            return
-        argv = [
+    def _listener_argv(self, protocols) -> list[str]:
+        return [
             "python",
             "-m",
             "a2pwn._oob_listener",
@@ -135,18 +137,41 @@ class Collaborator:
             "--duration",
             str(self._ttl),
         ]
-        self._task = asyncio.create_task(
-            self._client.exec(argv, workspace=self._workspace, timeout_secs=self._ttl)
-        )
+
+    async def start_in_sandbox(self, protocols=("dns", "rawtcp", "http")) -> None:
+        """Launch the stdlib sink inside the sandbox as a **detached background** process.
+
+        DEADLOCK FIX: the previous design ran the listener as a foreground ``exec`` for its
+        whole TTL (up to an hour). ``BurpwnClient.exec`` holds the client's single request
+        lock until the child exits, so every ``poll()`` (``req_search``/``req_list``) blocked
+        behind the listener and no blind-OOB callback could ever be observed. Here the listener
+        is ``setsid``-detached and backgrounded (``&``) by a throwaway shell, so the launch
+        ``exec`` returns immediately, releasing the lock; the listener keeps running and its
+        callbacks are captured by the MITM independently of the launcher process. ``poll`` then
+        runs concurrently against the live listener.
+        """
+        if self._started:
+            return
+        inner = shlex.join(self._listener_argv(protocols))
+        # setsid -> new session survives the launcher shell exiting; & -> shell returns at once.
+        wrapper = f"setsid {inner} >/dev/null 2>&1 & echo {_LAUNCH_TOKEN}"
+        argv = ["sh", "-c", wrapper]
+        await self._client.exec(argv, workspace=self._workspace, timeout_secs=_LAUNCH_TIMEOUT_SECS)
+        self._started = True
 
     async def stop(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - stopping is best-effort
-                pass
-        self._task = None
+        """Best-effort teardown. The listener also self-terminates after ``--duration``."""
+        if not self._started:
+            return
+        try:
+            await self._client.exec(
+                ["pkill", "-f", "a2pwn._oob_listener"],
+                workspace=self._workspace,
+                timeout_secs=_LAUNCH_TIMEOUT_SECS,
+            )
+        except Exception:  # noqa: BLE001 - stopping is best-effort; the sink self-expires anyway
+            pass
+        self._started = False
 
     # ------------------------------------------------------------------ polling
 

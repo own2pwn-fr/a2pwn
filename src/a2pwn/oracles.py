@@ -243,6 +243,11 @@ def _pick(ctx: dict, spec: VerificationOracle, key: str, default: Any = None) ->
     return spec.expect.get(key, default)
 
 
+def _fail_closed(kind: str, reason: str) -> OracleResult:
+    """Fail-closed abstention: the 0-FP kernel never lets an unevaluated oracle pass."""
+    return OracleResult(confirmed=False, kind=kind, evidence=reason)
+
+
 async def run_oracle(spec: VerificationOracle, ctx: dict) -> OracleResult:
     """Dispatch to the right deterministic oracle.
 
@@ -250,35 +255,78 @@ async def run_oracle(spec: VerificationOracle, ctx: dict) -> OracleResult:
     ``{client, collaborator|collab, flow_a, flow_b, a_ref, b_ref, attack_id,
     flow_id, threshold_ms, correlation_id}``. Missing scalar params fall back to
     ``spec.expect``; ``correlation_id`` falls back to ``spec.correlation_id``.
+
+    **Fail-closed contract**: this coroutine NEVER returns ``None``. An unknown kind,
+    missing data, or an internal error yields ``OracleResult(confirmed=False, ...)`` so
+    the adjudicator can reject-with-reason instead of swallowing an exception into a
+    silent confirm. Every individual oracle returns a definite ``bool``.
     """
     kind = spec.kind
     client: BurpwnClient = ctx.get("client")
     collab: Collaborator = ctx.get("collaborator") or ctx.get("collab")
 
-    if kind == "differential":
-        return await differential(
-            client, _pick(ctx, spec, "flow_a"), _pick(ctx, spec, "flow_b"), spec.expect
-        )
-    if kind == "timing":
-        threshold = int(_pick(ctx, spec, "threshold_ms", default=5000))
-        return await timing_blind(client, _pick(ctx, spec, "attack_id"), threshold)
-    if kind == "oob":
-        cid = spec.correlation_id or ctx.get("correlation_id")
-        protocols = tuple(spec.expect.get("protocols", ("dns", "http", "rawtcp")))
-        timeout_secs = int(spec.expect.get("timeout_secs", 30))
-        return await oob(collab, cid, protocols=protocols, timeout_secs=timeout_secs)
-    if kind == "marker":
-        cid = spec.correlation_id or ctx.get("correlation_id")
-        return await marker(client, cid)
-    if kind == "two_identity":
-        return await two_identity(client, _pick(ctx, spec, "a_ref"), _pick(ctx, spec, "b_ref"))
-    if kind == "signature":
-        return await signature(client, _pick(ctx, spec, "flow_id"), spec.signals)
-    if kind == "llm_rubric":
-        return OracleResult(
-            confirmed=False,
-            kind="llm_rubric",
-            evidence="llm_rubric is adjudicated by the adversarial verifier agent; "
-            "no deterministic oracle can confirm it (0-FP kernel abstains)",
-        )
-    raise ValueError(f"unknown oracle kind: {kind!r}")
+    try:
+        if kind == "differential":
+            if client is None:
+                return _fail_closed(kind, "differential: no burpwn client in ctx (fail-closed)")
+            flow_a = _pick(ctx, spec, "flow_a")
+            flow_b = _pick(ctx, spec, "flow_b")
+            if flow_a is None or flow_b is None:
+                return _fail_closed(
+                    kind, f"differential: needs two flow ids, got a={flow_a!r} b={flow_b!r}"
+                )
+            return await differential(client, flow_a, flow_b, spec.expect)
+        if kind == "timing":
+            if client is None:
+                return _fail_closed(kind, "timing: no burpwn client in ctx (fail-closed)")
+            attack_id = _pick(ctx, spec, "attack_id")
+            if attack_id is None:
+                return _fail_closed(kind, "timing: no attack_id to read fuzz results from")
+            threshold = int(_pick(ctx, spec, "threshold_ms", default=5000))
+            return await timing_blind(client, attack_id, threshold)
+        if kind == "oob":
+            cid = spec.correlation_id or ctx.get("correlation_id")
+            if collab is None:
+                return _fail_closed(kind, "oob: no collaborator in ctx (fail-closed)")
+            if not cid:
+                return _fail_closed(kind, "oob: no correlation_id to poll for (fail-closed)")
+            protocols = tuple(spec.expect.get("protocols", ("dns", "http", "rawtcp")))
+            timeout_secs = int(spec.expect.get("timeout_secs", 30))
+            return await oob(collab, cid, protocols=protocols, timeout_secs=timeout_secs)
+        if kind == "marker":
+            cid = spec.correlation_id or ctx.get("correlation_id")
+            if client is None:
+                return _fail_closed(kind, "marker: no burpwn client in ctx (fail-closed)")
+            if not cid:
+                return _fail_closed(kind, "marker: no correlation_id to search for (fail-closed)")
+            return await marker(client, cid)
+        if kind == "two_identity":
+            if client is None:
+                return _fail_closed(kind, "two_identity: no burpwn client in ctx (fail-closed)")
+            a_ref = _pick(ctx, spec, "a_ref")
+            b_ref = _pick(ctx, spec, "b_ref")
+            if a_ref is None or b_ref is None:
+                return _fail_closed(
+                    kind, f"two_identity: needs attacker+owner flows, got a={a_ref!r} b={b_ref!r}"
+                )
+            return await two_identity(client, a_ref, b_ref)
+        if kind == "signature":
+            if client is None:
+                return _fail_closed(kind, "signature: no burpwn client in ctx (fail-closed)")
+            flow_id = _pick(ctx, spec, "flow_id")
+            if flow_id is None:
+                return _fail_closed(kind, "signature: no flow_id to inspect (fail-closed)")
+            if not any(s for s in spec.signals):
+                return _fail_closed(
+                    kind, "signature: no signals to match — cannot re-derive (fail-closed)"
+                )
+            return await signature(client, flow_id, spec.signals)
+        if kind == "llm_rubric":
+            return _fail_closed(
+                kind,
+                "llm_rubric is adjudicated by the adversarial verifier agent; "
+                "no deterministic oracle can confirm it (0-FP kernel abstains)",
+            )
+        return _fail_closed(kind, f"unknown oracle kind {kind!r}; cannot re-derive (fail-closed)")
+    except Exception as exc:  # noqa: BLE001 - an oracle crash must REJECT, never silent-confirm
+        return _fail_closed(kind, f"oracle {kind!r} raised {exc!r}; cannot re-derive (fail-closed)")

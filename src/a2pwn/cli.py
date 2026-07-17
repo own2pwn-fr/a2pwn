@@ -15,7 +15,7 @@ import typer
 
 from a2pwn.config import A2pwnConfig, BackendConfig, EngagementSpec, RoleModels
 from a2pwn.report import render_markdown
-from a2pwn.runtime import run_engagement, run_out_dir
+from a2pwn.runtime import BurpwnMissingError, ensure_burpwn_available, run_engagement, run_out_dir
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
                   help="Autonomous, evidence-grounded web-pentest orchestrator.")
@@ -63,7 +63,8 @@ def run(
     objective: str = typer.Option(..., "--objective", "-o", help="Engagement objective for the planner."),
     name: str = typer.Option("a2pwn", "--name", help="Engagement + burpwn session name (thread id)."),
     active_exploit: bool = typer.Option(False, "--active-exploit", help="Allow active exploitation without a per-dispatch pause."),
-    dos: bool = typer.Option(False, "--dos", help="Permit denial-of-service class techniques."),
+    step_through: bool = typer.Option(False, "--step-through", help="Interactively approve EACH dispatch (default: upfront-only approval)."),
+    dos: bool = typer.Option(False, "--dos", help="Advisory: signal to the planner that DoS-class techniques are permitted (prompt-only, not tool-enforced)."),
     oob_listener: str | None = typer.Option(None, "--oob-listener", help="External OOB collaborator base (host:port)."),
     checkpoint_uri: str | None = typer.Option(None, "--checkpoint-uri", help="Postgres URI (defaults to on-box SQLite)."),
     executor_model: str | None = typer.Option(None, "--executor-model", help="Override the executor role model."),
@@ -92,6 +93,13 @@ def run(
         typer.echo("Authorization not confirmed. Aborting.", err=True)
         raise typer.Exit(2)
 
+    # Fail fast on the most common first-run failure before constructing models or spending LLM calls.
+    try:
+        ensure_burpwn_available()
+    except BurpwnMissingError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
     engagement = EngagementSpec(
         name=name,
         targets=target,
@@ -111,12 +119,17 @@ def run(
             max_dispatches=max_dispatches,
             checkpoint_uri=checkpoint_uri,
             disclaimer_ack=ack,
+            step_through=step_through,
         )
     except ValueError as exc:
         typer.echo(f"Invalid configuration: {exc}", err=True)
         raise typer.Exit(2) from exc
 
-    report = asyncio.run(run_engagement(cfg, objective, thread_id=name))
+    try:
+        report = asyncio.run(run_engagement(cfg, objective, thread_id=name))
+    except BurpwnMissingError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
 
     out_dir = run_out_dir(cfg, name)
     md_path = out_dir / "report.md"

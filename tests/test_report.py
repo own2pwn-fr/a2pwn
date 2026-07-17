@@ -122,6 +122,28 @@ async def test_har_exported_once_per_workspace(fake_client, tmp_path):
     assert sorted(report.har_paths) == sorted(exported_workspaces)
 
 
+async def test_one_failing_har_export_still_builds_the_report(fake_client, tmp_path):
+    # A single workspace whose HAR export raises must not lose the whole report: the other
+    # workspaces are still exported and the report is returned with the surviving HAR paths.
+    def cli_export_har(session: str, out: str) -> dict:
+        if "boom-ws" in out:
+            raise RuntimeError("burpwn export har failed for this workspace")
+        return {"path": out}
+
+    fake_client.cli_export_har = cli_export_har  # type: ignore[method-assign]
+    findings = [
+        _finding("xss", "https://app.example.com/a", "q", workspace="ok-ws"),
+        _finding("ssrf", "https://app.example.com/c", "url", workspace="boom-ws"),
+    ]
+    state = {"engagement": _engagement(), "findings": findings, "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    assert report.har_paths == [str(tmp_path / "ok-ws.har")]  # boom-ws skipped, not fatal
+    assert {f.vuln_class for f in report.findings} == {"xss", "ssrf"}
+    assert report.stats["evidence_workspaces"] == 2  # both workspaces are still evidence
+
+
 async def test_cross_chains_and_markdown(fake_client, tmp_path):
     _record_har(fake_client)
     ssrf_key = Finding.make_key("ssrf", "https://app.example.com/fetch", "url")

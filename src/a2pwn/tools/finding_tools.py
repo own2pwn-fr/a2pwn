@@ -35,17 +35,24 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
         tag: str | None = None,
         key_flow: int | None = None,
         exec_ids: list[str] | None = None,
+        oracle_signals: list[str] | None = None,
+        correlation_id: str | None = None,
+        oracle_expect: dict | None = None,
         enables: list[str] | None = None,
     ):
         """Declare ONE proven candidate vulnerability, backed by captured burpwn flows.
 
         Call this once per distinct vulnerability you have actually demonstrated (not
         suspected). ``flow_ids`` MUST be the ``captured_request_ids`` returned by the
-        burpwn_exec/fuzz/replay calls that prove it — the finding is rejected later unless
-        those flows exist and its oracle re-derives the result. ``oracle_kind`` is how it can
-        be deterministically re-confirmed (differential/oob/marker/timing/two_identity/
-        signature). Group a finding's requests by passing the same ``workspace`` to your
-        burpwn_exec calls, then name it here.
+        burpwn_exec/fuzz/replay calls that prove it, and ``exec_ids`` MUST be the ``exec_id``
+        values those same calls returned — the finding is rejected later unless those flows
+        exist, no exec escaped the sandbox, and its oracle re-derives the result.
+        ``oracle_kind`` is how it can be deterministically re-confirmed (differential/oob/
+        marker/timing/two_identity/signature). Thread the oracle's inputs so the verifier can
+        replay it: ``oracle_signals`` (tokens/strings a signature/marker oracle must find),
+        ``correlation_id`` (the OOB token you issued for an oob oracle), and ``oracle_expect``
+        (oracle-specific params, e.g. ``{"threshold_ms": 5000}`` for timing). Group a
+        finding's requests by passing the same ``workspace`` to your burpwn_exec calls.
         """
         flow_ids = list(flow_ids or [])
         tag = tag or vuln_class
@@ -75,6 +82,9 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
             param=param,
             evidence=FlowBatchManager.strip_nul(evidence),
             oracle_kind=oracle_kind,
+            oracle_signals=list(oracle_signals or []),
+            correlation_id=correlation_id,
+            oracle_expect=dict(oracle_expect or {}),
             flow_batch=ref,
             enables=list(enables or []),
         )

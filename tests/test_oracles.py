@@ -256,3 +256,74 @@ async def test_run_oracle_llm_rubric_abstains():
     res = await run_oracle(spec, {})
     assert res.confirmed is False
     assert res.kind == "llm_rubric"
+
+
+# --- run_oracle fail-closed contract (NEVER returns None) ------------------------
+
+
+async def test_run_oracle_unknown_kind_fails_closed():
+    # Bypass the Literal validation to feed a kind no oracle maps; must reject, not raise.
+    spec = VerificationOracle.model_construct(kind="mystery")
+    res = await run_oracle(spec, {})
+    assert isinstance(res, OracleResult)
+    assert res.confirmed is False
+    assert res.kind == "mystery"
+    assert "unknown" in res.evidence.lower()
+
+
+async def test_run_oracle_missing_client_fails_closed():
+    spec = VerificationOracle(kind="signature", signals=["boom"])
+    res = await run_oracle(spec, {"flow_id": 1})  # no client handle
+    assert isinstance(res, OracleResult)
+    assert res.confirmed is False
+    assert res.kind == "signature"
+
+
+async def test_run_oracle_missing_flow_ids_fails_closed():
+    client = FakeClient(compare_out=_compare(200, 200, identical=True))
+    spec = VerificationOracle(kind="differential")
+    res = await run_oracle(spec, {"client": client})  # no flow_a/flow_b
+    assert res.confirmed is False
+
+
+async def test_run_oracle_oracle_raises_fails_closed():
+    class Boom:
+        async def compare(self, *a, **k):
+            raise RuntimeError("mcp down")
+
+    spec = VerificationOracle(kind="two_identity")
+    res = await run_oracle(spec, {"client": Boom(), "a_ref": 1, "b_ref": 2})
+    assert res.confirmed is False
+    assert "raised" in res.evidence.lower()
+
+
+async def test_run_oracle_signature_uses_spec_signals():
+    show = {"id": 9, "response": {"body": "PHP Warning: include(): failed to open stream"}}
+    client = FakeClient(show_out=show)
+    spec = VerificationOracle(kind="signature", signals=["failed to open stream"])
+    res = await run_oracle(spec, {"client": client, "flow_id": 9})
+    assert res.confirmed is True
+    assert res.flow_ids == [9]
+
+
+async def test_run_oracle_signature_empty_signals_fails_closed():
+    client = FakeClient(show_out={"id": 9, "response": {"body": "whatever"}})
+    spec = VerificationOracle(kind="signature", signals=[])
+    res = await run_oracle(spec, {"client": client, "flow_id": 9})
+    assert res.confirmed is False
+    assert "signal" in res.evidence.lower()
+
+
+async def test_run_oracle_oob_without_collaborator_fails_closed():
+    spec = VerificationOracle(kind="oob", correlation_id="cid")
+    res = await run_oracle(spec, {})  # no collaborator handle
+    assert res.confirmed is False
+    assert res.kind == "oob"
+
+
+async def test_run_oracle_oob_without_correlation_fails_closed():
+    collab = FakeCollaborator([])
+    spec = VerificationOracle(kind="oob")  # no correlation_id anywhere
+    res = await run_oracle(spec, {"collaborator": collab})
+    assert res.confirmed is False
+    assert collab.calls == []  # never polled — nothing to correlate

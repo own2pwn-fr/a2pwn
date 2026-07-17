@@ -124,6 +124,9 @@ def make_finding(
     confirmed: bool = False,
     indep: bool = False,
     enables: tuple[str, ...] = (),
+    signals: tuple[str, ...] = (),
+    expect: dict | None = None,
+    correlation_id: str | None = None,
 ) -> Finding:
     return Finding(
         key=Finding.make_key(vuln, target, param),
@@ -135,6 +138,9 @@ def make_finding(
         confirmed=confirmed,
         independently_verified=indep,
         oracle_kind=oracle,
+        oracle_signals=list(signals),
+        oracle_expect=dict(expect or {}),
+        correlation_id=correlation_id,
         flow_batch=FlowBatchRef(
             workspace=f"{vuln}-poc",
             workspace_id=2,
@@ -145,6 +151,17 @@ def make_finding(
         ),
         enables=list(enables),
     )
+
+
+def arm_differential(client) -> None:
+    """Program a fake burpwn client so the deterministic ``differential`` oracle CONFIRMS.
+
+    The fail-closed adjudicator now requires a positive oracle verdict on top of a real capture,
+    so confirm-path tests must arm the compare result with an observable delta (status change)."""
+    client.compare_return = {
+        "status": {"changed": True, "a": 200, "b": 500},
+        "body": {"identical": False, "len_a": 12, "len_b": 96, "reflected": []},
+    }
 
 
 def exec_result(findings: list[Finding], batches: list[FlowBatchRef] | None = None) -> dict:
@@ -174,6 +191,7 @@ def make_master_state(
         "dispatch_results": [],
         "findings": list(findings),
         "verify_queue": list(verify_queue),
+        "verify_attempts": {},
         "phase": "recon",
         "round": round,
         "budget": budget or make_budget(cfg),

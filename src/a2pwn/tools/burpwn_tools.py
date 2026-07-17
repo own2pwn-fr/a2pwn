@@ -7,16 +7,50 @@ already-connected client — the agent process itself stays outside the sandbox.
 
 from __future__ import annotations
 
+from typing import Any
+
 from langchain_core.tools import BaseTool, StructuredTool
 
 from a2pwn.burpwn import BurpwnClient
+from a2pwn.scope import argv_hosts, host_of, in_scope
 
 
-def burpwn_tools(client: BurpwnClient) -> list[BaseTool]:
+def burpwn_tools(client: BurpwnClient, engagement: Any = None) -> list[BaseTool]:
+    """Tools over a bound client. When ``engagement`` is given, every target-facing tool
+    deterministically REFUSES out-of-scope destinations (parsed from argv / replay Host
+    overrides / fuzz payloads) before anything runs — a prompt-injected ``fetch
+    http://attacker/`` or a stray ``169.254.169.254`` cannot drive real traffic off-scope.
+    """
+    targets = list(getattr(engagement, "targets", None) or [])
+    allow = list(getattr(engagement, "in_scope", None) or [])
+    enforce = bool(engagement is not None and (targets or allow))
+
+    def _refuse(hosts: list[str], where: str) -> dict:
+        return {
+            "error": "out-of-scope",
+            "refused": True,
+            "off_scope_hosts": hosts,
+            "message": (
+                f"REFUSED: {where} targets out-of-scope host(s) {hosts}; only "
+                f"{allow or targets} (and their subdomains) are in scope. Nothing was run."
+            ),
+        }
+
+    def _off_scope(hosts: list[str]) -> list[str]:
+        if not enforce:
+            return []
+        return [h for h in hosts if not in_scope(h, targets, allow)]
+
     async def burpwn_exec(
         argv: list[str], workspace: str | None = None, timeout_secs: int | None = None
     ) -> dict:
-        """Run a target-facing command inside the burpwn sandbox (all traffic captured/MITM'd)."""
+        """Run a target-facing command inside the burpwn sandbox (all traffic captured/MITM'd).
+
+        Out-of-scope destinations parsed from ``argv`` are refused without running anything.
+        """
+        bad = _off_scope(argv_hosts(list(argv or [])))
+        if bad:
+            return _refuse(bad, "burpwn_exec argv")
         return await client.exec(argv, workspace=workspace, timeout_secs=timeout_secs)
 
     async def burpwn_req_list(
@@ -51,7 +85,21 @@ def burpwn_tools(client: BurpwnClient) -> list[BaseTool]:
         set_body: str | None = None,
         method: str | None = None,
     ) -> dict:
-        """Repeater: replay a flow with edited headers/body/method."""
+        """Repeater: replay a flow with edited headers/body/method.
+
+        A ``Host`` header override pointing off-scope is refused (re-targeting a captured
+        flow at an out-of-scope host).
+        """
+        override_hosts: list[str] = []
+        for hdr in set_headers or []:
+            name = str(hdr.get("name", "")).lower()
+            if name in {"host", ":authority"}:
+                h = host_of(str(hdr.get("value", "")))
+                if h:
+                    override_hosts.append(h)
+        bad = _off_scope(override_hosts)
+        if bad:
+            return _refuse(bad, "burpwn_req_replay Host override")
         return await client.req_replay(
             id, set_headers=set_headers or [], set_body=set_body, method=method
         )
@@ -66,7 +114,19 @@ def burpwn_tools(client: BurpwnClient) -> list[BaseTool]:
         marker: str | None = None,
         name: str | None = None,
     ) -> dict:
-        """Intruder: fuzz payload positions in a flow; results ranked by status/len/time anomaly."""
+        """Intruder: fuzz payload positions in a flow; results ranked by status/len/time anomaly.
+
+        Payloads that are absolute URLs to an out-of-scope host (e.g. an SSRF payload aimed
+        at ``169.254.169.254``) are refused before the attack runs.
+        """
+        payload_hosts: list[str] = []
+        for p in payloads or []:
+            h = host_of(str(p))
+            if h:
+                payload_hosts.append(h)
+        bad = _off_scope(payload_hosts)
+        if bad:
+            return _refuse(bad, "burpwn_fuzz payload")
         return await client.fuzz(
             flow,
             positions,

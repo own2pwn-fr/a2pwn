@@ -61,6 +61,11 @@ class Finding(BaseModel):
         "two_identity",
         "llm_rubric",
     ]
+    # Oracle inputs threaded from the tool that reported the finding into the deterministic
+    # adjudicator (fail-closed). All optional/additive: defaults preserve old behaviour.
+    oracle_signals: list[str] = Field(default_factory=list)
+    correlation_id: str | None = None
+    oracle_expect: dict = Field(default_factory=dict)
     flow_batch: FlowBatchRef
     enables: list[str] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)

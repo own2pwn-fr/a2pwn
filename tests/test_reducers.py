@@ -2,7 +2,7 @@
 
 from _graphkit import make_finding
 from a2pwn.budget import DispatchBudget
-from a2pwn.graph import _merge_budget, append_curated, merge_findings
+from a2pwn.graph import _merge_attempts, _merge_budget, append_curated, merge_findings
 
 
 def test_append_curated_is_plain_concat():
@@ -52,3 +52,13 @@ def test_merge_budget_latches_stop_flag():
     acc = DispatchBudget(spent=0)
     folded = _merge_budget(acc, DispatchBudget(spent=1, stopped=True))
     assert folded.stopped is True
+
+
+def test_merge_attempts_sums_per_key_counts():
+    # Parallel verify Sends for the same finding key accumulate; distinct keys coexist.
+    left = {"k1": 1}
+    merged = _merge_attempts(_merge_attempts(left, {"k1": 1}), {"k2": 1})
+    assert merged == {"k1": 2, "k2": 1}
+    # Identity element (empty) is a no-op and never mutates the accumulator.
+    assert _merge_attempts({}, {"k1": 1}) == {"k1": 1}
+    assert _merge_attempts({"k1": 1}, {}) == {"k1": 1}

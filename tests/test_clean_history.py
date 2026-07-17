@@ -8,7 +8,18 @@
 import ast
 from pathlib import Path
 
+import a2pwn.graph as g
+from _graphkit import (
+    FakeClarifier,
+    FakeExecutor,
+    build_sub,
+    exec_result,
+    make_cfg,
+    make_finding,
+    sub_input,
+)
 from a2pwn.graph import MasterState, SubAgentState
+from a2pwn.models import SubAgentInput
 
 _SOURCE = Path(__file__).resolve().parent.parent / "src" / "a2pwn" / "graph.py"
 
@@ -59,3 +70,25 @@ def test_subgraph_is_read_only_inside_run_subagent():
                 ):
                     readers.add(node.name)
     assert readers <= {"run_subagent"}
+
+
+async def test_run_subagent_returns_only_curated_channels(monkeypatch, fake_client):
+    # Behavioural pairing for the structural guard: whatever the fork boundary hands back must be a
+    # subset of the curated MasterState channels — a transcript can never ride out of the child.
+    cfg = make_cfg()
+    sub = build_sub(
+        monkeypatch,
+        cfg,
+        fake_client,
+        clarifier=FakeClarifier(lambda ctx: []),
+        executor=FakeExecutor(exec_result([make_finding(flow_ids=())])),
+    )
+    g.SUBAGENT_GRAPH = sub
+    data = sub_input(cfg, intent="task")
+    payload = SubAgentInput(dispatch_id="0-task-0", intent="task", spec=None, master_ctx=data["master_ctx"])
+
+    out = await g.run_subagent(payload)
+
+    assert set(out) <= set(MasterState.__annotations__)
+    assert "messages" not in out
+    assert "clarifications" not in out

@@ -13,11 +13,16 @@ uncaptured net op raises an ALARM note, a docker-netns tool a WARN note (never e
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import logging
 import os
 import re
+import shlex
 import shutil
 import sqlite3
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -28,6 +33,8 @@ from pydantic import BaseModel
 from a2pwn.burpwn import BurpwnClient
 from a2pwn.models import Finding
 from a2pwn.oracles import VerificationOracle
+
+_log = logging.getLogger(__name__)
 
 _ORACLE_KINDS = {
     "differential",
@@ -83,6 +90,21 @@ class Skill(BaseModel):
         for src in self.payloads:
             out.extend(src.resolve(root))
         return out
+
+    def verify_script(self) -> Path | None:
+        """Path to the skill's adjacent ``verify.py`` (stashed by :func:`load_skill`), if any."""
+        script = self.verification.expect.get("script")
+        return Path(script) if script else None
+
+    def verifier(self) -> Callable | None:
+        """Import the skill's ``verify.py`` and return its ``verify(ctx)`` coroutine, or None.
+
+        This is the hook the confirmation path uses when a skill ships a bespoke oracle:
+        the caller runs ``await skill.verifier()(ctx)`` (returning an ``OracleResult``)
+        instead of the generic frontmatter oracle. When no ``verify.py`` exists the caller
+        falls back to ``skill.verification`` (kind/signals/expect/correlation_id).
+        """
+        return import_verify(self.verification.expect.get("script"))
 
 
 class SkillCard(BaseModel):
@@ -154,22 +176,36 @@ def retrieve(task: str, tags: list[str] = [], k: int = 12) -> list[SkillCard]:  
     return _retrieve_scan(root, task, tags, k)
 
 
+def _fts_quote(tok: str) -> str:
+    """Wrap a term as an FTS5 string literal so bareword operators (AND/OR/NOT/NEAR) and
+    other punctuation are matched literally instead of parsed as query syntax."""
+    return '"' + tok.replace('"', '""') + '"'
+
+
+def _terms_clause(terms: list[str]) -> str:
+    return "(" + " OR ".join(_fts_quote(t) for t in terms) + ")"
+
+
+def _tags_clause(tagset: list[str]) -> str:
+    return "(" + " OR ".join(f"tags:{_fts_quote(t)}" for t in tagset) + ")"
+
+
 def _retrieve_fts(db: Path, task: str, tags: list[str], k: int) -> list[SkillCard]:
     terms = _terms(task)
     tagset = [t for t in (_san(x) for x in tags) if t]
     clauses: list[str] = []
     if terms:
-        clauses.append("(" + " OR ".join(terms) + ")")
+        clauses.append(_terms_clause(terms))
     if tagset:
-        clauses.append("(" + " OR ".join(f"tags:{t}" for t in tagset) + ")")
+        clauses.append(_tags_clause(tagset))
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
         rows = _fts_query(con, " AND ".join(clauses), k)
         if not rows and tagset:
-            rows = _fts_query(con, "(" + " OR ".join(f"tags:{t}" for t in tagset) + ")", k)
+            rows = _fts_query(con, _tags_clause(tagset), k)
         if not rows and terms:
-            rows = _fts_query(con, "(" + " OR ".join(terms) + ")", k)
+            rows = _fts_query(con, _terms_clause(terms), k)
     finally:
         con.close()
     return [
@@ -276,9 +312,56 @@ def load_skill(name: str) -> Skill:
     raise KeyError(f"skill not found: {name}")
 
 
+def import_verify(script: str | Path | None) -> Callable | None:
+    """Dynamically import a skill's ``verify.py`` and return its ``verify`` callable.
+
+    Returns ``None`` when no script is given, the file is missing, or it exposes no callable
+    ``verify`` attribute — the caller then falls back to the frontmatter oracle. The returned
+    coroutine has the contract ``async verify(ctx: dict) -> OracleResult`` (see the shipped
+    ``skills/**/verify.py`` and the OOB/signature helpers in :mod:`a2pwn.oracles`).
+    """
+    if not script:
+        return None
+    path = Path(script)
+    if not path.exists():
+        return None
+    # Deterministic, unique module name so distinct verify.py files never collide in sys.modules.
+    slug = re.sub(r"[^a-z0-9]+", "_", str(path.resolve()).lower()).strip("_")
+    mod_name = f"a2pwn_skill_verify_{slug}"
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - a broken verify.py must not crash the gate
+        sys.modules.pop(mod_name, None)
+        _log.warning("failed to import verify.py at %s: %s", path, exc)
+        return None
+    fn = getattr(module, "verify", None)
+    return fn if callable(fn) else None
+
+
 # --------------------------------------------------------------------------- #
 # tools                                                                        #
 # --------------------------------------------------------------------------- #
+class _SafeArgs(dict):
+    """str.format_map mapping that renders unknown/None placeholders as empty strings."""
+
+    def __missing__(self, key: str) -> str:  # pragma: no cover - trivial
+        return ""
+
+
+def _as_arg_list(extra) -> list[str]:
+    """Normalise ``extra_args`` (a shell-ish string or a list) into argv tokens."""
+    if not extra:
+        return []
+    if isinstance(extra, str):
+        return shlex.split(extra)
+    return [str(a) for a in extra]
+
+
 class ToolResult(BaseModel):
     tool: str
     availability: Literal["native", "release", "pkg", "docker", "skipped"]
@@ -324,8 +407,26 @@ class Tool(BaseModel):
         return "skipped"
 
     def build_argv(self, **kw) -> list[str]:
+        """Render the tool's ``argv_template`` with caller inputs (``target``/``param``/
+        ``payload``/…). A placeholder that resolves to an empty value drops its token — and a
+        dangling flag that immediately precedes it — so an omitted optional never leaves a
+        bare ``-u`` with no value. ``extra_args`` (str or list) is appended verbatim. When no
+        template is defined the raw ``args`` list is passed through unchanged.
+        """
         if self.argv_template:
-            args = [part.format(**kw) for part in self.argv_template]
+            fmt = _SafeArgs({k: "" if v is None else str(v) for k, v in kw.items()})
+            args: list[str] = []
+            for part in self.argv_template:
+                if "{" in part:
+                    rendered = part.format_map(fmt)
+                    if not rendered.strip():
+                        if args and args[-1].startswith("-"):
+                            args.pop()  # drop the now-value-less flag
+                        continue
+                    args.append(rendered)
+                else:
+                    args.append(part)
+            args.extend(_as_arg_list(kw.get("extra_args")))
         else:
             args = [str(a) for a in kw.get("args", [])]
         return [self.binary, *args]
@@ -351,7 +452,12 @@ class Tool(BaseModel):
         stderr = res.get("stderr", "") or ""
         findings, _ = self.parse(stdout, stderr)
         note: str | None = None
-        if not self.captures:
+        # The docker tier runs in its OWN net namespace (docker run --network host uses the
+        # host ns, not the burpwn sandbox ns where the nftables REDIRECT lives) -> its traffic
+        # is NOT MITM'd. So a docker-tier run is uncaptured regardless of the manifest's
+        # captures bool, which can only express the native/pkg tiers. Never claim evidence.
+        uncaptured = (not self.captures) or (tier == "docker")
+        if uncaptured:
             note = "WARN: docker netns, uncaptured"
             findings = []
             captured = []
@@ -406,6 +512,14 @@ class Runner:
         self.registry = load_registry()
 
     async def run_all(self, skill: Skill, workspace: str, **kw) -> list[Finding]:
+        missing = [t for t in skill.tools if t not in self.registry]
+        if missing:
+            _log.warning(
+                "skill %s references tools absent from the registry (dropped): %s — "
+                "add a manifest to tools/registry.yaml",
+                skill.name,
+                missing,
+            )
         tools = [self.registry[t] for t in skill.tools if t in self.registry]
         tools.sort(key=lambda t: 0 if t.phase == "recon" else 1)  # dep order: recon -> exploit
         acc: list[Finding] = []
@@ -416,24 +530,51 @@ class Runner:
 
 
 def as_langchain_tools(skills: list[Skill], client: BurpwnClient, collab) -> list[BaseTool]:
-    """One BaseTool per skill; invoking it runs the skill's tool chain via the burpwn sandbox."""
+    """One BaseTool per skill; invoking it runs the skill's tool chain via the burpwn sandbox.
+
+    The wrapper threads real inputs (``target`` and optional ``param``/``payload``/
+    ``extra_args``) into every registry tool's ``argv_template`` so the chain runs against a
+    concrete target instead of a bare binary. Traffic is captured through ``BurpwnClient.exec``;
+    findings are only ever produced by the deterministic oracles (this returns tool output +
+    per-tool capture notes, never a self-asserted verdict).
+    """
     runner = Runner(client)
     tools: list[BaseTool] = []
     for skill in skills:
 
         def _make(bound: Skill):
-            async def _run(workspace: str) -> list[dict]:
-                findings = await runner.run_all(bound, workspace)
+            async def _run(
+                target: str,
+                workspace: str = "default",
+                param: str | None = None,
+                payload: str | None = None,
+                extra_args: str | None = None,
+            ) -> list[dict]:
+                findings = await runner.run_all(
+                    bound,
+                    workspace,
+                    target=target,
+                    param=param,
+                    payload=payload,
+                    extra_args=extra_args,
+                )
                 return [f.model_dump() for f in findings]
 
             return _run
 
         safe = re.sub(r"[^a-z0-9_]", "_", ("skill_" + skill.name).lower())
+        tool_names = ", ".join(skill.tools) or "(none)"
+        contract = (
+            f"\n\nINPUTS: target (URL/host, required), workspace (capture bucket), "
+            f"param (fuzzed parameter), payload (payload/wordlist), extra_args (extra CLI). "
+            f"Runs [{tool_names}] through the burpwn sandbox against `target`. "
+            f"Returns tool output; a finding is only real once an oracle re-derives it."
+        )
         tools.append(
             StructuredTool.from_function(
                 coroutine=_make(skill),
                 name=safe,
-                description=skill.description[:1000],
+                description=(skill.description[:800] + contract),
             )
         )
     return tools

@@ -9,12 +9,15 @@ and a clean human-readable markdown document is rendered.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from pydantic import BaseModel, Field
 
 from a2pwn.burpwn import BurpwnClient
 from a2pwn.models import Finding
+
+_log = logging.getLogger("a2pwn")
 
 _SEVERITY_ORDER: dict[str, int] = {
     "critical": 5,
@@ -121,7 +124,11 @@ async def build_report(state, client: BurpwnClient, out_dir: str) -> Report:
     har_paths: list[str] = []
     for ws in workspaces:
         out = os.path.join(out_dir, f"{ws}.har")
-        client.cli_export_har(engagement.session, out)
+        try:
+            client.cli_export_har(engagement.session, out)
+        except Exception as exc:  # noqa: BLE001 - one failed export must not lose the whole report
+            _log.warning("HAR export failed for workspace %s (skipping): %s", ws, exc)
+            continue
         har_paths.append(out)
 
     stats = _compute_stats(findings, chains, workspaces)

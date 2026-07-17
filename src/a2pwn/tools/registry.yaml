@@ -85,3 +85,39 @@ tools:
     # offline de-bundler over already-captured JS; no target traffic to capture.
     net: false
     captures: true
+
+  httpx:
+    binary: httpx
+    phase: recon
+    acquisition: [native, release, docker]
+    release:
+      repo: projectdiscovery/httpx
+      asset_pattern: "httpx_*_linux_amd64.zip"
+      version: "1"
+    docker_image: projectdiscovery/httpx:latest
+    captures: true
+
+  curl:
+    binary: curl
+    phase: exploit
+    # ubiquitous; native-only (no meaningful pinned release / docker capture story).
+    acquisition: [native]
+    captures: true
+
+  jsdebundle:
+    binary: jsdebundle
+    phase: recon
+    acquisition: [native, pkg]
+    pkg: "npx jsdebundle"
+    # offline source-map / bundle splitter over captured JS; no target traffic.
+    net: false
+    captures: true
+
+  hashcat:
+    binary: hashcat
+    phase: exploit
+    acquisition: [native, docker]
+    docker_image: dizcza/docker-hashcat:latest
+    # offline password/JWT-secret cracking; no target traffic to capture.
+    net: false
+    captures: true

@@ -223,3 +223,171 @@ def test_load_registry():
     assert reg["hydra"].captures is False  # docker-only fallback
     assert reg["webcrack"].net is False
     assert reg["sqlmap"].pkg == "uvx sqlmap"
+
+
+def test_load_registry_has_http_clients():
+    """httpx/curl (referenced by nearly every skill) are real manifests now, no longer silently
+    dropped from every skill's tool chain."""
+    reg = catalog.load_registry()
+    for name in ("httpx", "curl", "jsdebundle", "hashcat"):
+        assert name in reg, f"{name} missing from registry"
+    assert reg["curl"].captures is True
+    # offline post-processing tools carry net:false so an empty capture set is not an ALARM
+    assert reg["jsdebundle"].net is False and reg["hashcat"].net is False
+
+
+async def test_tool_run_docker_tier_captures_true_still_uncaptured(monkeypatch):
+    """A captures:true tool resolved to the docker tier is uncaptured (own netns) => WARN, no
+    evidence — the manifest bool only describes the native/pkg tiers."""
+
+    def fake_which(binary):
+        return "/usr/bin/docker" if binary == "docker" else None
+
+    monkeypatch.setattr(catalog.shutil, "which", fake_which)
+    tool = catalog.Tool(
+        name="nuclei",
+        binary="nuclei",
+        acquisition=["native", "docker"],
+        docker_image="projectdiscovery/nuclei:latest",
+        captures=True,
+        argv_template=["-u", "{target}"],
+    )
+    # a non-empty capture set from unrelated flows must NOT let docker output pass as evidence
+    client = FakeClient({"exit_code": 0, "captured_request_ids": [7, 8], "exec_id": "e9"})
+    res = await tool.run(client, "ws", target="https://t/")
+    assert res.availability == "docker"
+    assert res.note and res.note.startswith("WARN")
+    assert res.captured_request_ids == []
+    assert res.findings == []
+
+
+# --------------------------------------------------------------------------- #
+# build_argv threading                                                         #
+# --------------------------------------------------------------------------- #
+def test_build_argv_threads_target_param_and_extra():
+    tool = catalog.Tool(
+        name="sqlmap",
+        binary="sqlmap",
+        argv_template=["-u", "{target}", "-p", "{param}", "--batch"],
+    )
+    argv = tool.build_argv(target="https://t/?id=1", param="id", extra_args="--level 3")
+    assert argv == ["sqlmap", "-u", "https://t/?id=1", "-p", "id", "--batch", "--level", "3"]
+
+
+def test_build_argv_drops_empty_placeholder_and_dangling_flag():
+    """An omitted optional placeholder drops both the value token and its preceding flag."""
+    tool = catalog.Tool(name="sqlmap", binary="sqlmap", argv_template=["-u", "{target}", "-p", "{param}"])
+    argv = tool.build_argv(target="https://t/")  # param omitted
+    assert argv == ["sqlmap", "-u", "https://t/"]  # no bare '-p'
+
+
+# --------------------------------------------------------------------------- #
+# FTS operator-token robustness                                                #
+# --------------------------------------------------------------------------- #
+def test_retrieve_fts_operator_tokens_do_not_degrade(tmp_path, monkeypatch):
+    """A task containing FTS5 barewords (and/or/not/near) must still rank by relevance, not
+    silently fall back to an arbitrary unranked SELECT that returns irrelevant skills."""
+    monkeypatch.setenv("A2PWN_SKILLS_DIR", str(tmp_path))
+    _write_skill_tree(tmp_path)  # web-sqli
+    other = tmp_path / "recon" / "photos"
+    other.mkdir(parents=True)
+    (other / "SKILL.md").write_text(
+        "---\nname: recon-photos\ndescription: landscape photography gallery crawler\n"
+        "tags: [recon]\nverification: {kind: signature, signals: []}\n"
+        "license: MIT\nversion: 0.0.1\n---\nbody\n",
+        encoding="utf-8",
+    )
+    out = catalog.build_index(tmp_path, repo_root=tmp_path)
+    assert out["count"] == 2
+
+    cards = catalog.retrieve("sqli and injection near quote")
+    names = [c.name for c in cards]
+    assert "web-sqli" in names
+    assert "recon-photos" not in names  # would leak in on the unranked fallback
+
+
+# --------------------------------------------------------------------------- #
+# per-skill verify.py wiring                                                   #
+# --------------------------------------------------------------------------- #
+_VERIFY_PY = (
+    "async def verify(ctx):\n"
+    "    from a2pwn.oracles import OracleResult\n"
+    "    return OracleResult(confirmed=bool(ctx.get('hit')), kind='signature', evidence='t')\n"
+)
+
+
+def test_load_skill_exposes_verifier(tmp_path, monkeypatch):
+    monkeypatch.setenv("A2PWN_SKILLS_DIR", str(tmp_path))
+    d = tmp_path / "web" / "sqli"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(_SKILL_MD, encoding="utf-8")
+    (d / "verify.py").write_text(_VERIFY_PY, encoding="utf-8")
+
+    skill = catalog.load_skill("web-sqli")
+    assert skill.verify_script() is not None and skill.verify_script().name == "verify.py"
+    fn = skill.verifier()
+    assert callable(fn)
+
+
+async def test_verifier_runs_and_returns_oracle_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("A2PWN_SKILLS_DIR", str(tmp_path))
+    d = tmp_path / "web" / "sqli"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(_SKILL_MD, encoding="utf-8")
+    (d / "verify.py").write_text(_VERIFY_PY, encoding="utf-8")
+
+    fn = catalog.load_skill("web-sqli").verifier()
+    hit = await fn({"hit": True})
+    miss = await fn({"hit": False})
+    assert hit.confirmed is True and miss.confirmed is False
+    # frontmatter oracle spec is exposed alongside the bespoke verifier
+    skill = catalog.load_skill("web-sqli")
+    assert skill.verification.kind == "timing"
+    assert "you have an error in your SQL syntax" in skill.verification.signals
+
+
+def test_import_verify_missing_or_bad_returns_none(tmp_path):
+    assert catalog.import_verify(None) is None
+    assert catalog.import_verify(tmp_path / "nope.py") is None
+    bad = tmp_path / "novrfy.py"
+    bad.write_text("x = 1\n", encoding="utf-8")  # no verify attr
+    assert catalog.import_verify(bad) is None
+
+
+# --------------------------------------------------------------------------- #
+# as_langchain_tools threads real inputs                                       #
+# --------------------------------------------------------------------------- #
+async def test_langchain_tool_threads_target_into_argv(tmp_path, monkeypatch):
+    """The skill wrapper exposes a `target` input and threads it through run_all->run->argv.
+
+    The registry is injected here (argv_template lives in the BURPWN-owned registry.yaml) so
+    this exercises the CATALOG threading mechanism independently of that file's contents.
+    """
+    monkeypatch.setenv("A2PWN_SKILLS_DIR", str(tmp_path))
+    _write_skill_tree(tmp_path)
+    monkeypatch.setattr(catalog.shutil, "which", lambda b: f"/usr/bin/{b}")
+    monkeypatch.setattr(
+        catalog,
+        "load_registry",
+        lambda *a, **k: {
+            "sqlmap": catalog.Tool(
+                name="sqlmap",
+                binary="sqlmap",
+                acquisition=["native"],
+                argv_template=["-u", "{target}", "-p", "{param}", "--batch"],
+            )
+        },
+    )
+
+    client = FakeClient({"exit_code": 0, "captured_request_ids": [1], "exec_id": "e0"})
+    skill = catalog.load_skill("web-sqli")  # tools: [sqlmap]
+    tools = catalog.as_langchain_tools([skill], client, collab=None)
+    assert len(tools) == 1
+    tool = tools[0]
+    assert tool.name == "skill_web_sqli"
+    assert "target" in tool.args  # real input surfaced to the agent
+
+    await tool.ainvoke({"target": "https://victim/?id=1", "param": "id", "workspace": "ws"})
+    argv, ws = client.calls[0]
+    assert ws == "ws"
+    assert "https://victim/?id=1" in argv and "id" in argv  # target/param reached the binary
