@@ -41,6 +41,44 @@ Two mandates drive every design decision:
    **and** a non-empty burpwn flow batch proves the traffic was actually captured. A network operation
    that captured zero flows is a loud alarm (traffic escaped the sandbox), never silent evidence.
 
+## Proof it works — a real engagement
+
+Run autonomously against the sanctioned [BrokenCrystals](https://github.com/NeuraLegion/brokencrystals)
+lab (`a2pwn run -t https://brokencrystals.com/ -o "..." --active-exploit --yes`), a2pwn found, chained
+and **independently verified 11 findings — 8 critical, 3 high** — end to end (recon → exploit → read
+response → deterministic-oracle verify → report + per-workspace HAR), with zero false positives.
+
+The headline is a fully **cross-chained** takeover the agent assembled on its own:
+
+> **OS command injection** (`GET /api/spawn?command=id` → `uid=0(root)`) → pivoted via the RCE to
+> `cat /proc/self/environ`, leaking `KEYCLOAK_ADMIN_CLIENT_SECRET` → performed an OAuth2
+> `client_credentials` grant with the leaked secret, **forging an admin Bearer token** with
+> `manage-users` → replayed that token *from the internet* against the Keycloak Admin REST API →
+> **full realm user list (PII) and account-takeover primitive**.
+
+Every step is backed by a tagged burpwn flow batch and reproduced by an independent verify sub-agent
+before it reaches the report. The rest of the run, each proven and verified:
+
+| Severity | Finding |
+|----------|---------|
+| CRITICAL | RCE → leaked Keycloak secret → forged admin token → Admin-API takeover *(the chain above)* |
+| CRITICAL | Broken access control — OIDC password-reset / user impersonation |
+| CRITICAL | Unauth OS command injection (root) via `/api/spawn` |
+| CRITICAL | Path traversal / arbitrary file read via `/api/file?path=` (reaches `/etc`, `/proc`) |
+| CRITICAL | JWT RS256 **signing-key disclosure** via path traversal (enables token forgery) |
+| CRITICAL | Kubernetes **serviceaccount-token** + cluster topology disclosure via LFI |
+| HIGH | Env-var credential leak (command injection + LFI) enabling third-party API abuse |
+| HIGH | Config-secrets leak via `/api/config` |
+| HIGH | RCE-chained internal **SSRF** pivot |
+
+Evidence is exported as HAR (here, a 198-entry capture) alongside the markdown report under the run
+directory. On the default subscription backend the executor drives the target through the
+`claude-agent-sdk`'s native tool loop, so tool results are trusted and the agent exploits to depth
+instead of stopping at recon.
+
+> Reproduce responsibly: use only sanctioned labs like BrokenCrystals or PortSwigger's
+> `ginandjuice.shop`.
+
 ## Install & run
 
 ```bash
@@ -140,9 +178,12 @@ MASTER graph  (dispatch-only; never touches a target)
 
 ## Status
 
-`0.1.0` — early. The orchestration core, backends, burpwn integration, oracles, catalog, reporting and
-CLI are in place with the clean-history / reconciliation / capture-alarm invariants under test. The
-seed skill library is being expanded toward full depth on each class.
+`0.1.0` — early, but the full loop works end to end: the orchestration core, native-SDK executor,
+backends, burpwn integration, deterministic oracles, catalog, continuation judge, auto-compaction,
+reporting and CLI are in place and exercised by 250+ tests (clean-history / reconciliation /
+capture-alarm / fail-closed-adjudication invariants included). Validated against a live sanctioned lab
+(see [Proof it works](#proof-it-works--a-real-engagement)). The seed skill library is being expanded
+toward full depth on each class.
 
 ## License
 
