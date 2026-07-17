@@ -163,14 +163,15 @@ async def bootstrap(
     collab = Collaborator(client, cfg.engagement.oob_listener)
     fork = MasterFork(cfg.models)
 
+    skills = _seed_skills(cfg)
     tools = (
-        as_langchain_tools(_seed_skills(cfg), client, collab)
+        as_langchain_tools(skills, client, collab)
         + burpwn_tools(client)
         + oracle_tools(collab, client)
         + finding_tools(client)
     )
 
-    subgraph = build_subagent_graph(cfg, client, fork, tools, collab)
+    subgraph = build_subagent_graph(cfg, client, fork, tools, collab, skills)
     graph = build_master_graph(cfg, subgraph, client, checkpointer)
     return client, graph, checkpointer
 

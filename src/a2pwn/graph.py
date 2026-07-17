@@ -445,11 +445,18 @@ def build_subagent_graph(
     fork: MasterFork,
     tools: list,
     collab: Any,
+    skills: list | None = None,
 ) -> CompiledStateGraph:
     """Compile the stateless sub-agent subgraph (``checkpointer=False`` HARD)."""
     clarifier = build_clarifier(cfg.models)
     executor = build_executor(
-        cfg.models, tools, _active_tools(cfg, tools), cfg.compaction_token_threshold
+        cfg.models,
+        tools,
+        _active_tools(cfg, tools),
+        cfg.compaction_token_threshold,
+        client=client,
+        collab=collab,
+        skills=skills,
     )
     verifier = build_verifier(cfg.models, tools, cfg.compaction_token_threshold)
     fbm = FlowBatchManager(client)
