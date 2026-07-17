@@ -11,7 +11,6 @@ from _graphkit import (
     arm_differential,
     build_sub,
     exec_result,
-    make_budget,
     make_cfg,
     make_finding,
     make_master_state,
@@ -53,7 +52,7 @@ def test_integrate_next_continues_when_work_pending():
 def test_integrate_next_hard_stops_skip_the_judge():
     cfg = make_cfg()
     # budget exhausted => done (never judge), even with no pending work
-    state = make_master_state(cfg, budget=make_budget(cfg, spent=cfg.max_dispatches))
+    state = make_master_state(cfg, spent=cfg.max_dispatches)
     assert g.integrate_next(state) == "done"
 
     STOP.set()

@@ -1,8 +1,7 @@
 """Reducers: curated append + monotone finding merge (never downgrades)."""
 
 from _graphkit import make_finding
-from a2pwn.budget import DispatchBudget
-from a2pwn.graph import _merge_attempts, _merge_budget, append_curated, merge_findings
+from a2pwn.graph import _merge_attempts, append_curated, merge_findings
 
 
 def test_append_curated_is_plain_concat():
@@ -41,17 +40,6 @@ def test_merge_findings_never_downgrades_independently_verified():
     assert merged[0].independently_verified is True
 
 
-def test_merge_budget_sums_spend_deltas():
-    acc = DispatchBudget(max_dispatches=10, spent=2)
-    folded = _merge_budget(_merge_budget(acc, DispatchBudget(spent=1)), DispatchBudget(spent=1))
-    assert folded.spent == 4
-    assert folded.max_dispatches == 10  # caps preserved from the accumulator
-
-
-def test_merge_budget_latches_stop_flag():
-    acc = DispatchBudget(spent=0)
-    folded = _merge_budget(acc, DispatchBudget(spent=1, stopped=True))
-    assert folded.stopped is True
 
 
 def test_merge_attempts_sums_per_key_counts():

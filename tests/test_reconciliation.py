@@ -112,7 +112,7 @@ async def test_failing_dispatch_degrades_to_blocked_result():
     # One bad dispatch must NOT propagate: it becomes a recorded blocked CleanResult + budget delta.
     assert out["findings"] == []
     assert out["verify_queue"] == []
-    assert out["budget"].spent == 1
+    assert out["spent"] == 1
     result = out["dispatch_results"][0]
     assert result.status == "blocked"
     assert "executor blew up" in result.summary

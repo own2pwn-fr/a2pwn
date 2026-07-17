@@ -36,11 +36,22 @@ class DispatchBudget(BaseModel):
     def exhausted(self) -> bool:
         return self.stopped or STOP.is_set() or self.spent >= self.max_dispatches
 
-    def clamp_batch(self, tasks: list) -> list:
+    # State-aware variants: the master state carries the CAPS in this immutable ``budget`` object
+    # and the accumulating spend in a separate ``spent`` channel (an ``operator.add`` int), so the
+    # LangGraph fan-out reducer can never overwrite the caps with a delta's defaults. The graph
+    # routers use these, passing ``state["spent"]``.
+    def is_exhausted(self, spent: int) -> bool:
+        return self.stopped or STOP.is_set() or spent >= self.max_dispatches
+
+    def clamp(self, tasks: list, spent: int) -> list:
         """Cap a phase's parallel Sends to the batch width AND the remaining hard budget, so a
         phase never dispatches past ``max_dispatches``."""
-        remaining = max(0, self.max_dispatches - self.spent)
+        remaining = max(0, self.max_dispatches - spent)
         return tasks[: min(self.max_batch_width, remaining)]
+
+    def clamp_batch(self, tasks: list) -> list:
+        """Model-local clamp using this budget's own ``spent`` (standalone / test use)."""
+        return self.clamp(tasks, self.spent)
 
 
 def install_stop_handler(budget_ref: DispatchBudget) -> None:

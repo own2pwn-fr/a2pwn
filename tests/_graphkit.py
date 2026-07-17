@@ -207,6 +207,7 @@ def make_master_state(
     history: tuple = (),
     round: int = 0,
     continuations: int = 0,
+    spent: int = 0,
     budget: DispatchBudget | None = None,
 ) -> dict:
     return {
@@ -222,6 +223,7 @@ def make_master_state(
         "phase": "recon",
         "round": round,
         "continuations": continuations,
+        "spent": spent,
         "budget": budget or make_budget(cfg),
     }
 

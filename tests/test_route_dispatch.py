@@ -51,7 +51,7 @@ def test_route_clamps_to_max_batch_width():
 def test_route_reports_when_budget_exhausted():
     cfg = make_cfg()
     tasks = (_task("t", "https://t/1"),)
-    state = make_master_state(cfg, pending=tasks, budget=make_budget(cfg, max_dispatches=5, spent=5))
+    state = make_master_state(cfg, pending=tasks, spent=5, budget=make_budget(cfg, max_dispatches=5))
     assert route_dispatch(state) == "report"
 
 
@@ -102,7 +102,7 @@ def test_route_clamps_batch_to_remaining_hard_budget():
     cfg = make_cfg(max_batch_width=6)
     tasks = tuple(_task(f"t{i}", f"https://t/{i}") for i in range(5))
     # Only one dispatch of hard budget remains -> a phase may not dispatch past it.
-    state = make_master_state(cfg, pending=tasks, budget=make_budget(cfg, max_dispatches=2, spent=1))
+    state = make_master_state(cfg, pending=tasks, spent=1, budget=make_budget(cfg, max_dispatches=2))
     out = route_dispatch(state)
     assert isinstance(out, list)
     assert len(out) == 1

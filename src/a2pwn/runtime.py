@@ -292,6 +292,7 @@ async def run_engagement(
             "phase": "recon",
             "round": 0,
             "continuations": 0,
+            "spent": 0,
         }
 
         async def _drive() -> Report:

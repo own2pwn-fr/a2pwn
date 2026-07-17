@@ -55,7 +55,7 @@ def test_stop_flag_routes_to_report():
 def test_exhausted_budget_routes_to_report_even_with_work_pending():
     cfg = make_cfg()
     tasks = (TaskSpec(task="t", target="https://t/1"),)
-    state = make_master_state(cfg, pending=tasks, budget=make_budget(cfg, max_dispatches=1, spent=1))
+    state = make_master_state(cfg, pending=tasks, spent=1, budget=make_budget(cfg, max_dispatches=1))
     assert route_dispatch(state) == "report"
 
 

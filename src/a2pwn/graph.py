@@ -35,7 +35,7 @@ from a2pwn.agents import (
     freeze_context,
 )
 from a2pwn.backends import make_model
-from a2pwn.budget import STOP, DispatchBudget
+from a2pwn.budget import DispatchBudget
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
 from a2pwn.config import A2pwnConfig
 from a2pwn.models import (
@@ -90,17 +90,9 @@ def _merge_attempts(left: dict[str, int], right: dict[str, int]) -> dict[str, in
     return out
 
 
-def _merge_budget(acc: DispatchBudget, inc: DispatchBudget) -> DispatchBudget:
-    """Fold per-dispatch spend deltas onto the accumulator (parallel-Send safe).
-
-    Each ``run_subagent`` returns a ``DispatchBudget(spent=1)`` delta; folding keeps the
-    accumulator's caps and sums the spend so N concurrent dispatches count as N.
-    """
-    if acc is None:  # pragma: no cover - defensive; LangGraph sets the first value directly
-        return inc
-    return acc.model_copy(
-        update={"spent": acc.spent + inc.spent, "stopped": acc.stopped or inc.stopped}
-    )
+def _spent(state: MasterState) -> int:
+    """Total dispatch spend so far (the ``spent`` channel accumulates per-dispatch +1 deltas)."""
+    return int(state.get("spent", 0) or 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +115,11 @@ class MasterState(TypedDict):
     round: int
     # How many times the continuation judge re-opened the engagement after a natural "done" (capped).
     continuations: int
-    budget: Annotated[DispatchBudget, _merge_budget]
+    # CAPS live here (overwrite channel — seeded once, never carrying accumulated spend), while the
+    # accumulating dispatch spend lives in ``spent`` (an ``operator.add`` int). Keeping them apart
+    # stops the parallel-Send reducer from ever overwriting the caps with a delta's default caps.
+    budget: DispatchBudget
+    spent: Annotated[int, operator.add]
 
 
 class SubAgentState(TypedDict):
@@ -216,7 +212,7 @@ def _select_dispatch(
         return "verify", inputs, []
 
     parallel, deferred = partition_pending(state.get("pending", []))
-    clamped = state["budget"].clamp_batch(parallel)
+    clamped = state["budget"].clamp(parallel, _spent(state))
     overflow = parallel[len(clamped):]
     inputs = [
         SubAgentInput(
@@ -238,7 +234,7 @@ def route_dispatch(state: MasterState) -> list[Send] | str:
     emit one ``Send`` per selected invocation; an empty selection also ends the run.
     """
     budget = state["budget"]
-    if STOP.is_set() or budget.exhausted or state["round"] >= budget.max_phases:
+    if budget.is_exhausted(_spent(state)) or state["round"] >= budget.max_phases:
         return "report"
     _mode, inputs, _deferred = _select_dispatch(state)
     if not inputs:
@@ -309,7 +305,7 @@ async def run_subagent(payload: SubAgentInput) -> dict:
             "findings": [],
             "verify_queue": [],
             "verify_attempts": attempts,
-            "budget": DispatchBudget(spent=1),
+            "spent": 1,
         }
     progress.reset_dispatch(_tok)
     clean = out["clean_result"].model_copy(update={"dispatch_id": payload.dispatch_id})
@@ -327,7 +323,7 @@ async def run_subagent(payload: SubAgentInput) -> dict:
         "findings": confirmed,
         "verify_queue": verify_q,
         "verify_attempts": attempts,
-        "budget": DispatchBudget(spent=1),
+        "spent": 1,
     }
 
 
@@ -777,17 +773,23 @@ async def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
 
 def _make_bootstrap(cfg: A2pwnConfig):
     def _bootstrap_node(state: MasterState) -> dict:
-        # Seed verify_attempts so the reducer channel is initialised even when the runner's
-        # stream input omits it (it is written per verify dispatch by run_subagent).
-        updates: dict = {"phase": "recon", "round": 0, "verify_attempts": {}, "continuations": 0}
-        if not state.get("budget"):
-            updates["budget"] = DispatchBudget(
+        # Seed verify_attempts/spent so their reducer channels initialise even when the runner's
+        # stream input omits them. Set the budget CAPS authoritatively from cfg here — the caps live
+        # in this overwrite channel and are never derived from a dispatch delta, so max_dispatches /
+        # max_phases are actually enforced (a per-dispatch delta only bumps the separate ``spent``).
+        return {
+            "phase": "recon",
+            "round": 0,
+            "verify_attempts": {},
+            "continuations": 0,
+            "spent": 0,
+            "budget": DispatchBudget(
                 max_dispatches=cfg.max_dispatches,
                 max_batch_width=cfg.max_batch_width,
                 max_phases=cfg.max_phases,
                 max_verify_attempts=cfg.max_verify_rounds,
-            )
-        return updates
+            ),
+        }
 
     return _bootstrap_node
 
@@ -796,13 +798,13 @@ def _make_plan_node(planner: Any):
     async def _plan_node(state: MasterState) -> dict:
         b = state["budget"]
         progress.emit(
-            "phase", phase="plan", round=state.get("round", 0), spent=b.spent, max=b.max_dispatches
+            "phase", phase="plan", round=state.get("round", 0), spent=_spent(state), max=b.max_dispatches
         )
         pending = list(state.get("pending") or [])
         if not pending and not _pending_verify(state):
             pending = await propose_tasks(planner, state)
         parallel, deferred = partition_pending(pending)
-        clamped = state["budget"].clamp_batch(parallel)
+        clamped = state["budget"].clamp(parallel, _spent(state))
         overflow = parallel[len(clamped):]
         return {"pending": pending, "deferred": deferred + overflow, "phase": "dispatch"}
 
@@ -849,7 +851,7 @@ def integrate_next(state: MasterState) -> Literal["continue", "judge", "done"]:
     "here is what I did; want me to continue?" moment), route to ``judge`` to decide
     autonomously whether the engagement is genuinely complete."""
     budget = state["budget"]
-    if STOP.is_set() or budget.exhausted or state["round"] >= budget.max_phases:
+    if budget.is_exhausted(_spent(state)) or state["round"] >= budget.max_phases:
         return "done"
     if state.get("pending") or _pending_verify(state):
         return "continue"
@@ -864,7 +866,7 @@ def _make_judge_node(judge: Any, cfg: A2pwnConfig):
     async def _judge_node(state: MasterState) -> dict:
         used = state.get("continuations", 0)
         # Respect the hard cap and budget: never re-open past the limit or when spent.
-        if used >= cfg.max_continuations or state["budget"].exhausted or STOP.is_set():
+        if used >= cfg.max_continuations or state["budget"].is_exhausted(_spent(state)):
             _log.info("continuation judge skipped (cap/budget/stop); finalising")
             return {"pending": [], "phase": "complete"}
         ctx = {
