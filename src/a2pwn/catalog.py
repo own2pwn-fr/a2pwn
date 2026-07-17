@@ -43,6 +43,7 @@ _ORACLE_KINDS = {
     "marker",
     "signature",
     "two_identity",
+    "state_change",
     "llm_rubric",
 }
 
@@ -216,9 +217,7 @@ def _retrieve_fts(db: Path, task: str, tags: list[str], k: int) -> list[SkillCar
 
 def _fts_query(con: sqlite3.Connection, match: str, k: int) -> list[sqlite3.Row]:
     if not match:
-        return con.execute(
-            "SELECT name, description, tags, path FROM skills_fts LIMIT ?", (k,)
-        ).fetchall()
+        return con.execute("SELECT name, description, tags, path FROM skills_fts LIMIT ?", (k,)).fetchall()
     try:
         return con.execute(
             "SELECT name, description, tags, path FROM skills_fts "
@@ -226,9 +225,7 @@ def _fts_query(con: sqlite3.Connection, match: str, k: int) -> list[sqlite3.Row]
             (match, k),
         ).fetchall()
     except sqlite3.OperationalError:
-        return con.execute(
-            "SELECT name, description, tags, path FROM skills_fts LIMIT ?", (k,)
-        ).fetchall()
+        return con.execute("SELECT name, description, tags, path FROM skills_fts LIMIT ?", (k,)).fetchall()
 
 
 def _retrieve_scan(root: Path, task: str, tags: list[str], k: int) -> list[SkillCard]:
@@ -580,9 +577,7 @@ def as_langchain_tools(skills: list[Skill], client: BurpwnClient, collab) -> lis
     return tools
 
 
-def build_index(
-    skills_root: Path, repo_root: Path | None = None, verify_sources: bool = False
-) -> dict:
+def build_index(skills_root: Path, repo_root: Path | None = None, verify_sources: bool = False) -> dict:
     """Compile ``_index.json`` + ``_index.sqlite`` (FTS5) from every SKILL.md frontmatter.
 
     When ``verify_sources`` is set, records every payload glob that resolves to zero files
@@ -617,9 +612,7 @@ def build_index(
                 if src.kind in ("glob", "file", "upstream_doc") and not src.resolve(repo_root):
                     missing.append(f"{rel}: payload '{src.path}' resolves to 0 files")
     index_json = skills_root / "_index.json"
-    index_json.write_text(
-        json.dumps({"skills": cards}, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    index_json.write_text(json.dumps({"skills": cards}, indent=2, ensure_ascii=False), encoding="utf-8")
     index_sqlite = skills_root / "_index.sqlite"
     _write_fts(index_sqlite, cards)
     return {
@@ -636,9 +629,7 @@ def _write_fts(db: Path, cards: list[dict]) -> None:
         db.unlink()
     con = sqlite3.connect(str(db))
     try:
-        con.execute(
-            "CREATE VIRTUAL TABLE skills_fts USING fts5(name, description, tags, path UNINDEXED)"
-        )
+        con.execute("CREATE VIRTUAL TABLE skills_fts USING fts5(name, description, tags, path UNINDEXED)")
         con.executemany(
             "INSERT INTO skills_fts(name, description, tags, path) VALUES (?, ?, ?, ?)",
             [(c["name"], c["description"], " ".join(c["tags"]), c["path"]) for c in cards],

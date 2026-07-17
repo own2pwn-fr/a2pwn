@@ -90,6 +90,11 @@ class A2pwnConfig(BaseModel):
     # completion instead of overflowing the context window. 0 disables it.
     compaction_token_threshold: int = 150_000
     checkpoint_uri: str | None = None  # None => SqliteSaver default box path
+    # Optional wall-clock safety net (seconds) for the whole engagement. The dispatch/phase budgets
+    # bound the *count* of work, not its duration; a slow target or model could still stall a phase.
+    # When set, run_engagement aborts the drive loop past this deadline and still builds the report
+    # from whatever was proven. None disables it (the per-call burpwn/model timeouts still apply).
+    max_wall_secs: int | None = None
     # One-time authorization acknowledgement (the CLI ToS gate). Distinct from per-dispatch approval.
     disclaimer_ack: bool = False
     # Interactive step-through: prompt the operator to approve EACH dispatch. Off by default, so

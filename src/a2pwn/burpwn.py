@@ -27,6 +27,19 @@ _CLIENT_INFO = {"name": "a2pwn", "version": "0.1.0"}
 # carry request + response bodies plus JSON escaping, so allow generous headroom (64 MiB) above
 # asyncio's default 64 KiB StreamReader limit.
 _STDOUT_LINE_LIMIT = 64 * 1024 * 1024
+# Read timeout (seconds) for a normal MCP tool call and the initialize handshake. Bounds a wedged
+# server so a single frozen call fails fast instead of hanging the whole engagement forever (the
+# request lock is shared by all sub-agents, so one stuck call would otherwise freeze everything).
+_DEFAULT_TOOL_TIMEOUT_SECS = 120.0
+# ``exec`` runs real tools (sqlmap/nmap/…) that legitimately take minutes. Its client-side read
+# timeout is derived from the server-side ``timeout_secs`` (plus a margin) so it is generous but
+# still finite; when no timeout_secs is given, fall back to this floor.
+_DEFAULT_EXEC_TIMEOUT_SECS = 900.0
+_EXEC_TIMEOUT_MARGIN_SECS = 60.0
+# Timeout (seconds) for the synchronous ``burpwn --json`` CLI lifecycle/export calls.
+_CLI_TIMEOUT_SECS = 180
+# How many times the stdio MCP subprocess may be (re)spawned before we give up (a crash-loop guard).
+_MAX_SPAWNS = 4
 
 _log = logging.getLogger("a2pwn.burpwn")
 
@@ -86,18 +99,35 @@ class BurpwnClient:
         self._req_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._started = False
-        # Per-request read timeout (seconds); None disables it so long-running network
-        # execs (sqlmap/nmap/…) are not cut off. Set it to fail a wedged server fast.
-        self._request_timeout = request_timeout
+        # Per-call read timeout (seconds) for the handshake and normal tool calls. A caller may
+        # override it; ``None`` falls back to the bounded default so a wedged server never hangs
+        # the shared request lock indefinitely. ``exec`` uses a separate, exec-aware timeout.
+        self._request_timeout = request_timeout if request_timeout is not None else _DEFAULT_TOOL_TIMEOUT_SECS
         self._stderr_task: asyncio.Task | None = None
+        self._spawns = 0  # total (re)spawns; a crash-loop guard caps it at _MAX_SPAWNS
 
     # ---- lifecycle --------------------------------------------------------
+    def _alive(self) -> bool:
+        """True when the MCP subprocess is spawned and has not exited."""
+        return self._started and self._proc is not None and self._proc.returncode is None
+
     async def _ensure_started(self) -> None:
-        if self._started:
+        # Health-check on every call: a crashed ``burpwn mcp`` (returncode set) must be reaped
+        # and re-spawned, otherwise ``_started`` stays True and every subsequent call fails on a
+        # broken pipe forever while the engagement silently loops to its phase/budget cap.
+        if self._alive():
             return
         async with self._start_lock:
-            if self._started:
+            if self._alive():
                 return
+            if self._proc is not None:  # a dead/stale process to clean up before respawning
+                await self._reap_locked()
+            if self._spawns >= _MAX_SPAWNS:
+                raise BurpwnError(
+                    f"burpwn mcp server exited {self._spawns} time(s); refusing to respawn "
+                    "(crash loop) — check `burpwn doctor`"
+                )
+            self._spawns += 1
             env = os.environ.copy()
             env.pop("ANTHROPIC_API_KEY", None)
             self._proc = await asyncio.create_subprocess_exec(
@@ -126,6 +156,38 @@ class BurpwnClient:
             await self._notify("notifications/initialized", {})
             self._started = True
 
+    def _mark_dead(self) -> None:
+        """Flag the transport as broken so the next call reconnects (see ``_ensure_started``).
+
+        Called from inside the request lock on an EOF / broken pipe / over-limit line; leaves
+        ``_proc`` in place so ``_reap_locked`` can terminate and reap it on the respawn path.
+        """
+        self._started = False
+
+    async def _reap_locked(self) -> None:
+        """Terminate + reap the current subprocess. Caller must hold ``_start_lock``."""
+        proc = self._proc
+        self._proc = None
+        self._started = False
+        task = self._stderr_task
+        self._stderr_task = None
+        if task is not None:
+            task.cancel()
+        if proc is None:
+            return
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (TimeoutError, ProcessLookupError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+
     async def _drain_stderr(self) -> None:
         proc = self._proc
         if proc is None or proc.stderr is None:
@@ -142,41 +204,35 @@ class BurpwnClient:
             _log.debug("burpwn stderr drain stopped: %s", exc)
 
     async def close(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
-        self._proc = None
-        self._started = False
-        task = self._stderr_task
-        self._stderr_task = None
-        if task is not None:
-            task.cancel()
-        if proc.returncode is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                return
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except (TimeoutError, ProcessLookupError):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+        async with self._start_lock:
+            await self._reap_locked()
 
     # ---- JSON-RPC-over-stdio plumbing -------------------------------------
     async def _send(self, msg: dict) -> None:
         assert self._proc is not None and self._proc.stdin is not None
-        self._proc.stdin.write((json.dumps(msg) + "\n").encode())
-        await self._proc.stdin.drain()
+        try:
+            self._proc.stdin.write((json.dumps(msg) + "\n").encode())
+            await self._proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, RuntimeError) as exc:
+            # Child died between calls: the pipe is broken. Mark the transport dead so the next
+            # call reconnects, and surface a BurpwnError the dispatch layer degrades on.
+            self._mark_dead()
+            raise BurpwnError(f"burpwn mcp stdin broken: {exc}") from exc
 
     async def _recv(self) -> dict:
         assert self._proc is not None and self._proc.stdout is not None
         # Skip blank / non-JSON stdout lines (a stray log leaking to stdout must not
         # kill the in-flight call) — keep reading until a valid JSON object or EOF.
         while True:
-            line = await self._proc.stdout.readline()
+            try:
+                line = await self._proc.stdout.readline()
+            except ValueError as exc:
+                # A single line exceeded _STDOUT_LINE_LIMIT (LimitOverrunError). The reader's
+                # buffer is now inconsistent — treat the transport as dead and reconnect next call.
+                self._mark_dead()
+                raise BurpwnError(f"burpwn mcp response exceeded {_STDOUT_LINE_LIMIT} bytes") from exc
             if not line:
+                self._mark_dead()
                 raise BurpwnError("burpwn mcp server closed the stream")
             text = line.decode(errors="replace").strip()
             if not text:
@@ -210,12 +266,37 @@ class BurpwnClient:
                     raise BurpwnError(f"{method}: {msg}")
                 return resp.get("result", {})
 
+    def _timeout_for(self, name: str, arguments: dict) -> float | None:
+        """Per-call read timeout. ``exec`` gets a generous, exec-aware bound derived from its
+        server-side ``timeout_secs``; every other tool call uses the default tool timeout."""
+        if name == "exec":
+            secs = arguments.get("timeout_secs")
+            base = float(secs) if isinstance(secs, (int, float)) and secs > 0 else _DEFAULT_EXEC_TIMEOUT_SECS
+            return base + _EXEC_TIMEOUT_MARGIN_SECS
+        return self._request_timeout
+
     async def _call_tool(self, name: str, arguments: dict) -> Any:
-        await self._ensure_started()
-        result = await self._request("tools/call", {"name": name, "arguments": arguments})
-        if result.get("isError"):
-            raise BurpwnError(f"{name}: {_tool_text(result)}")
-        return _parse_tool_result(result)
+        # Retry once on a *transport death* (server crashed between/at the start of a call). The
+        # returncode health-check in _ensure_started is racy — a child that just exited may not be
+        # reaped yet — so the pipe can break mid-call; ``_mark_dead`` flags it and this retry lets
+        # _ensure_started respawn. A normal tool/JSON-RPC error leaves the transport alive and is
+        # raised immediately (no retry, so a wedged-but-alive server can't loop).
+        for attempt in range(2):
+            await self._ensure_started()
+            try:
+                result = await self._request(
+                    "tools/call",
+                    {"name": name, "arguments": arguments},
+                    timeout=self._timeout_for(name, arguments),
+                )
+            except BurpwnError:
+                if attempt == 0 and not self._alive():
+                    continue
+                raise
+            if result.get("isError"):
+                raise BurpwnError(f"{name}: {_tool_text(result)}")
+            return _parse_tool_result(result)
+        raise BurpwnError(f"{name}: transport died and could not be re-established")
 
     # ---- hot loop over MCP -------------------------------------------------
     async def exec(
@@ -337,14 +418,18 @@ class BurpwnClient:
     # ---- CLI-only lifecycle/export ----------------------------------------
     @staticmethod
     def _cli(args: list[str]) -> Any:
-        proc = subprocess.run(
-            ["burpwn", "--json", *args], capture_output=True, text=True
-        )
+        try:
+            proc = subprocess.run(
+                ["burpwn", "--json", *args],
+                capture_output=True,
+                text=True,
+                timeout=_CLI_TIMEOUT_SECS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise BurpwnError(f"burpwn {' '.join(args)} timed out after {_CLI_TIMEOUT_SECS}s") from exc
         lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
         if not lines:
-            raise BurpwnError(
-                f"burpwn {' '.join(args)} produced no output: {proc.stderr.strip()}"
-            )
+            raise BurpwnError(f"burpwn {' '.join(args)} produced no output: {proc.stderr.strip()}")
         env = json.loads(lines[-1])
         if not env.get("ok", False):
             raise BurpwnError(env.get("error") or f"burpwn {' '.join(args)} failed")
@@ -410,7 +495,9 @@ class FlowBatchManager:
         for flow_id in captured_request_ids:
             await self.client.tag_add(flow_id, tag, color)
         note = self.strip_nul(note_body)
-        key = key_flow if key_flow is not None else (captured_request_ids[0] if captured_request_ids else None)
+        key = (
+            key_flow if key_flow is not None else (captured_request_ids[0] if captured_request_ids else None)
+        )
         if key is not None:
             await self.client.note_add(key, note)
         return ref.model_copy(
@@ -489,9 +576,7 @@ class FlowBatchManager:
             from a2pwn.scope import host_of
 
             host = host_of(target)
-        res = await self.client.req_list(
-            workspace_id=ref.workspace_id, protocol="tls-passthru", host=host
-        )
+        res = await self.client.req_list(workspace_id=ref.workspace_id, protocol="tls-passthru", host=host)
         return bool(res.get("flows"))
 
     @staticmethod

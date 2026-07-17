@@ -120,9 +120,7 @@ async def test_two_identity_reproduces_victim_object_confirms():
 
 async def test_two_identity_superset_confirms():
     # not byte-identical but attacker response contains every victim line (only_in_b empty)
-    client = FakeClient(
-        compare_out=_compare(200, 200, identical=False, only_in_b=[], len_a=120, len_b=100)
-    )
+    client = FakeClient(compare_out=_compare(200, 200, identical=False, only_in_b=[], len_a=120, len_b=100))
     res = await two_identity(client, 5, 6)
     assert res.confirmed is True
 
@@ -166,18 +164,30 @@ async def test_oob_no_callback_rejects():
 # --- marker / timing / signature ------------------------------------------------
 
 
-async def test_marker_hit_confirms():
-    client = FakeClient(search_out={"flow_ids": [11, 12]})
+async def test_marker_stored_in_response_confirms():
+    # marker surfaces in the RESPONSE of a flow whose request did not carry it => stored/second-order
+    show = {"request": {"body": "post a comment"}, "response": {"body": "page shows uniqmarker here"}}
+    client = FakeClient(search_out={"flow_ids": [11]}, show_out=show)
     res = await marker(client, "uniqmarker")
     assert res.confirmed is True
-    assert res.flow_ids == [11, 12]
+    assert res.flow_ids == [11]
 
 
-async def test_marker_accepts_plain_list():
-    client = FakeClient(search_out=[13])
+async def test_marker_request_only_echo_rejects():
+    # REGRESSION: the injection request contains the marker so req_search always matches; a
+    # request-only echo (never in a response) must NOT auto-confirm the oracle.
+    show = {"request": {"body": "q=uniqmarker"}, "response": {"body": "no reflection here"}}
+    client = FakeClient(search_out={"flow_ids": [11]}, show_out=show)
     res = await marker(client, "uniqmarker")
-    assert res.confirmed is True
-    assert res.flow_ids == [13]
+    assert res.confirmed is False
+
+
+async def test_marker_same_flow_reflection_rejects():
+    # marker in BOTH the request and its own response = reflection (differential's job), not storage
+    show = {"request": {"body": "q=uniqmarker"}, "response": {"body": "you searched uniqmarker"}}
+    client = FakeClient(search_out={"flow_ids": [11]}, show_out=show)
+    res = await marker(client, "uniqmarker")
+    assert res.confirmed is False
 
 
 async def test_marker_miss_rejects():
@@ -220,6 +230,132 @@ async def test_signature_no_match_rejects():
     client = FakeClient(show_out=show)
     res = await signature(client, 30, ["SQL syntax"])
     assert res.confirmed is False
+
+
+async def test_timing_blind_uniform_slow_rejects():
+    # REGRESSION: an endpoint that is slow for EVERY payload (high baseline) is not a controlled
+    # SLEEP — the slowest must stand out from the baseline by a large fraction of the threshold.
+    fuzz = {
+        "results": [
+            {"payload": "a", "flow_id": 1, "latency_ms": 5000},
+            {"payload": "b", "flow_id": 2, "latency_ms": 5100},
+            {"payload": "SLEEP", "flow_id": 3, "latency_ms": 5300},
+        ]
+    }
+    client = FakeClient(fuzz_out=fuzz)
+    res = await timing_blind(client, 99, threshold_ms=5000)
+    assert res.confirmed is False
+    assert "baseline" in res.evidence
+
+
+async def test_timing_blind_spike_over_baseline_confirms():
+    # A single payload far slower than the low baseline = a real controlled delay.
+    fuzz = {
+        "results": [
+            {"payload": "a", "flow_id": 1, "latency_ms": 90},
+            {"payload": "b", "flow_id": 2, "latency_ms": 110},
+            {"payload": "SLEEP(5)", "flow_id": 3, "latency_ms": 5200},
+        ]
+    }
+    client = FakeClient(fuzz_out=fuzz)
+    res = await timing_blind(client, 99, threshold_ms=5000)
+    assert res.confirmed is True
+    assert res.flow_ids == [3]
+
+
+# --- two_identity negative control (public-resource false positive) -------------
+
+
+class _PerFlowCompare:
+    """Fake client returning a different compare() result keyed on the first flow id."""
+
+    def __init__(self, by_a):
+        self.by_a = by_a
+
+    async def compare(self, flow_a, flow_b, what="all"):
+        return self.by_a[flow_a]
+
+
+async def test_two_identity_public_resource_rejects_with_control():
+    # REGRESSION: A reproduces B, but an anonymous control also reproduces B => the object is
+    # public, not an IDOR. The negative control must sink the finding.
+    client = FakeClient(compare_out=_compare(200, 200, identical=True))
+    res = await two_identity(client, 5, 6, c_ref=7)
+    assert res.confirmed is False
+    assert "PUBLIC" in res.evidence
+
+
+async def test_two_identity_private_with_denied_control_confirms():
+    client = _PerFlowCompare(
+        {
+            5: _compare(200, 200, identical=True),  # attacker reproduces owner object
+            7: _compare(403, 200, identical=False, only_in_b=["secret"]),  # anon control denied
+        }
+    )
+    res = await two_identity(client, 5, 6, c_ref=7)
+    assert res.confirmed is True
+
+
+# --- differential noise floor ---------------------------------------------------
+
+
+async def test_differential_length_delta_below_floor_rejects():
+    # REGRESSION: a sub-noise-floor length delta (dynamic content) is not a signal.
+    client = FakeClient(compare_out=_compare(200, 200, identical=False, len_a=100, len_b=105))
+    res = await differential(client, 1, 2, {"signal": "length_delta"})
+    assert res.confirmed is False
+
+
+async def test_differential_explicit_min_len_delta_overrides_floor():
+    client = FakeClient(compare_out=_compare(200, 200, identical=False, len_a=100, len_b=105))
+    res = await differential(client, 1, 2, {"signal": "length_delta", "min_len_delta": 4})
+    assert res.confirmed is True
+
+
+# --- state_change (business-logic / CSRF semantic oracle) -----------------------
+
+
+async def test_state_change_must_appear_confirms():
+    from a2pwn.oracles import state_change
+
+    client = FakeClient(
+        compare_out=_compare(200, 200, identical=False, only_in_b=["email=attacker@evil.com"])
+    )
+    res = await state_change(client, 1, 2, {"must_appear": "attacker@evil.com"})
+    assert res.confirmed is True
+    assert res.kind == "state_change"
+
+
+async def test_state_change_must_appear_absent_rejects():
+    from a2pwn.oracles import state_change
+
+    client = FakeClient(compare_out=_compare(200, 200, identical=False, only_in_b=["unrelated"]))
+    res = await state_change(client, 1, 2, {"must_appear": "attacker@evil.com"})
+    assert res.confirmed is False
+
+
+async def test_state_change_body_delta_confirms():
+    from a2pwn.oracles import state_change
+
+    client = FakeClient(compare_out=_compare(200, 200, identical=False, len_a=100, len_b=200))
+    res = await state_change(client, 1, 2, {})
+    assert res.confirmed is True
+
+
+async def test_state_change_noise_floor_rejects():
+    from a2pwn.oracles import state_change
+
+    client = FakeClient(compare_out=_compare(200, 200, identical=False, len_a=100, len_b=105))
+    res = await state_change(client, 1, 2, {})
+    assert res.confirmed is False
+
+
+async def test_run_oracle_routes_state_change():
+    spec = VerificationOracle(kind="state_change", expect={"must_appear": "tok"})
+    client = FakeClient(compare_out=_compare(200, 200, identical=False, only_in_b=["tok-here"]))
+    res = await run_oracle(spec, {"client": client, "before_ref": 1, "after_ref": 2})
+    assert res.confirmed is True
+    assert res.kind == "state_change"
 
 
 # --- run_oracle dispatcher ------------------------------------------------------

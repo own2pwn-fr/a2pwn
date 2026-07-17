@@ -64,13 +64,35 @@ def test_route_reports_when_phase_cap_reached():
 def test_route_prefers_verify_queue():
     cfg = make_cfg()
     candidate = make_finding(confirmed=True, flow_ids=(1,))
-    state = make_master_state(
-        cfg, pending=(_task("t", "https://t/1"),), verify_queue=(candidate,)
-    )
+    state = make_master_state(cfg, pending=(_task("t", "https://t/1"),), verify_queue=(candidate,))
     out = route_dispatch(state)
     assert isinstance(out, list)
     assert all(s.arg.intent == "verify" for s in out)
     assert out[0].arg.candidate.key == candidate.key
+
+
+def test_route_clamps_verify_fan_out_to_batch_width():
+    # REGRESSION: a full verify queue must be clamped to max_batch_width like the task branch —
+    # otherwise every queued finding becomes a concurrent Send (30 findings -> 30 Opus sub-agents),
+    # blowing past the phase/spend caps the run is supposed to enforce.
+    cfg = make_cfg(max_batch_width=3)
+    candidates = tuple(make_finding(confirmed=True, param=f"p{i}", flow_ids=(1,)) for i in range(8))
+    state = make_master_state(cfg, verify_queue=candidates)
+    out = route_dispatch(state)
+    assert isinstance(out, list)
+    assert all(s.arg.intent == "verify" for s in out)
+    assert len(out) == 3  # clamped, not 8
+
+
+def test_route_clamps_verify_fan_out_to_remaining_budget():
+    cfg = make_cfg(max_batch_width=6)
+    candidates = tuple(make_finding(confirmed=True, param=f"p{i}", flow_ids=(1,)) for i in range(6))
+    # Only 2 dispatches left before the hard cap -> at most 2 verify Sends this phase.
+    state = make_master_state(
+        cfg, verify_queue=candidates, spent=8, budget=make_budget(cfg, max_dispatches=10)
+    )
+    out = route_dispatch(state)
+    assert len(out) == 2
 
 
 def test_route_skips_already_promoted_verify_candidates():

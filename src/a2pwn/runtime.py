@@ -22,7 +22,7 @@ from langgraph.types import Command
 
 from a2pwn import progress
 from a2pwn.agents import MasterFork
-from a2pwn.budget import DispatchBudget, install_stop_handler
+from a2pwn.budget import STOP, DispatchBudget, install_stop_handler
 from a2pwn.burpwn import BurpwnClient
 from a2pwn.catalog import as_langchain_tools, load_skill, retrieve
 from a2pwn.collaborator import Collaborator
@@ -63,8 +63,12 @@ async def _make_checkpointer(cfg: A2pwnConfig) -> BaseCheckpointSaver:
     if cfg.checkpoint_uri:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-        saver = await AsyncPostgresSaver.from_conn_string(cfg.checkpoint_uri).__aenter__()
+        # Keep the async context manager so teardown can call __aexit__ symmetrically and release
+        # the connection pool — a bare `.conn.close()` leaks pooled connections on the Postgres path.
+        cm = AsyncPostgresSaver.from_conn_string(cfg.checkpoint_uri)
+        saver = await cm.__aenter__()
         await saver.setup()
+        saver._a2pwn_cm = cm
         return saver
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -163,6 +167,17 @@ async def bootstrap(
             _log.debug("intercept_scope(%s) failed (continuing): %s", host, exc)
     checkpointer = await _make_checkpointer(cfg)
     collab = Collaborator(client, cfg.engagement.oob_listener)
+    # Actually START the OOB callback sink, otherwise the `oob` oracle polls a listener that was
+    # never launched and NO blind SSRF/XXE/deserialization/SQLi can ever be confirmed (the strongest
+    # 0-FP signal would be dead code). Best-effort: a sandbox that cannot host the listener must not
+    # abort the run; the external backend (oob_listener set) needs no in-sandbox listener. Stash the
+    # handle on the client so run_engagement's teardown can stop() it.
+    client._collaborator = collab
+    if not cfg.engagement.oob_listener:
+        try:
+            await collab.start_in_sandbox()
+        except Exception as exc:  # noqa: BLE001 - OOB is one oracle among several; degrade, don't abort
+            _log.warning("OOB listener failed to start (blind-OOB oracle disabled): %s", exc)
     fork = MasterFork(cfg.models)
 
     skills = _seed_skills(cfg)
@@ -180,6 +195,13 @@ async def bootstrap(
 
 async def _close_checkpointer(checkpointer: BaseCheckpointSaver) -> None:
     """Close the checkpointer's backing connection so its worker thread doesn't hang exit."""
+    cm = getattr(checkpointer, "_a2pwn_cm", None)
+    if cm is not None:  # Postgres path: exit the context manager so the pool is released.
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            _log.debug("checkpointer context exit failed: %s", exc)
+        return
     conn = getattr(checkpointer, "conn", None)
     closer = getattr(conn, "close", None)
     if closer is None:
@@ -253,9 +275,7 @@ def _approve_interrupt(cfg: A2pwnConfig, snap: Any) -> bool:
 # --------------------------------------------------------------------------- #
 # engagement runner                                                            #
 # --------------------------------------------------------------------------- #
-async def run_engagement(
-    cfg: A2pwnConfig, objective: str, thread_id: str, *, tui: bool = False
-) -> Report:
+async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str, *, tui: bool = False) -> Report:
     """Drive the master graph to completion and build the evidence-grounded report.
 
     With ``tui=True`` a live :mod:`rich` dashboard runs concurrently, fed by the display-only
@@ -295,7 +315,7 @@ async def run_engagement(
             "spent": 0,
         }
 
-        async def _drive() -> Report:
+        async def _drive_loop() -> None:
             si = stream_input
             while True:
                 async for chunk in graph.astream(
@@ -310,6 +330,22 @@ async def run_engagement(
                     budget.stopped = True
                     break
                 si = Command(resume=True) if _has_dynamic_interrupt(snap) else None
+
+        async def _drive() -> Report:
+            # Optional wall-clock safety net: past the deadline, stop driving and still report what
+            # was proven. STOP also flags the routers so a resume wouldn't re-enter the graph.
+            if cfg.max_wall_secs:
+                try:
+                    await asyncio.wait_for(_drive_loop(), timeout=cfg.max_wall_secs)
+                except TimeoutError:
+                    _log.warning(
+                        "engagement hit the %ss wall-clock deadline; building the report from "
+                        "proven findings so far",
+                        cfg.max_wall_secs,
+                    )
+                    STOP.set()
+            else:
+                await _drive_loop()
             final = (await graph.aget_state(config)).values
             return await build_report(final, client, str(out_dir))
 
@@ -341,6 +377,12 @@ async def run_engagement(
         # Close each subsystem independently so one failing close never orphans the other's worker
         # thread. The checkpoint is already durable, so the run stays resumable by thread_id.
         if client is not None:
+            collab = getattr(client, "_collaborator", None)
+            if collab is not None and hasattr(collab, "stop"):
+                try:
+                    await collab.stop()  # tear down the in-sandbox OOB listener
+                except Exception as exc:  # noqa: BLE001 - best-effort; the listener self-expires on TTL
+                    _log.debug("OOB listener stop failed: %s", exc)
             try:
                 await client.close()
             except Exception as exc:  # noqa: BLE001 - best-effort teardown, never mask the real error

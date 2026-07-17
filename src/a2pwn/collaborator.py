@@ -93,6 +93,7 @@ class Collaborator:
         self._external_base = external_base or None
         self._host_cache: str | None = None
         self._started = False
+        self._start_lock = asyncio.Lock()  # serialise start_in_sandbox so the sink launches once
         self._workspace = os.environ.get("A2PWN_OOB_WORKSPACE", "oob") or None
         self._dns_port = int(os.environ.get("A2PWN_OOB_DNS_PORT", "53"))
         self._http_port = int(os.environ.get("A2PWN_OOB_HTTP_PORT", "80"))
@@ -152,12 +153,15 @@ class Collaborator:
         """
         if self._started:
             return
-        inner = shlex.join(self._listener_argv(protocols))
-        # setsid -> new session survives the launcher shell exiting; & -> shell returns at once.
-        wrapper = f"setsid {inner} >/dev/null 2>&1 & echo {_LAUNCH_TOKEN}"
-        argv = ["sh", "-c", wrapper]
-        await self._client.exec(argv, workspace=self._workspace, timeout_secs=_LAUNCH_TIMEOUT_SECS)
-        self._started = True
+        async with self._start_lock:
+            if self._started:  # a concurrent caller may have launched it while we waited
+                return
+            inner = shlex.join(self._listener_argv(protocols))
+            # setsid -> new session survives the launcher shell exiting; & -> shell returns at once.
+            wrapper = f"setsid {inner} >/dev/null 2>&1 & echo {_LAUNCH_TOKEN}"
+            argv = ["sh", "-c", wrapper]
+            await self._client.exec(argv, workspace=self._workspace, timeout_secs=_LAUNCH_TIMEOUT_SECS)
+            self._started = True
 
     async def stop(self) -> None:
         """Best-effort teardown. The listener also self-terminates after ``--duration``."""
@@ -186,9 +190,7 @@ class Collaborator:
             return await self._poll_external(correlation_id, timeout_secs)
         return await self._poll_in_sandbox(correlation_id, timeout_secs, protocols)
 
-    async def _poll_in_sandbox(
-        self, correlation_id: str, timeout_secs: int, protocols
-    ) -> list[OOBHit]:
+    async def _poll_in_sandbox(self, correlation_id: str, timeout_secs: int, protocols) -> list[OOBHit]:
         deadline = time.monotonic() + timeout_secs
         seen: dict[int, OOBHit] = {}
         while True:
@@ -277,7 +279,5 @@ def _extract_interactions(data, correlation_id: str) -> list[OOBHit]:
             or item.get("rawRequest")
             or ""
         )
-        hits.append(
-            OOBHit(correlation_id=correlation_id, protocol=proto, source_ip=src, raw=str(raw))
-        )
+        hits.append(OOBHit(correlation_id=correlation_id, protocol=proto, source_ip=src, raw=str(raw)))
     return hits

@@ -200,6 +200,12 @@ def _select_dispatch(
     ctx = freeze_context(state)
     to_verify = _pending_verify(state)
     if to_verify:
+        # Clamp the verify fan-out to the batch width AND the remaining hard budget, exactly like
+        # the task branch below. Without this a full verify queue emits one Send per finding (30
+        # findings -> 30 concurrent Opus sub-agents + burpwn traffic) regardless of max_batch_width,
+        # blowing past the phase/spend caps the run is supposed to enforce. The overflow stays in
+        # verify_queue and is picked up next phase (verify is prioritised, so it drains first).
+        clamped = state["budget"].clamp(to_verify, _spent(state))
         inputs = [
             SubAgentInput(
                 dispatch_id=f"{state['round']}-verify-{i}",
@@ -207,13 +213,13 @@ def _select_dispatch(
                 candidate=f,
                 master_ctx=ctx,
             )
-            for i, f in enumerate(to_verify)
+            for i, f in enumerate(clamped)
         ]
         return "verify", inputs, []
 
     parallel, deferred = partition_pending(state.get("pending", []))
     clamped = state["budget"].clamp(parallel, _spent(state))
-    overflow = parallel[len(clamped):]
+    overflow = parallel[len(clamped) :]
     inputs = [
         SubAgentInput(
             dispatch_id=f"{state['round']}-task-{i}",
@@ -260,9 +266,7 @@ async def run_subagent(payload: SubAgentInput) -> dict:
     # A verify dispatch counts as one independent-verify attempt for its candidate key even when
     # it fails/errors, so a persistently-unverifiable finding drains from the queue (capped).
     attempt_key = (
-        payload.candidate.key
-        if payload.intent == "verify" and payload.candidate is not None
-        else None
+        payload.candidate.key if payload.intent == "verify" and payload.candidate is not None else None
     )
     attempts = {attempt_key: 1} if attempt_key else {}
     _label = payload.spec.task if payload.spec else (payload.candidate.key if payload.candidate else "verify")
@@ -310,14 +314,8 @@ async def run_subagent(payload: SubAgentInput) -> dict:
     progress.reset_dispatch(_tok)
     clean = out["clean_result"].model_copy(update={"dispatch_id": payload.dispatch_id})
     confirmed = [f for f in clean.findings if f.confirmed]
-    progress.emit(
-        "dispatch_end", id=payload.dispatch_id, status=clean.status, n_findings=len(confirmed)
-    )
-    verify_q = (
-        [f for f in confirmed if not f.independently_verified]
-        if payload.intent == "task"
-        else []
-    )
+    progress.emit("dispatch_end", id=payload.dispatch_id, status=clean.status, n_findings=len(confirmed))
+    verify_q = [f for f in confirmed if not f.independently_verified] if payload.intent == "task" else []
     return {
         "dispatch_results": [clean],
         "findings": confirmed,
@@ -511,13 +509,8 @@ def build_subagent_graph(
             lines.append("CANDIDATE FINDING:\n" + cand.model_dump_json(indent=2))
         qas = state.get("clarifications", [])
         if qas:
-            lines.append(
-                "CLARIFICATIONS:\n"
-                + "\n".join(f"Q: {p.question}\nA: {p.answer}" for p in qas)
-            )
-        lines.append(
-            "IN-SCOPE TARGETS:\n" + ", ".join(state["master_ctx"].engagement.targets)
-        )
+            lines.append("CLARIFICATIONS:\n" + "\n".join(f"Q: {p.question}\nA: {p.answer}" for p in qas))
+        lines.append("IN-SCOPE TARGETS:\n" + ", ".join(state["master_ctx"].engagement.targets))
         return {"refined_prompt": "\n\n".join(lines)}
 
     async def _execute(state: SubAgentState) -> dict:
@@ -566,6 +559,11 @@ def build_subagent_graph(
             "flow_b": fids[1] if len(fids) >= 2 else None,
             "a_ref": fids[0] if len(fids) >= 1 else None,
             "b_ref": fids[1] if len(fids) >= 2 else None,
+            # third evidence flow = the negative control (anon/unauthorised) for two_identity,
+            # or an explicit before/after pair for the state_change semantic oracle.
+            "c_ref": fids[2] if len(fids) >= 3 else None,
+            "before_ref": fids[0] if len(fids) >= 1 else None,
+            "after_ref": fids[1] if len(fids) >= 2 else None,
             "attack_id": expect.get("attack_id"),
             "threshold_ms": expect.get("threshold_ms", 5000),
             "correlation_id": candidate.correlation_id,
@@ -594,8 +592,7 @@ def build_subagent_graph(
         if not res.confirmed:
             return (
                 False,
-                f"REJECT {candidate.key}: oracle {candidate.oracle_kind} did not re-derive "
-                f"({res.evidence})",
+                f"REJECT {candidate.key}: oracle {candidate.oracle_kind} did not re-derive ({res.evidence})",
             )
         return True, ""
 
@@ -613,15 +610,21 @@ def build_subagent_graph(
             if ok:
                 confirmed.append(c.model_copy(update={"confirmed": True}))
                 progress.emit(
-                    "finding", status="confirmed", vuln_class=c.vuln_class,
-                    severity=c.severity, target=c.target,
+                    "finding",
+                    status="confirmed",
+                    vuln_class=c.vuln_class,
+                    severity=c.severity,
+                    target=c.target,
                 )
             else:
                 rejected.append(c)
                 not_done.append(reason)
                 progress.emit(
-                    "finding", status="rejected", vuln_class=c.vuln_class,
-                    severity=c.severity, target=c.target,
+                    "finding",
+                    status="rejected",
+                    vuln_class=c.vuln_class,
+                    severity=c.severity,
+                    target=c.target,
                 )
                 if "ALARM" in reason or "capture" in reason.lower():
                     capture_ok = False
@@ -677,9 +680,7 @@ def build_subagent_graph(
             base = critique.confirmed if critique is not None else []
             findings = [f.model_copy(update={"evidence": strip(f.evidence)}) for f in base]
 
-        blocked = bool(
-            critique is not None and any("BLOCKED" in g for g in critique.not_done)
-        )
+        blocked = bool(critique is not None and any("BLOCKED" in g for g in critique.not_done))
         candidates = state.get("candidate_findings", [])
         if findings:
             status: Literal["confirmed", "partial", "no_finding", "blocked"] = "confirmed"
@@ -703,11 +704,7 @@ def build_subagent_graph(
                     )
                 )
         residual = list(critique.not_done) if critique is not None else []
-        summary = (
-            critique.notes
-            if critique is not None
-            else f"{status}: {len(findings)} finding(s)"
-        )
+        summary = critique.notes if critique is not None else f"{status}: {len(findings)} finding(s)"
         result = CleanResult(
             dispatch_id="",
             status=status,
@@ -805,7 +802,7 @@ def _make_plan_node(planner: Any):
             pending = await propose_tasks(planner, state)
         parallel, deferred = partition_pending(pending)
         clamped = state["budget"].clamp(parallel, _spent(state))
-        overflow = parallel[len(clamped):]
+        overflow = parallel[len(clamped) :]
         return {"pending": pending, "deferred": deferred + overflow, "phase": "dispatch"}
 
     return _plan_node
