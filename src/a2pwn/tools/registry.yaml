@@ -1,0 +1,87 @@
+# Tool manifests: acquisition tiers (native -> release -> pkg -> docker).
+#
+# Preference order keeps CAPTURE FIDELITY: a native binary or a pinned static release
+# runs directly inside the burpwn user+net namespace (fully MITM'd). uvx/npx packages run
+# locally in-sandbox too. A docker fallback gets its OWN net namespace, so burpwn's
+# in-sandbox nftables REDIRECT does NOT capture it -> such tools carry captures:false, and
+# the Tool wrapper emits a WARN + never claims evidence for them.
+#
+# net:false marks offline/local tools (no target traffic expected) so an empty capture set
+# is not treated as an ALARM.
+
+tools:
+  nuclei:
+    binary: nuclei
+    phase: exploit
+    acquisition: [native, release, docker]
+    release:
+      repo: projectdiscovery/nuclei
+      asset_pattern: "nuclei_*_linux_amd64.zip"
+      version: "3"
+    docker_image: projectdiscovery/nuclei:latest
+    captures: true
+
+  katana:
+    binary: katana
+    phase: recon
+    acquisition: [native, release, docker]
+    release:
+      repo: projectdiscovery/katana
+      asset_pattern: "katana_*_linux_amd64.zip"
+      version: "1"
+    docker_image: projectdiscovery/katana:latest
+    captures: true
+
+  subfinder:
+    binary: subfinder
+    phase: recon
+    acquisition: [native, release, docker]
+    release:
+      repo: projectdiscovery/subfinder
+      asset_pattern: "subfinder_*_linux_amd64.zip"
+      version: "2"
+    docker_image: projectdiscovery/subfinder:latest
+    captures: true
+
+  ffuf:
+    binary: ffuf
+    phase: recon
+    acquisition: [native, release, docker]
+    release:
+      repo: ffuf/ffuf
+      asset_pattern: "ffuf_*_linux_amd64.tar.gz"
+      version: "2"
+    docker_image: ghcr.io/ffuf/ffuf:latest
+    captures: true
+
+  sqlmap:
+    binary: sqlmap
+    phase: exploit
+    acquisition: [native, pkg, docker]
+    pkg: "uvx sqlmap"
+    docker_image: ghcr.io/sqlmapproject/sqlmap:latest
+    captures: true
+
+  nmap:
+    binary: nmap
+    phase: recon
+    acquisition: [native, docker]
+    docker_image: instrumentisto/nmap:latest
+    captures: true
+
+  hydra:
+    binary: hydra
+    phase: exploit
+    acquisition: [native, docker]
+    docker_image: vanhauser/hydra:latest
+    # docker fallback runs in its own netns -> uncaptured; surface the gap honestly.
+    captures: false
+
+  webcrack:
+    binary: webcrack
+    phase: recon
+    acquisition: [native, pkg]
+    pkg: "npx webcrack"
+    # offline de-bundler over already-captured JS; no target traffic to capture.
+    net: false
+    captures: true

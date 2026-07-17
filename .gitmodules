@@ -1,0 +1,15 @@
+# Vendored security-knowledge sources. Payloads are REFERENCED from these pinned
+# submodules, never copied into the repo (license hygiene — see ATTRIBUTION.md).
+# Populate with:  git submodule update --init --depth 1
+[submodule "vendor/PayloadsAllTheThings"]
+	path = vendor/PayloadsAllTheThings
+	url = https://github.com/swisskyrepo/PayloadsAllTheThings.git
+	shallow = true
+[submodule "vendor/hacktricks"]
+	path = vendor/hacktricks
+	url = https://github.com/HackTricks-wiki/hacktricks.git
+	shallow = true
+[submodule "vendor/nuclei-templates"]
+	path = vendor/nuclei-templates
+	url = https://github.com/projectdiscovery/nuclei-templates.git
+	shallow = true
