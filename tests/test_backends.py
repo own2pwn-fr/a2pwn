@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import types
 
 import anyio
@@ -168,37 +169,39 @@ async def test_astream_yields_text_and_tool_chunks(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_generate_uses_anyio_from_thread_bridge(monkeypatch):
+def test_generate_bridges_to_agenerate(monkeypatch):
+    """The sync path must drive the async _agenerate to completion even in a plain thread
+    (no running loop, no anyio portal) — the environment LangGraph runs sync nodes in."""
     called = {}
 
-    def fake_run(func, *args):
-        called["func"] = func
-        called["args"] = args
+    async def fake_agen(self, messages, stop=None, run_manager=None, **kw):
+        called["messages"] = messages
         return ChatResult(generations=[])
 
-    monkeypatch.setattr(anyio.from_thread, "run", fake_run)
-
+    monkeypatch.setattr(ChatClaudeCode, "_agenerate", fake_agen)
     model = ChatClaudeCode()
     msgs = [HumanMessage("go")]
-    out = model._generate(msgs, stop=None, run_manager=None)
 
-    assert isinstance(out, ChatResult)
-    # the sync path must bridge into the async _agenerate via anyio.from_thread.run
-    assert called["func"] == model._agenerate
-    assert called["args"][0] is msgs
+    out = {}
+    t = threading.Thread(target=lambda: out.update(r=model._generate(msgs, stop=None, run_manager=None)))
+    t.start()
+    t.join()
+
+    assert isinstance(out["r"], ChatResult)
+    assert called["messages"] is msgs
 
 
-def test_stream_uses_anyio_from_thread_bridge(monkeypatch):
-    recorded = {}
+def test_stream_bridges_to_astream(monkeypatch):
+    async def fake_astream(self, messages, stop=None, run_manager=None, **kw):
+        from langchain_core.messages import AIMessageChunk
+        from langchain_core.outputs import ChatGenerationChunk
 
-    def fake_run(func, *args):
-        recorded["func"] = func
-        return []
+        yield ChatGenerationChunk(message=AIMessageChunk(content="hi"))
 
-    monkeypatch.setattr(anyio.from_thread, "run", fake_run)
+    monkeypatch.setattr(ChatClaudeCode, "_astream", fake_astream)
     model = ChatClaudeCode()
-    list(model._stream([HumanMessage("go")]))
-    assert recorded["func"] == model._collect_stream
+    chunks = list(model._stream([HumanMessage("go")]))
+    assert chunks and chunks[0].message.content == "hi"
 
 
 # --------------------------------------------------------------------------- #
@@ -268,3 +271,57 @@ def test_antigravity_requires_key(monkeypatch):
     assert model._resolve() is None
     with pytest.raises(RuntimeError):
         model._cli_generate("hi")
+
+
+# --------------------------------------------------------------------------- #
+# prompted function-calling (the subscription backend is text-only)
+# --------------------------------------------------------------------------- #
+from pydantic import BaseModel  # noqa: E402
+
+from a2pwn.backends import (  # noqa: E402
+    _first_json_object,
+    _parse_prompted_tool_calls,
+    _render_messages,
+)
+
+
+def test_first_json_object_fence_and_balanced():
+    assert _first_json_object("sure:\n```json\n{\"a\": {\"b\": 1}}\n```") == {"a": {"b": 1}}
+    assert _first_json_object('prefix {"x": "}"} suffix') == {"x": "}"}
+    assert _first_json_object("no json here") is None
+
+
+def test_parse_prompted_tool_calls_variants():
+    calls = _parse_prompted_tool_calls('{"tool_calls":[{"name":"burpwn_exec","arguments":{"argv":["curl"]}}]}')
+    assert calls and calls[0]["name"] == "burpwn_exec" and calls[0]["args"] == {"argv": ["curl"]}
+    assert calls[0]["id"]  # a synthetic id is always assigned
+    # bare single object
+    single = _parse_prompted_tool_calls('{"name":"nmap","arguments":{"t":"x"}}')
+    assert single and single[0]["name"] == "nmap"
+    # a plain-text final answer is NOT a tool call
+    assert _parse_prompted_tool_calls("The finding is confirmed because ...") is None
+
+
+def test_render_messages_injects_protocol_and_prior_calls():
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    schema = {"function": {"name": "nmap", "description": "scan", "parameters": {"type": "object"}}}
+    prior = AIMessage(content="", tool_calls=[{"id": "1", "name": "nmap", "args": {"t": "x"}, "type": "tool_call"}])
+    rendered = _render_messages([HumanMessage(content="hi"), prior], [schema])
+    assert "tool_calls" in rendered and "nmap" in rendered  # protocol + prior call are visible
+
+
+def test_with_structured_output_parses_json(monkeypatch):
+    class Out(BaseModel):
+        tasks: list[str] = []
+
+    async def fake_agen(self, messages, *a, **k):
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content='```json\n{"tasks":["a","b"]}\n```'))])
+
+    monkeypatch.setattr(ChatClaudeCode, "_agenerate", fake_agen)
+    m = ChatClaudeCode(model="sonnet")
+    out = anyio.run(m.with_structured_output(Out).ainvoke, [HumanMessage(content="plan")])
+    assert isinstance(out, Out) and out.tasks == ["a", "b"]

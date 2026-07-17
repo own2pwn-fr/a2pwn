@@ -13,20 +13,23 @@ Two internal families:
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import anyio
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from pydantic import ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from a2pwn.config import BackendConfig
 
@@ -80,23 +83,139 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+
+
+def _first_json_object(text: str) -> dict | None:
+    """Extract the first balanced ``{...}`` JSON object from free text (fence-tolerant)."""
+    if not text:
+        return None
+    stripped = _FENCE_RE.sub("", text.strip())
+    start = stripped.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(stripped)):
+        ch = stripped[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(stripped[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _parse_prompted_tool_calls(text: str) -> list[dict] | None:
+    """Parse the prompted ``{"tool_calls": [...]}`` protocol out of a text reply.
+
+    Also tolerates a bare single ``{"name": ..., "arguments": ...}`` object. Returns a
+    LangChain ``tool_calls`` list (with generated ids) or ``None`` when the reply is a
+    plain-text final answer.
+    """
+    obj = _first_json_object(text)
+    if not obj:
+        return None
+    raw = obj.get("tool_calls") or obj.get("tool_call")
+    if raw is None and "name" in obj and ("arguments" in obj or "args" in obj):
+        raw = [obj]
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        return None
+    calls: list[dict] = []
+    for c in raw:
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        args = c.get("arguments", c.get("args", {}))
+        if isinstance(args, str):
+            args = _first_json_object(args) or {}
+        calls.append(
+            {"id": c.get("id") or uuid.uuid4().hex[:24], "name": c["name"], "args": args, "type": "tool_call"}
+        )
+    return calls or None
+
+
+def _sync(coro: Any) -> Any:
+    """Drive a coroutine to completion from a synchronous caller, whether or not an event
+    loop is already running (LangGraph runs sync nodes in plain worker threads with no loop
+    and no anyio portal). Mirrors ``graph._run``."""
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _coerce_messages(value: Any) -> list[BaseMessage]:
+    """Normalise a Runnable input (message list / PromptValue / str) to ``list[BaseMessage]``."""
+    if isinstance(value, BaseMessage):
+        return [value]
+    if isinstance(value, str):
+        return [HumanMessage(content=value)]
+    if hasattr(value, "to_messages"):
+        return list(value.to_messages())
+    if isinstance(value, list):
+        return [m if isinstance(m, BaseMessage) else HumanMessage(content=str(m)) for m in value]
+    return [HumanMessage(content=str(value))]
+
+
+_TOOL_PROTOCOL = (
+    "You have tools available (listed below). Work step by step.\n"
+    "- To CALL one or more tools, reply with ONLY this JSON object and nothing else "
+    '(no prose, no markdown fences): {"tool_calls": [{"name": "<tool>", "arguments": {<args>}}]}\n'
+    "- To give your FINAL answer when no tool is needed, reply with plain text (never JSON).\n"
+    "- Never mix prose and the tool-call JSON in one reply.\n\n"
+    "Available tools:"
+)
+
+
 def _render_messages(messages: list[BaseMessage], tool_schemas: list[dict]) -> str:
-    """Flatten a LangChain message list into a single prompt string."""
+    """Flatten a LangChain message list into a single prompt string (with the prompted
+    tool-calling protocol when tools are bound, and prior tool calls/results rendered so a
+    multi-turn ReAct loop stays coherent)."""
     blocks: list[str] = []
     if tool_schemas:
-        import json
-
-        lines = ["You may call one of the following tools by emitting a tool call.", ""]
+        lines = [_TOOL_PROTOCOL]
         for schema in tool_schemas:
             fn = schema.get("function", schema)
             lines.append(f"- {fn.get('name')}: {fn.get('description', '')}")
             params = fn.get("parameters")
             if params:
-                lines.append(f"  schema: {json.dumps(params, separators=(',', ':'))}")
+                lines.append(f"  arguments schema: {json.dumps(params, separators=(',', ':'))}")
         blocks.append("[System]\n" + "\n".join(lines))
     for msg in messages:
         header = _ROLE_HEADERS.get(getattr(msg, "type", "human"), "User")
-        blocks.append(f"[{header}]\n{_content_to_text(msg.content)}")
+        text = _content_to_text(msg.content)
+        tcs = getattr(msg, "tool_calls", None)
+        if tcs:  # render the assistant's own prior tool calls so it can follow the thread
+            rendered = json.dumps(
+                {"tool_calls": [{"name": tc["name"], "arguments": tc.get("args", {})} for tc in tcs]},
+                separators=(",", ":"),
+            )
+            text = (text + "\n" + rendered).strip()
+        name = getattr(msg, "name", None)
+        label = f"{header} {name}" if (header == "Tool" and name) else header
+        blocks.append(f"[{label}]\n{text}")
     return "\n\n".join(blocks)
 
 
@@ -162,7 +281,7 @@ class ChatClaudeCode(BaseChatModel):
                 if is_tool:
                     tool_calls.append(
                         {
-                            "id": getattr(block, "id", None) or "",
+                            "id": getattr(block, "id", None) or uuid.uuid4().hex[:24],
                             "name": getattr(block, "name", ""),
                             "args": getattr(block, "input", {}) or {},
                             "type": "tool_call",
@@ -170,7 +289,14 @@ class ChatClaudeCode(BaseChatModel):
                     )
                 elif is_text:
                     text_parts.append(getattr(block, "text", ""))
-        return "".join(text_parts), tool_calls
+        text = "".join(text_parts)
+        # Subscription runs with allowed_tools=[] (text only), so native ToolUseBlocks never
+        # arrive — recover tool calls from the prompted JSON protocol instead.
+        if not tool_calls and self.tool_schemas:
+            parsed = _parse_prompted_tool_calls(text)
+            if parsed:
+                return "", parsed
+        return text, tool_calls
 
     async def _agenerate(
         self,
@@ -191,51 +317,53 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        os.environ.pop("ANTHROPIC_API_KEY", None)
-        import claude_agent_sdk as sdk
+        # The subscription SDK is single-shot and tool calls must be parsed from the whole
+        # reply, so we generate once and emit a single chunk (tool calls carried intact).
+        result = await self._agenerate(messages, stop, run_manager, **kwargs)
+        msg = result.generations[0].message
+        chunk_msg = AIMessageChunk(
+            content=msg.content,
+            tool_call_chunks=[
+                {
+                    "name": tc["name"],
+                    "args": _dumps(tc.get("args", {})),
+                    "id": tc.get("id"),
+                    "index": i,
+                    "type": "tool_call_chunk",
+                }
+                for i, tc in enumerate(getattr(msg, "tool_calls", []) or [])
+            ],
+        )
+        chunk = ChatGenerationChunk(message=chunk_msg)
+        if run_manager is not None:
+            await run_manager.on_llm_new_token(msg.content or "", chunk=chunk)
+        yield chunk
 
-        try:
-            from claude_agent_sdk import ToolUseBlock
-        except Exception:  # pragma: no cover - version guard
-            ToolUseBlock = None  # type: ignore[assignment]
+    # ---- structured output (JSON mode; the subscription backend can't tool-call natively) ---- #
 
-        opts_kwargs = {"model": self.model, "allowed_tools": []}
-        opts_kwargs.update(self.options)
-        options = sdk.ClaudeAgentOptions(**opts_kwargs)
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> Runnable:
+        """Return a runnable that yields an instance of ``schema`` (a pydantic model).
 
-        prompt = _render_messages(messages, self.tool_schemas)
-        idx = 0
-        async for message in sdk.query(prompt=prompt, options=options):
-            for block in getattr(message, "content", None) or []:
-                is_tool = (ToolUseBlock is not None and isinstance(block, ToolUseBlock)) or (
-                    hasattr(block, "name") and hasattr(block, "input")
-                )
-                if is_tool:
-                    chunk = ChatGenerationChunk(
-                        message=AIMessageChunk(
-                            content="",
-                            tool_call_chunks=[
-                                {
-                                    "name": getattr(block, "name", ""),
-                                    "args": _dumps(getattr(block, "input", {}) or {}),
-                                    "id": getattr(block, "id", None) or "",
-                                    "index": idx,
-                                    "type": "tool_call_chunk",
-                                }
-                            ],
-                        )
-                    )
-                    idx += 1
-                else:
-                    text = getattr(block, "text", "")
-                    if not text:
-                        continue
-                    chunk = ChatGenerationChunk(message=AIMessageChunk(content=text))
-                if run_manager is not None:
-                    await run_manager.on_llm_new_token(
-                        chunk.message.content or "", chunk=chunk
-                    )
-                yield chunk
+        Implemented as JSON-mode prompting + parsing, because the subscription backend is
+        text-only: we ask for a single JSON object matching the schema and validate it.
+        """
+        is_model = isinstance(schema, type) and issubclass(schema, BaseModel)
+        json_schema = schema.model_json_schema() if is_model else schema
+        instruction = (
+            "Respond with ONLY a single JSON object that conforms to this JSON schema — no prose, "
+            "no markdown fences:\n" + json.dumps(json_schema, separators=(",", ":"))
+        )
+        model = self
+
+        async def _ainvoke(messages_input: Any) -> Any:
+            msgs = _coerce_messages(messages_input)
+            msgs = [*msgs, HumanMessage(content=instruction)]
+            result = await model._agenerate(msgs)
+            text = result.generations[0].message.content
+            obj = _first_json_object(text) or {}
+            return schema.model_validate(obj) if is_model else obj
+
+        return RunnableLambda(afunc=_ainvoke, func=lambda x: _sync(_ainvoke(x)))
 
     # ---- sync bridge (anyio; safe inside LangGraph's threaded sync harness) ---- #
 
@@ -246,7 +374,7 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        return anyio.from_thread.run(self._agenerate, messages, stop, run_manager)
+        return _sync(self._agenerate(messages, stop, run_manager))
 
     def _stream(
         self,
@@ -255,8 +383,7 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        chunks = anyio.from_thread.run(self._collect_stream, messages, stop, run_manager)
-        yield from chunks
+        yield from _sync(self._collect_stream(messages, stop, run_manager))
 
     async def _collect_stream(
         self,

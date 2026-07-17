@@ -40,12 +40,20 @@ By continuing you confirm you have written authorization for every in-scope targ
 """
 
 
+def _parse_backend(spec: str) -> BackendConfig:
+    """``model`` or ``provider:model`` — provider defaults to the subscription backend."""
+    if ":" in spec:
+        provider, model = spec.split(":", 1)
+        return BackendConfig(provider=provider, model=model)  # type: ignore[arg-type]
+    return BackendConfig(model=spec)
+
+
 def _build_models(executor_model: str | None, verifier_model: str | None) -> RoleModels:
     overrides: dict = {}
     if executor_model:
-        overrides["executor"] = BackendConfig(model=executor_model)
+        overrides["executor"] = _parse_backend(executor_model)
     if verifier_model:
-        overrides["verifier"] = BackendConfig(provider="anthropic", model=verifier_model)
+        overrides["verifier"] = _parse_backend(verifier_model)
     return RoleModels(**overrides)
 
 
@@ -70,6 +78,10 @@ def run(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Third-party debug logs (aiosqlite/httpx/checkpoint serde) drown the telemetry — cap them.
+    for noisy in ("aiosqlite", "httpx", "httpcore", "urllib3", "asyncio",
+                  "langgraph.checkpoint.serde.jsonplus", "claude_agent_sdk"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     typer.echo(_DISCLAIMER)
     ack = yes

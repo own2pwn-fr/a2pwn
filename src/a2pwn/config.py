@@ -32,10 +32,12 @@ class RoleModels(BaseModel):
 
     master: BackendConfig = Field(default_factory=BackendConfig)
     clarifier: BackendConfig = Field(default_factory=BackendConfig)
+    # Executor defaults to the subscription backend (claude-code -> sonnet).
     executor: BackendConfig = Field(default_factory=BackendConfig)
-    # Opus-class default: distinct from the executor to keep the adversarial verify honest.
+    # Opus-class default, distinct from the executor to keep the adversarial verify honest — but
+    # still on the default subscription backend so the out-of-the-box config runs with NO API key.
     verifier: BackendConfig = Field(
-        default_factory=lambda: BackendConfig(provider="anthropic", model="claude-opus-4-5")
+        default_factory=lambda: BackendConfig(provider="claude-code", model="opus")
     )
 
     @model_validator(mode="after")
