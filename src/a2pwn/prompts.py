@@ -100,12 +100,21 @@ form with SQLi payloads, inject into every reflected parameter, fuzz with burpwn
 burpwn_req_replay. Keep going until you have either PROVEN a vulnerability or genuinely exhausted the
 in-scope surface for this task.
 
+READ EVERY RESPONSE. After each burpwn_exec, call burpwn_req_show on the captured flow id and judge the
+BODY, not just the status line — leaked file contents (e.g. `root:x:0:0:` from /etc/passwd), command
+output (e.g. `uid=0(root)`), a SQL/stack error, or your reflected marker are PROOF even under an
+unexpected status. Targets are flaky: a 5xx / timeout / rate-limit is not a verdict — RETRY the request
+and try encoding/depth variants before concluding a payload failed.
+
 DECLARING A FINDING: the ONLY way a vulnerability counts is to call the `report_finding` tool once per
-proven bug, passing the exact `flow_ids` (the captured_request_ids returned by your burpwn_exec / fuzz
-/ replay calls) that demonstrate it, the `oracle_kind` that can re-confirm it, the target, param,
-severity, and a concrete evidence string. Run each candidate's requests under a dedicated `workspace`
-(pass the same workspace name to your burpwn_exec calls) and name it in report_finding. A finding with
-no flow_ids will be rejected.
+proven bug, passing the exact `flow_ids` (the captured_request_ids from the burpwn_exec / fuzz / replay
+that demonstrate it), the `oracle_kind` that can re-confirm it, the target, param, severity, and a
+concrete evidence string quoting the proof from the response body. Run each candidate's requests under a
+dedicated `workspace` and name it in report_finding. A finding with no flow_ids will be rejected.
+
+REPORT THE MOMENT YOU HAVE PROOF. As soon as a response body confirms a vulnerability, your VERY NEXT
+action is `report_finding` — do not keep exploring first. An unreported proven vuln does not exist. Only
+after reporting do you move on to the next candidate or chain.
 
 Precision over volume: one proven, evidenced bug beats ten guesses — but you must actually try to
 exploit, not just describe what could be tested.\

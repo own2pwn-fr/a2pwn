@@ -182,15 +182,38 @@ def _first_json_object(text: str) -> dict | None:
         search_from = start + 1
 
 
+def _coerce_value(v: Any) -> Any:
+    """Decode a per-argument value the model stringified. The prompted-JSON protocol often
+    yields a whole argument as a JSON *string* — ``{"argv": "[\\"curl\\",\\"-s\\"]"}``,
+    ``{"signals": "[\\"root:x:0:0\\"]"}``, ``{"workspace_id": "null"}`` — which then fails the
+    tool's list/None schema. Decode such strings so the typed tool schema validates."""
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if s[:1] in ("[", "{"):
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            return v
+    low = s.lower()
+    if low in ("null", "none"):
+        return None
+    if low in ("true", "false"):
+        return low == "true"
+    return v
+
+
 def _coerce_args(args: Any) -> dict:
     """Normalise tool ``arguments`` to a dict without silently dropping non-object payloads.
 
     A JSON string is decoded with ``json.loads`` first (so ``'["curl","-s"]'`` or a bare
     scalar survive) and only then brace-extracted; a decoded list/scalar (or a native
-    non-dict value) is wrapped under ``"input"`` rather than discarded.
+    non-dict value) is wrapped under ``"input"`` rather than discarded. Each surviving VALUE
+    is then de-stringified (``_coerce_value``) so list/None/bool args the model emitted as
+    strings validate against the tool schema.
     """
     if isinstance(args, dict):
-        return args
+        return {k: _coerce_value(v) for k, v in args.items()}
     if args is None:
         return {}
     if isinstance(args, str):
@@ -202,7 +225,7 @@ def _coerce_args(args: Any) -> dict:
         except json.JSONDecodeError:
             decoded = _first_json_object(s)
         if isinstance(decoded, dict):
-            return decoded
+            return {k: _coerce_value(v) for k, v in decoded.items()}
         if decoded is not None:
             return {"input": decoded}
         return {}
@@ -273,8 +296,14 @@ def _coerce_messages(value: Any) -> list[BaseMessage]:
 
 _TOOL_PROTOCOL = (
     "You have tools available (listed below). Work step by step.\n"
-    "- To CALL one or more tools, reply with ONLY this JSON object and nothing else "
-    '(no prose, no markdown fences): {"tool_calls": [{"name": "<tool>", "arguments": {<args>}}]}\n'
+    "- To CALL a tool, reply with ONLY this JSON object and nothing else (no prose, no markdown "
+    'fences): {"tool_calls": [{"name": "<tool>", "arguments": {<args>}}]}\n'
+    "- Prefer ONE tool call per reply and read its result before the next step; only batch calls "
+    "that are truly independent. Never re-issue a call that just succeeded.\n"
+    "- `arguments` values must be REAL JSON types, not stringified — e.g. a list argument is "
+    '["curl","-s"], NOT "[\\"curl\\",\\"-s\\"]"; null is null, not "null".\n'
+    "- ONLY the tools listed below exist. Do NOT call any other tool (there is no ToolSearch, "
+    "web_search, python, or file tool); calling an unlisted tool just wastes a turn.\n"
     "- To give your FINAL answer when no tool is needed, reply with plain text (never JSON).\n"
     "- Never mix prose and the tool-call JSON in one reply.\n\n"
     "Available tools:"

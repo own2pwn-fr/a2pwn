@@ -655,3 +655,31 @@ async def test_sdk_error_with_no_content_propagates(monkeypatch):
     model = ChatClaudeCode()
     with pytest.raises(RuntimeError):
         await model._agenerate([HumanMessage("go")])
+
+
+# --------------------------------------------------------------------------- #
+# arg coercion: the model often stringifies list/None/bool argument VALUES
+# --------------------------------------------------------------------------- #
+from a2pwn.backends import _coerce_args, _coerce_value  # noqa: E402
+
+
+def test_coerce_value_destringifies():
+    assert _coerce_value('["curl", "-s"]') == ["curl", "-s"]
+    assert _coerce_value('{"a": 1}') == {"a": 1}
+    assert _coerce_value("null") is None
+    assert _coerce_value("true") is True
+    assert _coerce_value("plain") == "plain"
+    assert _coerce_value(42) == 42
+
+
+def test_coerce_args_per_value():
+    # exactly the malformed shape observed live: argv + signals as JSON strings, workspace_id "null"
+    out = _coerce_args({"argv": '["curl", "-si", "http://x/"]', "workspace_id": "null", "n": "3"})
+    assert out["argv"] == ["curl", "-si", "http://x/"]
+    assert out["workspace_id"] is None
+    assert out["n"] == "3"  # numeric strings left for pydantic to coerce
+
+
+def test_coerce_args_whole_string_dict():
+    out = _coerce_args('{"signals": "[\\"root:x:0:0\\"]"}')
+    assert out["signals"] == ["root:x:0:0"]
