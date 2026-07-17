@@ -11,6 +11,7 @@ from _graphkit import (
     make_cfg,
     make_finding,
     make_master_state,
+    stub_judge,
 )
 from a2pwn.models import TaskSpec
 
@@ -41,6 +42,7 @@ def _build_master(monkeypatch, fake_client, tmp_saver):
         executor=FakeExecutor(exec_result([make_finding(flow_ids=(101, 102), exec_ids=("e-ok",))])),
     )
     monkeypatch.setattr(g, "propose_tasks", _no_tasks)  # async: master plan node awaits it
+    stub_judge(monkeypatch)  # continuation judge -> complete, so the natural stop finalises
     graph = g.build_master_graph(cfg, sub, fake_client, tmp_saver)
     return cfg, graph
 

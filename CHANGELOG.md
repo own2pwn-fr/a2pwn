@@ -13,6 +13,11 @@ All notable changes to this project are documented here. The format is based on
   construction (only `(task → clean result)` records; no sub-agent transcript can leak in).
 - **Clarify fork.** Sub-agents ask clarifying questions answered in parallel by isolated forks seeded
   with a compacted snapshot of the master context, folded into one self-contained refined prompt.
+- **Continuation judge.** When the master would naturally stop (planner out of work), a judge agent
+  decides autonomously whether the engagement is genuinely complete or should push further — replacing
+  the human "here is what I did; want me to continue?" prompt — and injects concrete follow-up tasks
+  when surface remains untested. Bounded by `max_continuations`; hard stops (budget / phase cap /
+  TaskStop) always win.
 - **Adversarial verification.** An intra-task verifier on a distinct, stronger role-model re-derives
   every candidate through a deterministic oracle (differential / OOB / marker / timing / two-identity)
   and rejects any finding without real captured evidence; a separate independent-verify dispatch

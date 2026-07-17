@@ -23,6 +23,7 @@ from _graphkit import (
     make_cfg,
     make_finding,
     make_master_state,
+    stub_judge,
 )
 from a2pwn.budget import STOP
 from a2pwn.models import DispatchRecord, TaskSpec
@@ -71,6 +72,7 @@ def _build_master(monkeypatch, fake_client, tmp_saver, *, active, executor, task
     arm_differential(fake_client)  # fail-closed adjudicator needs a positive oracle verdict
     sub = build_sub(monkeypatch, cfg, fake_client, clarifier=_NO_QUESTIONS, executor=executor)
     monkeypatch.setattr(g, "propose_tasks", _propose_once(tasks))  # async: master plan awaits it
+    stub_judge(monkeypatch)  # continuation judge -> complete, so the natural stop finalises
     graph = g.build_master_graph(cfg, sub, fake_client, tmp_saver)
     return cfg, graph
 

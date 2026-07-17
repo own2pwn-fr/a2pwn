@@ -27,6 +27,16 @@ class TaskSpec(BaseModel):
     mutates: bool = True  # False => never serialized against siblings
 
 
+class ContinuationVerdict(BaseModel):
+    """A continuation judge's ruling when the master would otherwise stop: is the engagement
+    genuinely complete, or is there important in-scope surface still worth pursuing?"""
+
+    complete: bool
+    rationale: str = ""
+    # Concrete follow-up tasks to run if not complete (fed straight into the master's pending queue).
+    remaining_work: list[TaskSpec] = Field(default_factory=list)
+
+
 class FlowBatchRef(BaseModel):
     """A burpwn workspace of captured flows that is the evidence backing a finding."""
 

@@ -96,6 +96,24 @@ def build_verifier(cfg: RoleModels, tools: list[BaseTool]) -> CompiledStateGraph
     )
 
 
+def _judge_messages(ctx: Any) -> list[BaseMessage]:
+    if not isinstance(ctx, dict):
+        ctx = {"input": ctx}
+    return P.render_messages(P.CONTINUATION_JUDGE_SYS, ctx)
+
+
+def build_continuation_judge(cfg: RoleModels) -> Runnable:
+    """A runnable mapping a context dict to a :class:`ContinuationVerdict`.
+
+    Invoked when the master would otherwise STOP: it decides whether the engagement is
+    genuinely complete or should push further, returning concrete follow-up tasks. Runs on
+    the master role-model (the orchestrator's own judgement)."""
+    from a2pwn.models import ContinuationVerdict
+
+    structured = make_model(cfg.master).with_structured_output(ContinuationVerdict)
+    return (RunnableLambda(_judge_messages) | structured).with_config(run_name="continuation_judge")
+
+
 def _message_text(message: BaseMessage) -> str:
     content = message.content
     if isinstance(content, str):

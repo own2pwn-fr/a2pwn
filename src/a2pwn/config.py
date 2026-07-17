@@ -81,6 +81,10 @@ class A2pwnConfig(BaseModel):
     max_phases: int = 12
     max_batch_width: int = 6  # hard cap on parallel Sends per phase
     max_dispatches: int = 200  # global budget ceiling
+    # When the master would naturally STOP (no work left, "done"), a continuation judge decides
+    # whether the engagement is genuinely complete or should push further. This caps how many times
+    # the judge may override "done" and re-open the engagement, so it cannot loop forever.
+    max_continuations: int = 2
     checkpoint_uri: str | None = None  # None => SqliteSaver default box path
     # One-time authorization acknowledgement (the CLI ToS gate). Distinct from per-dispatch approval.
     disclaimer_ack: bool = False

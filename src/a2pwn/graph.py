@@ -28,6 +28,7 @@ import a2pwn.prompts as P
 from a2pwn.agents import (
     MasterFork,
     build_clarifier,
+    build_continuation_judge,
     build_executor,
     build_verifier,
     freeze_context,
@@ -119,6 +120,8 @@ class MasterState(TypedDict):
     verify_attempts: Annotated[dict[str, int], _merge_attempts]
     phase: str
     round: int
+    # How many times the continuation judge re-opened the engagement after a natural "done" (capped).
+    continuations: int
     budget: Annotated[DispatchBudget, _merge_budget]
 
 
@@ -739,7 +742,7 @@ def _make_bootstrap(cfg: A2pwnConfig):
     def _bootstrap_node(state: MasterState) -> dict:
         # Seed verify_attempts so the reducer channel is initialised even when the runner's
         # stream input omits it (it is written per verify dispatch by run_subagent).
-        updates: dict = {"phase": "recon", "round": 0, "verify_attempts": {}}
+        updates: dict = {"phase": "recon", "round": 0, "verify_attempts": {}, "continuations": 0}
         if not state.get("budget"):
             updates["budget"] = DispatchBudget(
                 max_dispatches=cfg.max_dispatches,
@@ -795,16 +798,65 @@ async def _integrate_node(state: MasterState) -> dict:
     }
 
 
-def integrate_next(state: MasterState) -> Literal["continue", "done"]:
-    """Loop for another phase while there is work and budget; otherwise report.
+def integrate_next(state: MasterState) -> Literal["continue", "judge", "done"]:
+    """Loop for another phase while there is work and budget; otherwise consult the
+    continuation judge before stopping.
 
-    A TaskStop (``STOP`` set by SIGINT) or an exhausted/phase-capped budget ends the run."""
+    A TaskStop (``STOP`` set by SIGINT) or an exhausted/phase-capped budget ends the run
+    immediately (``done``, a hard stop — the judge never overrides those). When there is
+    still queued work, ``continue``. When the planner produced NO more work (the natural
+    "here is what I did; want me to continue?" moment), route to ``judge`` to decide
+    autonomously whether the engagement is genuinely complete."""
     budget = state["budget"]
     if STOP.is_set() or budget.exhausted or state["round"] >= budget.max_phases:
         return "done"
     if state.get("pending") or _pending_verify(state):
         return "continue"
-    return "done"
+    return "judge"
+
+
+def _make_judge_node(judge: Any, cfg: A2pwnConfig):
+    """Continuation judge: invoked when the master would naturally STOP. Decides whether the
+    engagement is complete or should push further, and (if so, and under the cap/budget) injects
+    concrete follow-up tasks so the run continues instead of ending prematurely."""
+
+    async def _judge_node(state: MasterState) -> dict:
+        used = state.get("continuations", 0)
+        # Respect the hard cap and budget: never re-open past the limit or when spent.
+        if used >= cfg.max_continuations or state["budget"].exhausted or STOP.is_set():
+            _log.info("continuation judge skipped (cap/budget/stop); finalising")
+            return {"pending": [], "phase": "complete"}
+        ctx = {
+            "objective": state["objective"],
+            "engagement": state["engagement"],
+            "in_scope": state["engagement"].in_scope or state["engagement"].targets,
+            "history": state.get("history", []),
+            "findings": state.get("findings", []),
+        }
+        try:
+            verdict = await judge.ainvoke(ctx)
+        except Exception as exc:  # noqa: BLE001 - a judge failure must not hang the run
+            _log.warning("continuation judge failed, finalising: %s", exc)
+            return {"pending": [], "phase": "complete"}
+        remaining = list(getattr(verdict, "remaining_work", []) or [])
+        if getattr(verdict, "complete", True) or not remaining:
+            _log.info("continuation judge: engagement complete — %s", getattr(verdict, "rationale", ""))
+            return {"pending": [], "phase": "complete"}
+        _log.info(
+            "continuation judge: NOT complete (round %d/%d) — re-opening with %d task(s): %s",
+            used + 1,
+            cfg.max_continuations,
+            len(remaining),
+            getattr(verdict, "rationale", ""),
+        )
+        return {"pending": remaining, "continuations": used + 1, "phase": "continuation"}
+
+    return _judge_node
+
+
+def judge_route(state: MasterState) -> Literal["plan", "report"]:
+    """Continue planning if the judge injected follow-up work; otherwise report."""
+    return "plan" if state.get("pending") else "report"
 
 
 async def _report_node(state: MasterState) -> dict:
@@ -830,12 +882,14 @@ def build_master_graph(
     SUBAGENT_GRAPH = subgraph
 
     planner = make_model(cfg.models.master)
+    judge = build_continuation_judge(cfg.models)
 
     builder = StateGraph(MasterState)
     builder.add_node("bootstrap", _make_bootstrap(cfg))
     builder.add_node("plan", _make_plan_node(planner))
     builder.add_node("run_subagent", run_subagent)
     builder.add_node("integrate", _integrate_node)
+    builder.add_node("judge", _make_judge_node(judge, cfg))
     builder.add_node("report", _report_node)
 
     builder.add_edge(START, "bootstrap")
@@ -843,8 +897,9 @@ def build_master_graph(
     builder.add_conditional_edges("plan", route_dispatch, ["run_subagent", "report"])
     builder.add_edge("run_subagent", "integrate")
     builder.add_conditional_edges(
-        "integrate", integrate_next, {"continue": "plan", "done": "report"}
+        "integrate", integrate_next, {"continue": "plan", "judge": "judge", "done": "report"}
     )
+    builder.add_conditional_edges("judge", judge_route, {"plan": "plan", "report": "report"})
     builder.add_edge("report", END)
 
     interrupt_before = [] if cfg.engagement.active_exploit_allowed else ["run_subagent"]

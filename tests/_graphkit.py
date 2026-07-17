@@ -69,6 +69,30 @@ class FakeFork:
         return QAPair(question=question, answer=f"answer::{question}")
 
 
+class FakeJudge:
+    """`.ainvoke(ctx) -> ContinuationVerdict` — the continuation judge, decided by injection."""
+
+    def __init__(self, complete: bool = True, remaining: tuple = ()):
+        from a2pwn.models import ContinuationVerdict
+
+        self._verdict = ContinuationVerdict(complete=complete, remaining_work=list(remaining))
+        self.calls: list[Any] = []
+
+    async def ainvoke(self, ctx: Any, *a: Any, **k: Any):
+        self.calls.append(ctx)
+        return self._verdict
+
+
+def stub_judge(monkeypatch, *, complete: bool = True, remaining: tuple = ()) -> FakeJudge:
+    """Patch ``build_continuation_judge`` so the master graph never calls a real model at its
+    natural-stop point. Defaults to 'complete' so the run finalises straight to report."""
+    import a2pwn.graph as g
+
+    judge = FakeJudge(complete=complete, remaining=remaining)
+    monkeypatch.setattr(g, "build_continuation_judge", lambda models: judge)
+    return judge
+
+
 def make_cfg(
     *,
     active: bool = True,
@@ -77,6 +101,7 @@ def make_cfg(
     max_phases: int = 12,
     max_batch_width: int = 6,
     max_dispatches: int = 200,
+    max_continuations: int = 2,
     targets: list[str] | None = None,
     name: str = "eng",
 ) -> A2pwnConfig:
@@ -94,6 +119,7 @@ def make_cfg(
         max_phases=max_phases,
         max_batch_width=max_batch_width,
         max_dispatches=max_dispatches,
+        max_continuations=max_continuations,
     )
 
 
@@ -180,6 +206,7 @@ def make_master_state(
     verify_queue: tuple[Finding, ...] = (),
     history: tuple = (),
     round: int = 0,
+    continuations: int = 0,
     budget: DispatchBudget | None = None,
 ) -> dict:
     return {
@@ -194,6 +221,7 @@ def make_master_state(
         "verify_attempts": {},
         "phase": "recon",
         "round": round,
+        "continuations": continuations,
         "budget": budget or make_budget(cfg),
     }
 

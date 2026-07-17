@@ -275,8 +275,10 @@ async def run_engagement(cfg: A2pwnConfig, objective: str, thread_id: str) -> Re
             "dispatch_results": [],
             "findings": [],
             "verify_queue": [],
+            "verify_attempts": {},
             "phase": "recon",
             "round": 0,
+            "continuations": 0,
         }
 
         while True:
