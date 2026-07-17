@@ -619,3 +619,39 @@ def test_codex_cli_timeout_raises(monkeypatch):
     monkeypatch.setattr(backends.subprocess, "run", fake_run)
     with pytest.raises(RuntimeError, match="timed out"):
         ChatCodex()._cli_generate("hi")
+
+
+# --------------------------------------------------------------------------- #
+# resilience: salvage streamed content on a terminal SDK error
+# --------------------------------------------------------------------------- #
+def _install_raising_sdk(monkeypatch, blocks, exc):
+    """Fake SDK whose query streams `blocks` then raises `exc` (models the CLI's terminal
+    'returned an error result: success' after the assistant content already streamed)."""
+
+    async def query(*, prompt, options, transport=None):
+        yield _AssistantMessage(content=blocks)
+        raise exc
+
+    fake = types.ModuleType("claude_agent_sdk")
+    fake.query = query
+    fake.ClaudeAgentOptions = _Options
+    fake.TextBlock = _TextBlock
+    fake.ToolUseBlock = _ToolUseBlock
+    fake.AssistantMessage = _AssistantMessage
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+
+
+async def test_sdk_error_after_content_is_salvaged(monkeypatch):
+    _install_raising_sdk(
+        monkeypatch, [_TextBlock("partial answer")], Exception("returned an error result: success")
+    )
+    model = ChatClaudeCode()
+    result = await model._agenerate([HumanMessage("go")])
+    assert result.generations[0].message.content == "partial answer"
+
+
+async def test_sdk_error_with_no_content_propagates(monkeypatch):
+    _install_raising_sdk(monkeypatch, [], RuntimeError("auth failed"))
+    model = ChatClaudeCode()
+    with pytest.raises(RuntimeError):
+        await model._agenerate([HumanMessage("go")])

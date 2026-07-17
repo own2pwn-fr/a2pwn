@@ -460,7 +460,14 @@ def build_subagent_graph(
         # anyway, so skip the wasted LLM call and compose the prompt directly.
         if state.get("clarify_round", 0) > cfg.max_clarify_rounds:
             return "compose_prompt"
-        questions = await clarifier.ainvoke(_clarify_ctx(state))
+        # A clarifier hiccup (a bare "[]" the structured parser rejects, a transient SDK error)
+        # must NOT waste the whole dispatch — degrade to "no questions" and go straight to
+        # exploitation. Clarification is an optional refinement, never a gate.
+        try:
+            questions = await clarifier.ainvoke(_clarify_ctx(state))
+        except Exception as exc:  # noqa: BLE001 - optional refinement; proceed on any failure
+            _log.info("clarifier failed, proceeding self-contained: %s", exc)
+            return "compose_prompt"
         aug = {
             "questions": list(questions or []),
             "clarify_round": state.get("clarify_round", 0),

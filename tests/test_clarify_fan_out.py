@@ -42,3 +42,25 @@ async def test_clarify_round_cap_stops_the_loop(monkeypatch, fake_client):
     # rounds 1 and 2 fan out one question each, then compose_prompt is forced.
     assert len(fork.calls) == 2
     assert out["clean_result"].status in {"no_finding", "partial"}
+
+
+async def test_clarifier_failure_degrades_to_self_contained(monkeypatch, fake_client):
+    """A clarifier hiccup (raised error / bad structured output) must not waste the dispatch —
+    the child proceeds straight to compose_prompt/execute instead of crashing."""
+    cfg = make_cfg()
+
+    def _boom(ctx):
+        raise RuntimeError("structured output failed: raw reply '[]'")
+
+    sub = build_sub(
+        monkeypatch,
+        cfg,
+        fake_client,
+        clarifier=FakeClarifier(_boom),
+        executor=FakeExecutor(exec_result([])),
+        fork=FakeFork(),
+    )
+    spec = TaskSpec(task="probe login", target="https://app.example.com/login")
+    out = await sub.ainvoke(sub_input(cfg, intent="task", spec=spec))
+    # Reached distill despite the clarifier blowing up.
+    assert out["clean_result"].status in {"no_finding", "partial", "blocked"}

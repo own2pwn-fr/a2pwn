@@ -14,6 +14,7 @@ Two internal families:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,8 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from a2pwn.config import BackendConfig
+
+_log = logging.getLogger("a2pwn")
 
 
 class StructuredOutputError(ValueError):
@@ -382,25 +385,34 @@ class ChatClaudeCode(BaseChatModel):
         text_parts: list[str] = []
         tool_calls: list[dict] = []
         try:
-            async for message in sdk.query(prompt=prompt, options=options):
-                for block in getattr(message, "content", None) or []:
-                    is_tool = (ToolUseBlock is not None and isinstance(block, ToolUseBlock)) or (
-                        hasattr(block, "name") and hasattr(block, "input")
-                    )
-                    is_text = (TextBlock is not None and isinstance(block, TextBlock)) or hasattr(
-                        block, "text"
-                    )
-                    if is_tool:
-                        tool_calls.append(
-                            {
-                                "id": getattr(block, "id", None) or uuid.uuid4().hex[:24],
-                                "name": getattr(block, "name", ""),
-                                "args": getattr(block, "input", {}) or {},
-                                "type": "tool_call",
-                            }
-                        )
-                    elif is_text:
-                        text_parts.append(getattr(block, "text", ""))
+            # The SDK can raise on a terminal ResultMessage the CLI marks as error (e.g.
+            # "returned an error result: success") AFTER the assistant content already streamed.
+            # Salvage whatever we collected rather than aborting the whole dispatch; only a
+            # failure with nothing collected at all propagates.
+            try:
+                async for message in sdk.query(prompt=prompt, options=options):
+                    for block in getattr(message, "content", None) or []:
+                        is_tool = (
+                            ToolUseBlock is not None and isinstance(block, ToolUseBlock)
+                        ) or (hasattr(block, "name") and hasattr(block, "input"))
+                        is_text = (
+                            TextBlock is not None and isinstance(block, TextBlock)
+                        ) or hasattr(block, "text")
+                        if is_tool:
+                            tool_calls.append(
+                                {
+                                    "id": getattr(block, "id", None) or uuid.uuid4().hex[:24],
+                                    "name": getattr(block, "name", ""),
+                                    "args": getattr(block, "input", {}) or {},
+                                    "type": "tool_call",
+                                }
+                            )
+                        elif is_text:
+                            text_parts.append(getattr(block, "text", ""))
+            except Exception as exc:  # noqa: BLE001 - salvage streamed content on a terminal SDK error
+                if not text_parts and not tool_calls:
+                    raise
+                _log.info("claude-code SDK error after content, salvaging partial reply: %s", exc)
         finally:
             # Restore only in the legacy fallback path; the primary path never mutated env.
             if use_env_restore and saved_key is not None:
