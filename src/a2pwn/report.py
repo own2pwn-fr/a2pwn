@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +19,10 @@ from a2pwn.burpwn import BurpwnClient
 from a2pwn.models import Finding
 
 _log = logging.getLogger("a2pwn")
+
+
+def _safe_name(token: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", token) or "ws"
 
 _SEVERITY_ORDER: dict[str, int] = {
     "critical": 5,
@@ -122,14 +127,22 @@ async def build_report(state, client: BurpwnClient, out_dir: str) -> Report:
 
     os.makedirs(out_dir, exist_ok=True)
     har_paths: list[str] = []
-    for ws in workspaces:
-        out = os.path.join(out_dir, f"{ws}.har")
+    # Per-finding evidence HAR, scoped to its workspace ID where known; plus a whole-session HAR as
+    # the always-present fallback (some findings lack a resolved workspace_id).
+    ws_ids: dict[str, int | None] = {}
+    for f in findings:
+        ws_ids.setdefault(f.flow_batch.workspace, f.flow_batch.workspace_id)
+    exports: list[tuple[str, int | None]] = [("evidence-all", None)]
+    exports += [(ws, wid) for ws, wid in ws_ids.items() if wid is not None]
+    for name, wid in exports:
+        out = os.path.join(out_dir, f"{_safe_name(name)}.har")
         try:
-            client.cli_export_har(engagement.session, out)
+            client.cli_export_har(engagement.session, out, wid)
         except Exception as exc:  # noqa: BLE001 - one failed export must not lose the whole report
-            _log.warning("HAR export failed for workspace %s (skipping): %s", ws, exc)
+            _log.warning("HAR export failed for %s (skipping): %s", name, exc)
             continue
-        har_paths.append(out)
+        if os.path.exists(out):
+            har_paths.append(out)
 
     stats = _compute_stats(findings, chains, workspaces)
     return Report(

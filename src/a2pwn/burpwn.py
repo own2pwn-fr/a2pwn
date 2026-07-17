@@ -355,8 +355,14 @@ class BurpwnClient:
         return BurpwnClient._cli(["session", "new", "--name", name]) or {}
 
     @staticmethod
-    def cli_export_har(session: str, out: str) -> dict:
-        return BurpwnClient._cli(["--session", session, "export", "har", "-o", out]) or {}
+    def cli_export_har(session: str, out: str, workspace_id: int | None = None) -> dict:
+        # `burpwn export har` has no --session flag; it exports the ACTIVE session. Select it first,
+        # then export (optionally scoped to a workspace ID — the flag takes an id, not a name).
+        BurpwnClient._cli(["session", "use", session])
+        argv = ["export", "har", "-o", out]
+        if workspace_id is not None:
+            argv += ["--workspace", str(workspace_id)]
+        return BurpwnClient._cli(argv) or {}
 
     @staticmethod
     def cli_ca_export(out: str) -> dict:

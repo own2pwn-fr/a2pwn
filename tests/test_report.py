@@ -45,11 +45,12 @@ def _engagement() -> EngagementSpec:
     return EngagementSpec(name="acme", targets=["https://app.example.com"], session="acme")
 
 
-def _record_har(client) -> list[tuple[str, str]]:
-    calls: list[tuple[str, str]] = []
+def _record_har(client) -> list[tuple[str, str, int | None]]:
+    calls: list[tuple[str, str, int | None]] = []
 
-    def cli_export_har(session: str, out: str) -> dict:
-        calls.append((session, out))
+    def cli_export_har(session: str, out: str, workspace_id: int | None = None) -> dict:
+        calls.append((session, out, workspace_id))
+        open(out, "w").close()  # the real export writes a file; build_report only lists existing ones
         return {"path": out}
 
     client.cli_export_har = cli_export_har  # type: ignore[method-assign]
@@ -112,22 +113,24 @@ async def test_har_exported_once_per_workspace(fake_client, tmp_path):
 
     report = await build_report(state, fake_client, str(tmp_path))
 
-    exported_workspaces = [out for _session, out in calls]
-    # one call per distinct promoted workspace
-    assert len(calls) == 2
-    assert str(tmp_path / "shared-ws.har") in exported_workspaces
-    assert str(tmp_path / "ssrf-ws.har") in exported_workspaces
-    assert all(session == "acme" for session, _out in calls)
-    assert not any("ghost-ws" in out for out in exported_workspaces)
-    assert sorted(report.har_paths) == sorted(exported_workspaces)
+    exported = [out for _session, out, _wid in calls]
+    # a whole-session evidence HAR + one per DISTINCT promoted workspace (shared-ws deduped)
+    assert str(tmp_path / "evidence-all.har") in exported
+    assert str(tmp_path / "shared-ws.har") in exported
+    assert str(tmp_path / "ssrf-ws.har") in exported
+    assert len(calls) == 3  # evidence-all + shared-ws + ssrf-ws (shared-ws exported once)
+    assert all(session == "acme" for session, _out, _wid in calls)
+    assert not any("ghost-ws" in out for out in exported)
+    assert sorted(report.har_paths) == sorted(exported)
 
 
 async def test_one_failing_har_export_still_builds_the_report(fake_client, tmp_path):
     # A single workspace whose HAR export raises must not lose the whole report: the other
     # workspaces are still exported and the report is returned with the surviving HAR paths.
-    def cli_export_har(session: str, out: str) -> dict:
+    def cli_export_har(session: str, out: str, workspace_id: int | None = None) -> dict:
         if "boom-ws" in out:
             raise RuntimeError("burpwn export har failed for this workspace")
+        open(out, "w").close()
         return {"path": out}
 
     fake_client.cli_export_har = cli_export_har  # type: ignore[method-assign]
@@ -139,7 +142,10 @@ async def test_one_failing_har_export_still_builds_the_report(fake_client, tmp_p
 
     report = await build_report(state, fake_client, str(tmp_path))
 
-    assert report.har_paths == [str(tmp_path / "ok-ws.har")]  # boom-ws skipped, not fatal
+    # boom-ws raises and is skipped; the whole-session evidence + ok-ws still export.
+    assert str(tmp_path / "evidence-all.har") in report.har_paths
+    assert str(tmp_path / "ok-ws.har") in report.har_paths
+    assert not any("boom-ws" in p for p in report.har_paths)
     assert {f.vuln_class for f in report.findings} == {"xss", "ssrf"}
     assert report.stats["evidence_workspaces"] == 2  # both workspaces are still evidence
 
