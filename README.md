@@ -95,6 +95,28 @@ uv run a2pwn run --target https://ginandjuice.shop --objective "audit the shop e
 
 Findings and a per-batch HAR export land under the run directory.
 
+### Docker (batteries included)
+
+The published image bundles a2pwn, all Python deps, the burpwn sandbox, and (via
+`claude-agent-sdk`) a Claude Code CLI — nothing else to install. The sub-agents build a rootless
+user/network namespace, so the container needs `--privileged` (or the equivalent caps):
+
+```bash
+# subscription backend — mount your Claude Code login:
+docker run --rm -it --privileged \
+  -v "$HOME/.claude:/root/.claude" \
+  -v "$PWD/out:/root/.local/share/a2pwn" \
+  own2pwnfr/a2pwn run -t https://ginandjuice.shop -o "find and prove web vulns" --yes
+
+# API backend instead (no subscription):
+docker run --rm -it --privileged -e ANTHROPIC_API_KEY=sk-... \
+  own2pwnfr/a2pwn run -t https://brokencrystals.com -o "..." \
+  --executor-model anthropic:claude-sonnet-4-5 --verifier-model anthropic:claude-opus-4-5 --yes
+```
+
+Reports and HAR captures land in the mounted `out/` directory. The live TUI runs on an interactive
+terminal (`-it`); add `--plain` for log-style output in CI.
+
 ### Requirements
 
 - [burpwn](https://github.com/own2pwn-fr/burpwn) on `PATH` (the sandbox + intercepting proxy). Run
