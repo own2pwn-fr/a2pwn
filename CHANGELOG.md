@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **burpwn onboarding.** burpwn is a prebuilt release binary, not a Python package, so
+  `git clone → uv sync → uv run` left first-time users without it and the agent failed at the first
+  sandbox call. Two new commands close the gap: **`a2pwn install-burpwn`** resolves the host arch
+  triple, downloads the matching release tarball from the burpwn repo and installs the binary onto a
+  writable `PATH` dir (`--dest` / `--version` / `--force`; Linux only, extracts only the single
+  `burpwn` member to avoid tarball path-traversal); **`a2pwn doctor`** is a standalone preflight (no
+  auth gate, no model spend) that reports whether burpwn is on `PATH` and whether the host supports
+  rootless user/network namespaces. `a2pwn run`/`resume` now run the burpwn preflight **before** the
+  authorization gate, and the missing-binary hint points at `a2pwn install-burpwn`. README quickstart
+  now includes the install + doctor steps.
+
 - **`state_change` oracle** — a deterministic proof path for business-logic / CSRF findings (a
   targeted value provably appears/disappears/changes across a before/after pair), replacing the
   abstaining `llm_rubric` the kernel always rejected.

@@ -155,9 +155,9 @@ def ensure_burpwn_available() -> None:
     if shutil.which("burpwn") is None:
         raise BurpwnMissingError(
             "burpwn is not installed or not on PATH. a2pwn drives ALL traffic through the burpwn "
-            "sandbox, so it cannot run without it. Install it from "
-            "https://github.com/own2pwn-fr/burpwn and run `burpwn doctor` to verify the host "
-            "supports rootless user/network namespaces, then re-run."
+            "sandbox, so it cannot run without it. Install it with `a2pwn install-burpwn` (or grab a "
+            "release from https://github.com/own2pwn-fr/burpwn), then run `a2pwn doctor` to verify "
+            "the host supports rootless user/network namespaces, and re-run."
         )
 
 

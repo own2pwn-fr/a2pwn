@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import typer
 
@@ -255,19 +257,20 @@ def run(
     # Show the plan BEFORE the authorization gate so the operator can bail on a wrong scope/flag.
     _print_run_plan(cfg, objective, out_dir, compact=yes)
 
+    # Fail fast on the most common first-run failure BEFORE the authorization gate — no point making
+    # the operator acknowledge the disclaimer for a run that cannot capture traffic.
+    try:
+        ensure_burpwn_available()
+    except BurpwnMissingError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
     ack = _authorize(yes)
     if not ack:
         typer.echo("Authorization not confirmed. Aborting.", err=True)
         raise typer.Exit(2)
     cfg.disclaimer_ack = ack
     cfg.engagement.authorization_acknowledged = ack
-
-    # Fail fast on the most common first-run failure before spending LLM calls.
-    try:
-        ensure_burpwn_available()
-    except BurpwnMissingError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1) from exc
 
     try:
         report = asyncio.run(run_engagement(cfg, objective, thread_id=name, tui=use_tui, formats=formats))
@@ -388,18 +391,19 @@ def resume(
 
     out_dir = run_out_dir(cfg, name)
     _print_run_plan(cfg, obj, out_dir, compact=yes)
-    ack = _authorize(yes)
-    if not ack:
-        typer.echo("Authorization not confirmed. Aborting.", err=True)
-        raise typer.Exit(2)
-    cfg.disclaimer_ack = ack
-    cfg.engagement.authorization_acknowledged = ack
 
     try:
         ensure_burpwn_available()
     except BurpwnMissingError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
+
+    ack = _authorize(yes)
+    if not ack:
+        typer.echo("Authorization not confirmed. Aborting.", err=True)
+        raise typer.Exit(2)
+    cfg.disclaimer_ack = ack
+    cfg.engagement.authorization_acknowledged = ack
 
     typer.echo(f"Resuming run '{name}' …")
     try:
@@ -409,6 +413,88 @@ def resume(
         raise typer.Exit(1) from exc
 
     _emit_report(report, cfg, name)
+
+
+@app.command()
+def doctor() -> None:
+    """Preflight the host: is burpwn installed, and does the sandbox have what it needs?
+
+    A standalone environment check — no authorization gate, no engagement, no model calls. Run it
+    right after install to confirm burpwn is on PATH and the host supports rootless user/network
+    namespaces before spending a real run.
+    """
+    from a2pwn.burpwn import BurpwnClient
+    from a2pwn.installer import BURPWN_REPO
+
+    path = shutil.which("burpwn")
+    if path is None:
+        typer.echo("✗ burpwn: not found on PATH.", err=True)
+        typer.echo(f"  Install it with `a2pwn install-burpwn` (or from {BURPWN_REPO}).", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"✓ burpwn on PATH: {path}")
+
+    try:
+        report = BurpwnClient.cli_doctor()
+    except Exception as exc:  # noqa: BLE001 - any doctor failure is a red preflight, reported cleanly
+        typer.echo(f"✗ `burpwn doctor` failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    ok = not (isinstance(report, dict) and report.get("ok") is False)
+    if isinstance(report, dict):
+        for key, value in report.items():
+            if key == "ok":
+                continue
+            typer.echo(f"    {key}: {value}")
+    if ok:
+        typer.echo("✓ sandbox prerequisites OK — you're ready to run.")
+    else:
+        typer.echo(
+            "✗ sandbox prerequisites incomplete (rootless user/network namespaces). "
+            "See the burpwn doctor output above.",
+            err=True,
+        )
+    raise typer.Exit(0 if ok else 1)
+
+
+@app.command("install-burpwn")
+def install_burpwn_cmd(
+    dest: str | None = typer.Option(
+        None,
+        "--dest",
+        help="Directory to install the burpwn binary into (default: a writable bin dir on PATH, e.g. ~/.local/bin).",
+    ),
+    version: str = typer.Option(
+        "latest", "--version", help="burpwn release tag to install (default: the latest release)."
+    ),
+    force: bool = typer.Option(False, "--force", help="Reinstall even if burpwn is already on PATH."),
+) -> None:
+    """Download the burpwn release binary and install it on PATH — the one dep `uv sync` can't pull.
+
+    burpwn is a prebuilt GitHub-release binary, not a Python package, so `git clone → uv sync → uv
+    run` leaves it missing. This fetches the right build for your architecture and drops it in a bin
+    dir on your PATH. Linux only (macOS/Windows: use the Docker image). Then run `a2pwn doctor`.
+    """
+    from a2pwn import installer
+
+    existing = shutil.which("burpwn")
+    if existing and not force:
+        typer.echo(f"burpwn is already installed at {existing} (use --force to reinstall).")
+        raise typer.Exit(0)
+
+    try:
+        triple = installer.release_triple()
+        target_dir = Path(dest) if dest else installer.default_dest()
+        typer.echo(f"Downloading burpwn ({triple}, {version}) → {target_dir} …")
+        binpath = installer.install_burpwn(target_dir, version=version, triple=triple)
+    except installer.InstallError as exc:
+        typer.echo(f"Install failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"✓ installed burpwn → {binpath}")
+    if not installer.on_path(target_dir):
+        typer.echo(f"⚠ {target_dir} is not on your PATH. Add it, then re-open your shell:", err=True)
+        typer.echo(f'    export PATH="{target_dir}:$PATH"', err=True)
+    typer.echo("Next: run `a2pwn doctor` to verify the sandbox prerequisites.")
 
 
 def main() -> None:

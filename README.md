@@ -81,8 +81,15 @@ instead of stopping at recon.
 
 ## Install & run
 
+a2pwn drives **all** traffic through the [burpwn](https://github.com/own2pwn-fr/burpwn) sandbox — a
+prebuilt release binary, **not** a Python package, so `uv`/`pip` cannot pull it. Install it once
+(Linux only; on macOS/Windows use the [Docker image](#docker-batteries-included)), then verify the
+host with `a2pwn doctor`:
+
 ```bash
 # one-shot, no clone (uv installs into an ephemeral env)
+uvx a2pwn install-burpwn      # fetch the burpwn sandbox binary onto your PATH (~/.local/bin)
+uvx a2pwn doctor              # verify burpwn is on PATH + the host supports rootless namespaces
 uvx a2pwn run --target https://app.example.com --objective "find and prove exploitable web vulns"
 ```
 
@@ -90,8 +97,15 @@ or from a checkout:
 
 ```bash
 uv sync
+uv run a2pwn install-burpwn   # the one dependency `uv sync` can't install
+uv run a2pwn doctor           # preflight: burpwn present + rootless user/network namespaces OK
 uv run a2pwn run --target https://ginandjuice.shop --objective "audit the shop end to end" --yes
 ```
+
+`a2pwn install-burpwn` resolves your architecture, downloads the matching release tarball and drops
+the `burpwn` binary in a bin dir on your `PATH` (override with `--dest`, pin a tag with `--version`).
+Already have burpwn elsewhere? Skip it — `a2pwn doctor` will find it. Prefer to install by hand?
+Grab a release from the [burpwn repo](https://github.com/own2pwn-fr/burpwn) and put it on `PATH`.
 
 Findings land under the run directory as `report.md` plus machine-readable `report.json`,
 `report.sarif` (GitHub code-scanning / CI) and a self-contained `report.html`, alongside a per-batch
@@ -135,10 +149,12 @@ terminal (`-it`); add `--plain` for log-style output in CI.
 
 ### Requirements
 
-- [burpwn](https://github.com/own2pwn-fr/burpwn) on `PATH` (the sandbox + intercepting proxy). Run
-  `burpwn doctor` once to confirm the host supports rootless user/network namespaces. a2pwn
-  preflights this and aborts immediately with an install hint if the binary is missing — it never
-  starts spending model calls on a run that cannot capture traffic.
+- [burpwn](https://github.com/own2pwn-fr/burpwn) on `PATH` (the sandbox + intercepting proxy).
+  Install it with `a2pwn install-burpwn` and confirm the host with `a2pwn doctor` (checks the binary
+  is present and that rootless user/network namespaces work). `a2pwn run` also preflights this
+  **before** the authorization gate and aborts immediately with an install hint if the binary is
+  missing — it never spends model calls on a run that cannot capture traffic. Linux only; on
+  macOS/Windows use the Docker image.
 - A model backend (see below). The default needs a working Claude Code login — nothing else.
 
 ### Authorization & scope
