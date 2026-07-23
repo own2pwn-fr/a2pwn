@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Executor observability.** The native-SDK sub-agent used to run blind: its burpwn tool calls,
+  their results and any failures only reached the live TUI (via the display event bus), so a
+  `--plain` run showed nothing — "the agent can't use burpwn but I have no logs". Every tool call is
+  now logged on the `a2pwn.executor` logger (INFO = the call + args, visible in `--plain`; DEBUG =
+  result head with `-v`), a tool that raises is **logged at WARNING and surfaced to the model as an
+  error result** instead of vanishing into an opaque SDK exception, and a run that makes zero tool
+  calls and finds nothing (the signature of a model refusal — "cannot execute … under current tool
+  constraints") is flagged at WARNING with the model's last text. Makes environment failures (a
+  broken burpwn sandbox: glibc/namespace) and model refusals distinguishable from a headless run.
+
 - **burpwn onboarding.** burpwn is a prebuilt release binary, not a Python package, so
   `git clone → uv sync → uv run` left first-time users without it and the agent failed at the first
   sandbox call. Two new commands close the gap: **`a2pwn install-burpwn`** resolves the host arch

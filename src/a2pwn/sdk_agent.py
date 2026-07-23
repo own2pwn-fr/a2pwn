@@ -20,6 +20,7 @@ or later; see the repository ``LICENSE`` for the full text.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -39,6 +40,10 @@ from a2pwn import progress
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
 from a2pwn.models import Finding, FlowBatchRef
 from a2pwn.oracles import VerificationOracle, run_oracle
+
+# Child of the "a2pwn" logger so the TUI's WARNING-silencing still applies, but `--plain` (INFO) and
+# `-v` (DEBUG) surface the sub-agent's otherwise-invisible tool calls, results and refusals.
+_log = logging.getLogger("a2pwn.executor")
 
 # Kept byte-identical to a2pwn.tools.finding_tools so findings clamp the same way.
 _ORACLES = {"differential", "oob", "marker", "signature", "timing", "two_identity", "llm_rubric"}
@@ -81,6 +86,33 @@ def _slug(name: str) -> str:
 def _head(text: str, n: int = _HEAD) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= n else text[:n] + "…"
+
+
+def _observe_tool(name: str, handler, blocked: set):
+    """Wrap a tool handler with the active-exploit hard block + observability.
+
+    Every call, its result head and any failure are logged (INFO/DEBUG/WARNING) and a tool error is
+    surfaced to the model as an error result instead of vanishing into an opaque SDK exception. This
+    is what makes a ``--plain`` run show *whether burpwn is actually being driven* and *why it fails*
+    — the gap behind "the agent can't use burpwn but I have no logs".
+    """
+
+    async def _fn(args: dict) -> dict:
+        did = progress.current_dispatch()
+        if name in blocked:
+            _log.info("[%s] tool %s BLOCKED (active-exploit not authorised)", did, name)
+            return _text_result(f"BLOCKED: active exploitation not authorised for {name}")
+        _log.info("[%s] tool %s %s", did, name, _head(json.dumps(args, default=str), 160))
+        try:
+            result = await handler(args)
+        except Exception as exc:  # noqa: BLE001 - log + feed the model an error, never swallow silently
+            _log.warning("[%s] tool %s FAILED: %s", did, name, exc)
+            progress.emit("activity", stage="error", text=f"{name} FAILED: {_head(str(exc), 120)}")
+            return _text_result(f"ERROR from {name}: {exc}")
+        _log.debug("[%s] tool %s -> %s", did, name, _head(json.dumps(result, default=str), 200))
+        return result
+
+    return _fn
 
 
 async def run_sdk_agent(
@@ -392,20 +424,10 @@ async def run_sdk_agent(
         ),
     ]
 
-    def _wrap(name: str, handler) -> object:
-        """Apply the active-exploitation hard block around a handler."""
-
-        async def _fn(args: dict) -> dict:
-            if name in blocked:
-                return _text_result(f"BLOCKED: active exploitation not authorised for {name}")
-            return await handler(args)
-
-        return _fn
-
     sdk_tools = []
     tool_names: list[str] = []
     for name, description, schema, handler in specs:
-        sdk_tools.append(tool(name, description, schema)(_wrap(name, handler)))
+        sdk_tools.append(tool(name, description, schema)(_observe_tool(name, handler, blocked)))
         tool_names.append(name)
 
     # ---- one on-demand info tool per skill (loads methodology when the agent asks) ------
@@ -463,6 +485,7 @@ async def run_sdk_agent(
                         if block.text and block.text.strip():
                             summary = block.text
                             transcript.append(f"say {_head(block.text)}")
+                            _log.info("[%s] say %s", progress.current_dispatch(), _head(block.text, 200))
                             progress.emit("thought", text=_head(block.text, 140))
             elif isinstance(msg, ResultMessage):
                 if getattr(msg, "result", None):
@@ -470,8 +493,18 @@ async def run_sdk_agent(
                     transcript.append(f"result {_head(msg.result)}")
     except Exception as exc:  # noqa: BLE001 - salvage partial work; only re-raise on a total loss
         transcript.append(f"error {_head(repr(exc))}")
+        _log.warning("[%s] executor loop error: %s", progress.current_dispatch(), _head(repr(exc), 200))
         if not (findings or tool_calls or summary):
             raise
+
+    # A run that called NO tools and reported NO findings is the signature of a model refusal
+    # ("cannot execute … under current tool constraints") — flag it loudly so it isn't invisible.
+    if tool_calls == 0 and not findings:
+        _log.warning(
+            "[%s] executor made 0 tool calls and found nothing — likely a model refusal; last text: %s",
+            progress.current_dispatch(),
+            _head(summary, 240) or "(none)",
+        )
 
     return SdkExecOutcome(
         candidate_findings=findings,
