@@ -69,6 +69,7 @@ class Finding(BaseModel):
         "signature",
         "timing",
         "two_identity",
+        "state_change",
         "llm_rubric",
     ]
     # Oracle inputs threaded from the tool that reported the finding into the deterministic
@@ -82,7 +83,7 @@ class Finding(BaseModel):
 
     @staticmethod
     def make_key(vuln_class: str, target: str, param: str | None) -> str:
-        return f'{vuln_class}|{target}|{param or "*"}'
+        return f"{vuln_class}|{target}|{param or '*'}"
 
     def rank(self) -> int:
         """3 = independently verified, 2 = confirmed, 1 = candidate."""
@@ -136,9 +137,7 @@ class MasterContextView(BaseModel):
         clarify question cannot blow up as O(history * questions).
         """
         recent = self.history[-k:] if k > 0 else []
-        slim_history = [
-            rec.model_copy(update={"result": _slim_result(rec.result)}) for rec in recent
-        ]
+        slim_history = [rec.model_copy(update={"result": _slim_result(rec.result)}) for rec in recent]
         slim_findings = [_slim_finding(f) for f in self.known_findings]
         return MasterContextView(
             objective=self.objective,

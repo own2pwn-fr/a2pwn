@@ -41,7 +41,10 @@ class FakeClarifier:
 
 
 class FakeExecutor:
-    """`.ainvoke(state) -> dict` returning canned ReAct outputs, one per call."""
+    """`.ainvoke(state) -> dict` returning canned ReAct outputs, one per call.
+
+    A canned entry that is a ``BaseException`` instance is raised instead of returned, so a test
+    can simulate a specific retry round crashing (e.g. the SDK's max-turns exhaustion)."""
 
     def __init__(self, results: Any):
         self._results = results if isinstance(results, list) else [results]
@@ -52,6 +55,8 @@ class FakeExecutor:
         self.calls.append(state)
         out = self._results[min(self._i, len(self._results) - 1)]
         self._i += 1
+        if isinstance(out, BaseException):
+            raise out
         return out
 
     async def ainvoke(self, state: dict, *a: Any, **k: Any) -> dict:
@@ -124,9 +129,7 @@ def make_cfg(
 
 
 def make_ctx(cfg: A2pwnConfig, objective: str = "find and prove exploitable web vulns") -> MasterContextView:
-    return MasterContextView(
-        objective=objective, engagement=cfg.engagement, history=[], known_findings=[]
-    )
+    return MasterContextView(objective=objective, engagement=cfg.engagement, history=[], known_findings=[])
 
 
 def make_budget(cfg: A2pwnConfig, **over: Any) -> DispatchBudget:

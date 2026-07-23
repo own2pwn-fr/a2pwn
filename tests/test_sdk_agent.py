@@ -73,3 +73,12 @@ def test_json_result_head_roundtrips():
     # sanity: the wrapper's debug head serialises dict results without throwing
     payload = sdk_agent._json_result({"a": [1, 2, 3]})
     assert json.loads(_text_of(payload)) == {"a": [1, 2, 3]}
+
+
+def test_oracles_allowlist_includes_state_change():
+    """Regression: state_change (the business-logic/CSRF oracle, shipped and documented in
+    EXECUTOR_SYS) was missing from this allow-list, so report_finding silently rewrote every
+    state_change candidate to "signature" — the adjudicator then re-derived the wrong oracle
+    against the wrong flow shape and rejected genuinely-proven HIGH findings with no signal to
+    the operator that anything had gone wrong."""
+    assert "state_change" in sdk_agent._ORACLES

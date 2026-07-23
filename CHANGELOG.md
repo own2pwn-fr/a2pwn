@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed (real findings silently dropped from the report)
+
+Found on a live full-scope engagement: the LLM transcripts showed 4+ well-evidenced HIGH-severity
+candidates (JWT signature bypass, unauthenticated destructive DELETE, unauthenticated cross-tenant
+webhook-subscriber CRUD on two environments) but the final report showed 0 verified findings and
+only 1 unrelated LOW — a direct violation of the "reconciliation only ever promotes, never silently
+drops" design invariant. Root-caused to three independent bugs:
+
+- **`state_change` oracle was silently corrupted to `signature`.** The oracle allow-lists in both
+  executor paths (`sdk_agent.py`, `tools/finding_tools.py`) — and the `Finding.oracle_kind` Pydantic
+  `Literal` itself in `models.py` — never included `"state_change"`, even though it shipped as a
+  documented oracle kind and `VerificationOracle.kind` (the actual dispatcher) already supported it.
+  Every finding the executor reported with `oracle_kind="state_change"` was rewritten to
+  `"signature"` before adjudication, so the deterministic re-check ran the WRONG oracle against the
+  wrong flow shape and rejected genuinely-proven business-logic/CSRF/CRUD findings with zero signal
+  to the operator. This is almost certainly why every cross-tenant subscriber-CRUD finding vanished.
+- **A verify-retry-round crash wiped the whole dispatch, not just the retried candidate.** The
+  sub-agent graph is `checkpointer=False` by design; when a multi-candidate dispatch confirmed some
+  candidates but not others, the verify loop retried the executor for the unproven ones — and if
+  THAT retry's executor invocation raised (e.g. the SDK's "Reached maximum number of turns (40)"
+  with zero new activity), the exception propagated uncaught out of the whole sub-agent invocation,
+  landing in `run_subagent`'s outer handler, which degraded the ENTIRE dispatch to `"blocked"` —
+  discarding every already-confirmed candidate from earlier rounds of the SAME dispatch, not just
+  the one still being retried. `_execute` now catches an exception on retry rounds only (round 0
+  still propagates, preserving the existing isolated-failure contract) and treats it as "no new
+  activity this round", so prior-round confirmations survive to `distill`.
+- **Adjudication reject reasons were invisible outside the TUI.** `_verify`'s REJECT reason (capture
+  alarm, tls-passthru block, or the oracle simply not re-deriving) only ever reached the
+  TUI-only progress event bus — a `--plain` run had no way to tell why a candidate never made the
+  report short of reverse-engineering it from source and raw burpwn state, which is exactly what
+  this bug required to diagnose. Every reject reason is now logged at WARNING.
+
 ### Added
 
 - **Executor observability.** The native-SDK sub-agent used to run blind: its burpwn tool calls,

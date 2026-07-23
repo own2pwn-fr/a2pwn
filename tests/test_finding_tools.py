@@ -37,17 +37,42 @@ async def test_report_finding_emits_finding_artifact(fake_client):
     assert finding.key == Finding.make_key("sqli", "https://demo.testfire.net/login.jsp", "uid")
 
 
+async def test_report_finding_accepts_state_change_oracle(fake_client):
+    """Regression: state_change (the business-logic/CSRF oracle, CHANGELOG-shipped) was missing
+    from _ORACLES, so every state_change finding was silently rewritten to "signature" here — the
+    adjudicator then re-derived the WRONG oracle against the wrong flow shape and rejected
+    genuinely-proven findings with no signal to the operator."""
+    tool = finding_tools(fake_client)[0]
+    msg = await tool.ainvoke(
+        {
+            "args": {
+                "vuln_class": "broken-access-control",
+                "severity": "high",
+                "target": "https://api.example.com/subscribers",
+                "evidence": "marker present before, absent after an unauthenticated delete",
+                "flow_ids": [10, 11],
+                "oracle_kind": "state_change",
+                "oracle_expect": {"must_disappear": "marker-xyz"},
+            },
+            "id": "call-sc",
+            "name": "report_finding",
+            "type": "tool_call",
+        }
+    )
+    assert msg.artifact.oracle_kind == "state_change"
+
+
 async def test_report_finding_bad_enums_default_safely(fake_client):
     tool = finding_tools(fake_client)[0]
     msg = await tool.ainvoke(
         {
             "args": {
                 "vuln_class": "xss",
-                "severity": "spicy",       # invalid -> medium
+                "severity": "spicy",  # invalid -> medium
                 "target": "https://x/",
                 "evidence": "reflected",
                 "flow_ids": [1],
-                "oracle_kind": "vibes",    # invalid -> signature
+                "oracle_kind": "vibes",  # invalid -> signature
             },
             "id": "call-2",
             "name": "report_finding",

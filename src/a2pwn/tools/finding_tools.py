@@ -15,7 +15,16 @@ from langchain_core.tools import BaseTool, StructuredTool
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
 from a2pwn.models import Finding, FlowBatchRef
 
-_ORACLES = {"differential", "oob", "marker", "signature", "timing", "two_identity", "llm_rubric"}
+_ORACLES = {
+    "differential",
+    "oob",
+    "marker",
+    "signature",
+    "timing",
+    "two_identity",
+    "state_change",
+    "llm_rubric",
+}
 _SEVERITIES = {"info", "low", "medium", "high", "critical"}
 
 
@@ -48,11 +57,13 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
         values those same calls returned — the finding is rejected later unless those flows
         exist, no exec escaped the sandbox, and its oracle re-derives the result.
         ``oracle_kind`` is how it can be deterministically re-confirmed (differential/oob/
-        marker/timing/two_identity/signature). Thread the oracle's inputs so the verifier can
-        replay it: ``oracle_signals`` (tokens/strings a signature/marker oracle must find),
-        ``correlation_id`` (the OOB token you issued for an oob oracle), and ``oracle_expect``
-        (oracle-specific params, e.g. ``{"threshold_ms": 5000}`` for timing). Group a
-        finding's requests by passing the same ``workspace`` to your burpwn_exec calls.
+        marker/timing/two_identity/state_change/signature). Thread the oracle's inputs so the
+        verifier can replay it: ``oracle_signals`` (tokens/strings a signature/marker oracle must
+        find), ``correlation_id`` (the OOB token you issued for an oob oracle), and
+        ``oracle_expect`` (oracle-specific params — ``{"threshold_ms": 5000}`` for timing;
+        ``{"must_appear": "<token>"}`` or ``{"must_disappear": "<token>"}`` for state_change, where
+        ``flow_ids[0]`` is the before-flow and ``flow_ids[1]`` the after-flow). Group a finding's
+        requests by passing the same ``workspace`` to your burpwn_exec calls.
         """
         flow_ids = list(flow_ids or [])
         tag = tag or vuln_class

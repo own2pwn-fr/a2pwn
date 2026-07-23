@@ -46,7 +46,16 @@ from a2pwn.oracles import VerificationOracle, run_oracle
 _log = logging.getLogger("a2pwn.executor")
 
 # Kept byte-identical to a2pwn.tools.finding_tools so findings clamp the same way.
-_ORACLES = {"differential", "oob", "marker", "signature", "timing", "two_identity", "llm_rubric"}
+_ORACLES = {
+    "differential",
+    "oob",
+    "marker",
+    "signature",
+    "timing",
+    "two_identity",
+    "state_change",
+    "llm_rubric",
+}
 _SEVERITIES = {"info", "low", "medium", "high", "critical"}
 
 # A single MCP text block should not carry an unbounded body (a req_show can be multi-MiB);
@@ -382,7 +391,10 @@ async def run_sdk_agent(
         (
             "run_oracle",
             "Deterministically confirm a candidate finding via the named oracle "
-            "(differential/timing/oob/marker/signature/two_identity/llm_rubric). Returns an OracleResult.",
+            "(differential/timing/oob/marker/signature/two_identity/state_change/llm_rubric). "
+            'For state_change, expect={"must_appear": "<token>"} or '
+            '{"must_disappear": "<token>"}, with flow_a=before-flow and flow_b=after-flow. '
+            "Returns an OracleResult.",
             {
                 "kind": str,
                 "expect": dict,

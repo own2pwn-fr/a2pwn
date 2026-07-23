@@ -524,7 +524,30 @@ def build_subagent_graph(
                 f" real captured evidence:\n{critique.notes}\n{gaps}"
             )
         progress.emit("activity", stage="exploit", text="executing")
-        result = await _invoke_agent(executor, prompt)
+        verify_round = state.get("verify_round", 0)
+        if verify_round == 0:
+            # First attempt: let a crash propagate as before (run_subagent degrades the whole
+            # dispatch to "blocked") — there is no prior-round work to protect yet.
+            result = await _invoke_agent(executor, prompt)
+        else:
+            try:
+                result = await _invoke_agent(executor, prompt)
+            except Exception as exc:  # noqa: BLE001 - a RETRY round crashing (e.g. max-turns with
+                # zero new activity) must NOT propagate: the sub-agent graph has checkpointer=False,
+                # so an uncaught exception here is caught by run_subagent's outer try/except and
+                # degrades the ENTIRE dispatch to "blocked", discarding every already-confirmed
+                # candidate from EARLIER rounds of this SAME dispatch — a real data-loss bug this
+                # once masked (a multi-candidate task where only some candidates confirmed would
+                # retry the still-rejected ones, and a crashed retry silently dropped the
+                # already-proven findings too). Treat as "no new activity this round" instead:
+                # state's candidate_findings (merged below) is untouched, so anything already
+                # confirmed in a prior round survives to distill.
+                _log.warning(
+                    "executor invocation failed on verify round %s, keeping prior candidates: %s",
+                    verify_round,
+                    exc,
+                )
+                result = {}
         messages = list(result.get("messages", []))
         findings = list(result.get("candidate_findings", []))
         batches = list(result.get("flow_batches", []))
@@ -621,6 +644,11 @@ def build_subagent_graph(
             else:
                 rejected.append(c)
                 not_done.append(reason)
+                # Only the TUI saw this via progress.emit — a --plain run had no way to tell WHY a
+                # well-evidenced candidate never made it into the report. Log it at WARNING so the
+                # reject reason (capture alarm, tls-passthru, or the oracle simply not re-deriving)
+                # is visible without needing to reverse-engineer it from source + raw burpwn state.
+                _log.warning("candidate %s REJECTED at adjudication: %s", c.key, reason)
                 progress.emit(
                     "finding",
                     status="rejected",
