@@ -80,6 +80,16 @@ class Finding(BaseModel):
     flow_batch: FlowBatchRef
     enables: list[str] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)
+    # Executor-supplied classification (optional/additive). The numeric CVSS score shown in reports
+    # is NEVER taken from the model — it is re-derived deterministically from cvss_vector at report
+    # build time (a2pwn.cvss.parse_cvss31), the same "compute, don't trust the model's arithmetic"
+    # discipline as the oracle kernel. An unparseable vector is surfaced as-is, never silently hidden.
+    cvss_vector: str | None = None  # e.g. "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+    cwe_ids: list[str] = Field(default_factory=list)  # e.g. ["CWE-306"]
+    # Populated by report.py at build time from the flow actually captured for this finding
+    # (a real burpwn req_show, never invented) — best-effort, absent if the fetch fails.
+    raw_http: str | None = None
+    curl_repro: str | None = None
 
     @staticmethod
     def make_key(vuln_class: str, target: str, param: str | None) -> str:

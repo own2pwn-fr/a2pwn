@@ -112,3 +112,27 @@ async def test_report_finding_threads_oracle_inputs_and_exec_ids(fake_client):
     assert finding.oracle_expect == {"threshold_ms": 5000}
     # exec ids threaded onto the flow batch so the sandbox-escape alarm can attribute them
     assert finding.flow_batch.exec_ids == ["exec-9"]
+
+
+async def test_report_finding_threads_cvss_and_cwe(fake_client):
+    tool = finding_tools(fake_client)[0]
+    msg = await tool.ainvoke(
+        {
+            "args": {
+                "vuln_class": "broken-access-control",
+                "severity": "high",
+                "target": "https://api.example.com/metrics",
+                "evidence": "unauthenticated internal metrics",
+                "flow_ids": [1],
+                "oracle_kind": "differential",
+                "cvss_vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+                "cwe_ids": ["CWE-306", "CWE-200"],
+            },
+            "id": "call-4",
+            "name": "report_finding",
+            "type": "tool_call",
+        }
+    )
+    finding = msg.artifact
+    assert finding.cvss_vector == "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+    assert finding.cwe_ids == ["CWE-306", "CWE-200"]

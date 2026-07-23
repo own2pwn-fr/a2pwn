@@ -48,6 +48,8 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
         correlation_id: str | None = None,
         oracle_expect: dict | None = None,
         enables: list[str] | None = None,
+        cvss_vector: str | None = None,
+        cwe_ids: list[str] | None = None,
     ):
         """Declare ONE proven candidate vulnerability, backed by captured burpwn flows.
 
@@ -63,7 +65,11 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
         ``oracle_expect`` (oracle-specific params — ``{"threshold_ms": 5000}`` for timing;
         ``{"must_appear": "<token>"}`` or ``{"must_disappear": "<token>"}`` for state_change, where
         ``flow_ids[0]`` is the before-flow and ``flow_ids[1]`` the after-flow). Group a finding's
-        requests by passing the same ``workspace`` to your burpwn_exec calls.
+        requests by passing the same ``workspace`` to your burpwn_exec calls. ALWAYS include
+        ``cvss_vector`` (a CVSS 3.1 vector, e.g. ``"AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"`` — the
+        report re-derives the numeric score from this string itself, your own score estimate is
+        ignored) and ``cwe_ids`` (e.g. ``["CWE-306"]``) so the report can cite them; omit only if
+        genuinely no CWE applies.
         """
         flow_ids = list(flow_ids or [])
         tag = tag or vuln_class
@@ -98,6 +104,8 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
             oracle_expect=dict(oracle_expect or {}),
             flow_batch=ref,
             enables=list(enables or []),
+            cvss_vector=cvss_vector,
+            cwe_ids=list(cwe_ids or []),
         )
         summary = (
             f"recorded candidate {finding.key} (severity={finding.severity}, "

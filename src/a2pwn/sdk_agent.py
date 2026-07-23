@@ -271,6 +271,8 @@ async def run_sdk_agent(
         correlation_id = args.get("correlation_id")
         oracle_expect = args.get("oracle_expect")
         enables = args.get("enables")
+        cvss_vector = args.get("cvss_vector")
+        cwe_ids = args.get("cwe_ids")
 
         oracle_kind = oracle_kind if oracle_kind in _ORACLES else "signature"
         severity = severity if severity in _SEVERITIES else "medium"
@@ -303,6 +305,8 @@ async def run_sdk_agent(
             oracle_expect=dict(oracle_expect or {}),
             flow_batch=ref,
             enables=list(enables or []),
+            cvss_vector=cvss_vector,
+            cwe_ids=list(cwe_ids or []),
         )
         findings.append(finding)
         progress.emit(
@@ -431,7 +435,11 @@ async def run_sdk_agent(
             "Declare ONE proven candidate vulnerability, backed by captured burpwn flows. "
             "flow_ids MUST be the captured_request_ids that prove it and exec_ids the exec_id values "
             "those calls returned; oracle_kind is how it can be deterministically re-confirmed. Thread "
-            "oracle_signals/correlation_id/oracle_expect so the verifier can replay the oracle.",
+            "oracle_signals/correlation_id/oracle_expect so the verifier can replay the oracle. "
+            "ALWAYS include cvss_vector (a CVSS 3.1 vector, e.g. "
+            '"AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N" — the report re-derives the numeric score from '
+            'this string itself, your own score estimate is ignored) and cwe_ids (e.g. ["CWE-306"]) '
+            "so the report can cite them; omit only if genuinely no CWE applies.",
             {
                 "vuln_class": str,
                 "severity": str,
@@ -449,6 +457,8 @@ async def run_sdk_agent(
                 "correlation_id": str,
                 "oracle_expect": dict,
                 "enables": list,
+                "cvss_vector": str,
+                "cwe_ids": list,
             },
             _report_finding,
         ),

@@ -243,6 +243,124 @@ async def test_confirmed_not_reproduced_tier_split(fake_client, tmp_path):
     assert "not independently reproduced" in html_doc.lower()
 
 
+def _seed_flow(client, flow_id: int) -> None:
+    client.all_flows.append(
+        {
+            "id": flow_id,
+            "scheme": "https",
+            "request": {
+                "method": "GET",
+                "path": "/metrics",
+                "authority": "coreapi.example.com",
+                "http_version": "HTTP/2",
+                "headers": "user-agent: curl/8.15.0\r\naccept: */*\r\n",
+                "body": "",
+            },
+            "response": {
+                "status": 200,
+                "http_version": "HTTP/2",
+                "headers": "content-type: application/json\r\n",
+                "body": '{"insertions": 1}',
+            },
+        }
+    )
+
+
+async def test_cvss_and_cwe_rendered_in_markdown_and_html(fake_client, tmp_path):
+    _record_har(fake_client)
+    f = _finding("broken-access-control", "https://app.example.com/metrics", None, workspace="bac-poc")
+    f.cvss_vector = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+    f.cwe_ids = ["CWE-306"]
+    state = {"engagement": _engagement(), "findings": [f], "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    md = render_markdown(report)
+    assert "CVSS 3.1:** 9.1 (Critical)" in md
+    assert "CWE-306" in md
+    html_doc = (tmp_path / "report.html").read_text()
+    assert "9.1 (Critical)" in html_doc
+    assert "CWE-306" in html_doc
+    sarif = json.loads((tmp_path / "report.sarif").read_text())
+    props = sarif["runs"][0]["results"][0]["properties"]
+    assert props["cweIds"] == ["CWE-306"]
+    assert props["cvssScore"] == 9.1
+    assert props["security-severity"] == "9.1"
+
+
+async def test_unparseable_cvss_vector_is_surfaced_not_hidden(fake_client, tmp_path):
+    _record_har(fake_client)
+    f = _finding("xss", "https://app.example.com/s", "q", workspace="xss-poc")
+    f.cvss_vector = "not a real vector"
+    state = {"engagement": _engagement(), "findings": [f], "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    md = render_markdown(report)
+    assert "unparseable vector supplied" in md
+    assert "not a real vector" in md
+
+
+async def test_no_cvss_vector_omits_the_line(fake_client, tmp_path):
+    _record_har(fake_client)
+    f = _finding("xss", "https://app.example.com/s", "q", workspace="xss-poc")
+    state = {"engagement": _engagement(), "findings": [f], "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    assert "CVSS 3.1:" not in render_markdown(report)
+
+
+async def test_repro_fetched_and_rendered_from_a_real_captured_flow(fake_client, tmp_path):
+    _record_har(fake_client)
+    _seed_flow(fake_client, 1)
+    f = _finding("broken-access-control", "https://coreapi.example.com/metrics", None, workspace="bac-poc")
+    state = {"engagement": _engagement(), "findings": [f], "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    assert 1 in [c["id"] for c in fake_client.req_show_calls]
+    md = render_markdown(report)
+    assert "Reproduction — raw HTTP" in md
+    assert "GET /metrics HTTP/2" in md
+    assert "Host: coreapi.example.com" in md
+    assert "Reproduction — curl" in md
+    assert "curl -s -i" in md
+    assert "https://coreapi.example.com/metrics" in md
+    assert '"insertions": 1' in md  # the real captured response body, not invented text
+
+
+async def test_repro_absent_when_flow_cannot_be_fetched(fake_client, tmp_path):
+    # No matching flow seeded: the fake client's req_show degrades to a bare {"id": ...} payload
+    # (no "request" key) — must render with NO reproduction block, never a garbage placeholder.
+    _record_har(fake_client)
+    f = _finding("xss", "https://app.example.com/s", "q", workspace="xss-poc")
+    state = {"engagement": _engagement(), "findings": [f], "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    md = render_markdown(report)
+    assert "Reproduction —" not in md
+    assert report.findings[0].raw_http is None
+    assert report.findings[0].curl_repro is None
+
+
+async def test_repro_fetch_exception_does_not_lose_the_finding(fake_client, tmp_path):
+    _record_har(fake_client)
+
+    async def _boom(flow_id, raw=False):
+        raise RuntimeError("session gone")
+
+    fake_client.req_show = _boom  # type: ignore[method-assign]
+    f = _finding("xss", "https://app.example.com/s", "q", workspace="xss-poc")
+    state = {"engagement": _engagement(), "findings": [f], "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    assert {f.vuln_class for f in report.findings} == {"xss"}  # not dropped
+    assert report.findings[0].raw_http is None
+
+
 async def test_format_selection_gates_sarif_and_html(fake_client, tmp_path):
     _record_har(fake_client)
     findings = [_finding("xss", "https://app.example.com/s", "q", workspace="xss-poc")]

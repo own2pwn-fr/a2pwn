@@ -14,17 +14,93 @@ import json
 import logging
 import os
 import re
+import shlex
 
 from pydantic import BaseModel, Field
 
 from a2pwn.burpwn import BurpwnClient
+from a2pwn.cvss import parse_cvss31
 from a2pwn.models import Finding
 
 _log = logging.getLogger("a2pwn")
 
+# Request headers curl derives itself from the URL/body — repeating them would just produce a
+# broken/duplicate request when the repro command is actually run.
+_CURL_SKIP_HEADERS = {"host", ":authority", "content-length"}
+
 
 def _safe_name(token: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", token) or "ws"
+
+
+def _header_lines(raw_headers: str) -> list[str]:
+    return [ln for ln in (raw_headers or "").split("\r\n") if ln.strip()]
+
+
+def _raw_http_block(flow: dict) -> str:
+    """Verbatim request+response block from a real ``req_show`` payload — never invented text."""
+    req = flow.get("request") or {}
+    resp = flow.get("response") or {}
+    version = req.get("http_version") or "HTTP/1.1"
+    lines = [f"{req.get('method', 'GET')} {req.get('path', '/')} {version}"]
+    if req.get("authority"):
+        lines.append(f"Host: {req['authority']}")
+    lines += _header_lines(req.get("headers", ""))
+    lines.append("")
+    if req.get("body"):
+        lines.append(req["body"])
+        lines.append("")
+    lines.append(f"{resp.get('http_version') or version} {resp.get('status', '')}".rstrip())
+    lines += _header_lines(resp.get("headers", ""))
+    lines.append("")
+    if resp.get("body"):
+        lines.append(resp["body"])
+    return "\n".join(lines)
+
+
+def _curl_repro(flow: dict) -> str:
+    """A copy-pasteable curl reproduction, reconstructed from the actual captured request."""
+    req = flow.get("request") or {}
+    method = req.get("method", "GET")
+    url = f"{flow.get('scheme', 'https')}://{req.get('authority', '')}{req.get('path', '/')}"
+    parts = ["curl", "-s", "-i"]
+    if method != "GET":
+        parts += ["-X", method]
+    for line in _header_lines(req.get("headers", "")):
+        key = line.split(":", 1)[0].strip().lower()
+        if key in _CURL_SKIP_HEADERS:
+            continue
+        parts += ["-H", shlex.quote(line)]
+    if req.get("body"):
+        parts += ["--data-raw", shlex.quote(req["body"])]
+    parts.append(shlex.quote(url))
+    return " ".join(parts)
+
+
+async def _fetch_repros(client: BurpwnClient, findings: list[Finding]) -> dict[str, dict]:
+    """Best-effort raw request/response fetch for each finding's key flow, keyed by finding key.
+
+    A fetch failure (session gone, flow expired) must never lose the finding itself — it just
+    renders without a reproduction block, exactly like a failed HAR export.
+    """
+    repros: dict[str, dict] = {}
+    for f in findings:
+        flow_id = f.flow_batch.key_flow
+        if flow_id is None and f.flow_batch.flow_ids:
+            flow_id = f.flow_batch.flow_ids[0]
+        if flow_id is None:
+            continue
+        try:
+            repros[f.key] = await client.req_show(flow_id, raw=True)
+        except Exception as exc:  # noqa: BLE001 - best-effort; never lose the finding over this
+            _log.debug("repro fetch failed for %s (flow %s): %s", f.key, flow_id, exc)
+    return repros
+
+
+def _with_repro(f: Finding, flow: dict | None) -> Finding:
+    if not flow or not flow.get("request"):
+        return f
+    return f.model_copy(update={"raw_http": _raw_http_block(flow), "curl_repro": _curl_repro(flow)})
 
 
 _SEVERITY_ORDER: dict[str, int] = {
@@ -170,6 +246,13 @@ async def build_report(
     all_findings = list(state.get("findings", []))
     findings = _promote(all_findings)
     confirmed_only = _confirmed_only(all_findings)
+
+    # Best-effort raw request/response + curl reproduction, fetched from the actually-captured
+    # flow (never invented). A failed fetch degrades to no repro block, never drops the finding.
+    repros = await _fetch_repros(client, [*findings, *confirmed_only])
+    findings = [_with_repro(f, repros.get(f.key)) for f in findings]
+    confirmed_only = [_with_repro(f, repros.get(f.key)) for f in confirmed_only]
+
     # HAR evidence export stays scoped to the strict verified tier (the confirmed-only tier is
     # surfaced in the report body, but its per-workspace HAR is not force-exported).
     workspaces = _distinct_workspaces(findings)
@@ -241,6 +324,15 @@ def _write_reports(report: Report, out_dir: str, formats: list[str] | set[str] |
     return paths
 
 
+def _cvss_line(f: Finding) -> str | None:
+    if not f.cvss_vector:
+        return None
+    score = parse_cvss31(f.cvss_vector)
+    if score is None:
+        return f"- **CVSS 3.1:** unparseable vector supplied — `{f.cvss_vector}` (not scored)"
+    return f"- **CVSS 3.1:** {score.base_score} ({score.severity}) — `{score.vector}`"
+
+
 def _finding_section(f: Finding, status_label: str = "independently verified") -> list[str]:
     fb = f.flow_batch
     title = f"{f.vuln_class}" + (f" ({f.sub_variant})" if f.sub_variant else "")
@@ -253,6 +345,11 @@ def _finding_section(f: Finding, status_label: str = "independently verified") -
         f"- **Oracle:** {f.oracle_kind}",
         f"- **Status:** {status_label}",
     ]
+    cvss_line = _cvss_line(f)
+    if cvss_line:
+        lines.append(cvss_line)
+    if f.cwe_ids:
+        lines.append("- **CWE:** " + ", ".join(f.cwe_ids))
     if f.enables:
         lines.append("- **Enables:** " + ", ".join(f"`{k}`" for k in f.enables))
     lines += [
@@ -263,6 +360,19 @@ def _finding_section(f: Finding, status_label: str = "independently verified") -
         f.evidence,
         "```",
         "",
+    ]
+    if f.raw_http:
+        lines += [
+            "**Reproduction — raw HTTP (from the actually captured flow):**",
+            "",
+            "```",
+            f.raw_http,
+            "```",
+            "",
+        ]
+    if f.curl_repro:
+        lines += ["**Reproduction — curl:**", "", "```bash", f.curl_repro, "```", ""]
+    lines += [
         "**Flow batch (captured proof):**",
         "",
         f"- Workspace: `{fb.workspace}`"
@@ -371,6 +481,25 @@ _SARIF_LEVEL: dict[str, str] = {
 
 
 def _sarif_result(f: Finding, tier: str) -> dict:
+    props: dict = {
+        "proofTier": tier,
+        "severity": f.severity,
+        "param": f.param or "*",
+        "key": f.key,
+        "oracle": f.oracle_kind,
+        "subVariant": f.sub_variant or "",
+        "enables": list(f.enables),
+    }
+    if f.cwe_ids:
+        props["cweIds"] = list(f.cwe_ids)
+    if f.cvss_vector:
+        score = parse_cvss31(f.cvss_vector)
+        props["cvssVector"] = f.cvss_vector
+        if score is not None:
+            props["cvssScore"] = score.base_score
+            props["cvssSeverity"] = score.severity
+            # GitHub code-scanning convention: a string numeric score under this exact key.
+            props["security-severity"] = str(score.base_score)
     return {
         "ruleId": f.vuln_class,
         "level": _SARIF_LEVEL.get(f.severity, "note"),
@@ -378,15 +507,7 @@ def _sarif_result(f: Finding, tier: str) -> dict:
         "locations": [
             {"physicalLocation": {"artifactLocation": {"uri": f.target}}},
         ],
-        "properties": {
-            "proofTier": tier,
-            "severity": f.severity,
-            "param": f.param or "*",
-            "key": f.key,
-            "oracle": f.oracle_kind,
-            "subVariant": f.sub_variant or "",
-            "enables": list(f.enables),
-        },
+        "properties": props,
     }
 
 
@@ -453,6 +574,16 @@ def _chip(sev: str) -> str:
     return f'<span class="chip" style="background:{color}">{html.escape(sev)}</span>'
 
 
+def _html_cvss_cwe(f: Finding) -> str:
+    bits: list[str] = []
+    if f.cvss_vector:
+        score = parse_cvss31(f.cvss_vector)
+        bits.append(html.escape(f"{score.base_score} ({score.severity})") if score else "unparseable")
+    if f.cwe_ids:
+        bits.append(html.escape(", ".join(f.cwe_ids)))
+    return "<br>".join(bits) if bits else "—"
+
+
 def _html_rows(findings: list[Finding]) -> str:
     rows: list[str] = []
     for f in findings:
@@ -464,11 +595,12 @@ def _html_rows(findings: list[Finding]) -> str:
             f"<td><code>{html.escape(f.target)}</code></td>"
             f"<td>{html.escape(f.param or '*')}</td>"
             f"<td>{html.escape(f.oracle_kind)}</td>"
+            f"<td>{_html_cvss_cwe(f)}</td>"
             f'<td class="ev">{html.escape(f.evidence)}</td>'
             "</tr>"
         )
     if not rows:
-        return '<tr><td colspan="6" class="note">None.</td></tr>'
+        return '<tr><td colspan="7" class="note">None.</td></tr>'
     return "".join(rows)
 
 
@@ -495,7 +627,7 @@ def render_html(r: Report) -> str:
         meta_bits.append(f"<b>Duration</b> {r.duration_secs:.1f}s")
     head = (
         "<tr><th>Severity</th><th>Vuln class</th><th>Target</th>"
-        "<th>Param</th><th>Oracle</th><th>Evidence</th></tr>"
+        "<th>Param</th><th>Oracle</th><th>CVSS / CWE</th><th>Evidence</th></tr>"
     )
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'

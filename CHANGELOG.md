@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **CVSS 3.1 + CWE on every finding, deterministic repro in every report format.** Writing a
+  client-facing report by hand after a real engagement required manually computing CVSS scores and
+  querying burpwn flow-by-flow for curl/raw-HTTP reproductions — the generated report had neither.
+  `report_finding` now accepts `cvss_vector`/`cwe_ids` (both tool paths; the executor is instructed
+  to always include them); a new `a2pwn.cvss.parse_cvss31` re-derives the numeric base score
+  straight from the FIRST.org formula so the report never trusts the model's own arithmetic (same
+  discipline as the oracle kernel) — an unparseable vector is surfaced as-is, never hidden. At
+  report-build time, each finding's key flow is fetched from burpwn and rendered as a verbatim raw
+  HTTP request/response block plus a reconstructed `curl` reproduction (both best-effort: a fetch
+  failure degrades to no repro block, never drops the finding). Rendered in md/html (new CVSS/CWE
+  column + repro sections) and sarif (`cvssScore`/`cweIds`/the GitHub-convention
+  `security-severity` property).
+
 ### Fixed (lessons from a live full-scope engagement)
 
 - **`--name` defaulted to the literal `"a2pwn"`.** Every unnamed run silently shared a checkpoint
