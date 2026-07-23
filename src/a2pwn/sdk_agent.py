@@ -64,6 +64,17 @@ _MAX_TEXT = 200_000
 # Head length for the human-readable transcript lines.
 _HEAD = 240
 
+# Anthropic's own Claude Code CLI boilerplate for a safety-flagged message (observed live: a
+# dispatch that had already made real tool calls hit this mid-turn on a specific request). The SDK
+# then surfaces the eventual ResultMessage/exception under the same generic "executor loop error"
+# label as a genuine crash (its own text is misleadingly "returned an error result: success"), so a
+# --plain run can't tell a model refusal from a technical failure without this heuristic.
+_REFUSAL_MARKERS = ("safety measures", "flagged this message", "Cyber Verification Program")
+
+
+def _is_model_refusal_text(text: str) -> bool:
+    return any(m in text for m in _REFUSAL_MARKERS)
+
 
 @dataclass
 class SdkExecOutcome:
@@ -132,7 +143,7 @@ async def run_sdk_agent(
     client: BurpwnClient,
     collab,
     skills: list,
-    max_turns: int = 40,
+    max_turns: int = 60,
     active_exploit_blocked: list[str] | None = None,
     options_extra: dict | None = None,
 ) -> SdkExecOutcome:
@@ -351,7 +362,12 @@ async def run_sdk_agent(
         ),
         (
             "burpwn_fuzz",
-            "Intruder: fuzz payload positions in a flow; results ranked by status/len/time anomaly.",
+            "Intruder: fuzz payload positions in a flow; results ranked by status/len/time anomaly. "
+            'positions is a list of "start:end" BYTE OFFSET strings into the flow\'s raw request '
+            "(NOT a field name or marker string) — call burpwn_req_show with raw=true first to get "
+            "the verbatim request bytes and compute the offset of your injection point, e.g. "
+            '["142:145"] to fuzz a 3-byte span starting at byte 142. mode is one of '
+            "sniper/battering-ram/pitchfork/cluster-bomb.",
             {
                 "flow": int,
                 "positions": list,
@@ -372,7 +388,9 @@ async def run_sdk_agent(
         ),
         (
             "burpwn_compare",
-            "Structured status/header/body diff + reflection check between two flows.",
+            "Structured status/header/body diff + reflection check between two flows. what MUST be "
+            'exactly one of "headers", "body" or "all" (a single value, never a comma list) — '
+            'defaults to "all" if omitted.',
             {"flow_a": int, "flow_b": int, "what": str},
             _burpwn_compare,
         ),
@@ -497,7 +515,14 @@ async def run_sdk_agent(
                         if block.text and block.text.strip():
                             summary = block.text
                             transcript.append(f"say {_head(block.text)}")
-                            _log.info("[%s] say %s", progress.current_dispatch(), _head(block.text, 200))
+                            if _is_model_refusal_text(block.text):
+                                _log.warning(
+                                    "[%s] MODEL REFUSAL (not a bug — the model itself declined): %s",
+                                    progress.current_dispatch(),
+                                    _head(block.text, 200),
+                                )
+                            else:
+                                _log.info("[%s] say %s", progress.current_dispatch(), _head(block.text, 200))
                             progress.emit("thought", text=_head(block.text, 140))
             elif isinstance(msg, ResultMessage):
                 if getattr(msg, "result", None):

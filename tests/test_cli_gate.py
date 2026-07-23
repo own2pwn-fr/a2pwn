@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -85,6 +87,50 @@ def test_step_through_flag_threads_into_config(monkeypatch, tmp_path):
     )
     assert res.exit_code == 0, res.output
     assert sink["cfg"].step_through is True
+
+
+def test_unnamed_run_gets_a_timestamped_name_not_the_old_shared_default(monkeypatch, tmp_path):
+    """Regression: `--name` used to default to the literal "a2pwn", so every unnamed run silently
+    resumed/mixed checkpoint state with any other unnamed run — observed live as stray
+    "Deserializing unregistered type" warnings and reused burpwn session state at bootstrap."""
+    sink: dict = {}
+    _stub_run(monkeypatch, sink)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    res = runner.invoke(cli.app, ["run", "-t", "https://app.example.com", "-o", "audit", "--yes"])
+    assert res.exit_code == 0, res.output
+    assert sink["thread_id"] != "a2pwn"
+    assert re.fullmatch(r"a2pwn-\d{8}-\d{6}", sink["thread_id"])
+
+
+def test_unnamed_runs_get_distinct_names(monkeypatch, tmp_path):
+    sink: dict = {}
+    _stub_run(monkeypatch, sink)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    seq = iter([datetime(2026, 1, 1, 0, 0, 0), datetime(2026, 1, 1, 0, 0, 1)])
+
+    class _FakeDatetime:
+        @staticmethod
+        def now():
+            return next(seq)
+
+    monkeypatch.setattr(cli, "datetime", _FakeDatetime)
+    args = ["run", "-t", "https://app.example.com", "-o", "audit", "--yes"]
+    runner.invoke(cli.app, args)
+    first = sink["thread_id"]
+    runner.invoke(cli.app, args)
+    second = sink["thread_id"]
+    assert first != second
+
+
+def test_explicit_name_still_overrides_default(monkeypatch, tmp_path):
+    sink: dict = {}
+    _stub_run(monkeypatch, sink)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    res = runner.invoke(
+        cli.app, ["run", "-t", "https://app.example.com", "-o", "audit", "--yes", "--name", "acme"]
+    )
+    assert res.exit_code == 0, res.output
+    assert sink["thread_id"] == "acme"
 
 
 def test_burpwn_missing_aborts_before_run(monkeypatch):

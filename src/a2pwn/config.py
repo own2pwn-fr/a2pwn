@@ -83,8 +83,10 @@ class A2pwnConfig(BaseModel):
     max_dispatches: int = 200  # global budget ceiling
     # Turn budget for ONE executor sub-agent. It must fit exhausting *every* vuln class co-located on
     # a surface (a param vulnerable to XSS *and* SQLi *and* SSRF), not just proving the first one, so
-    # the "report the moment you have proof, then stop" discipline never truncates coverage.
-    executor_max_turns: int = 40
+    # the "report the moment you have proof, then stop" discipline never truncates coverage. 40 was
+    # observed exhausting repeatedly (16 times in one real multi-API engagement) on ordinary
+    # recon->exploit->verify-retry sequences against a handful of REST endpoints — raised to 60.
+    executor_max_turns: int = 60
     # When the master would naturally STOP (no work left, "done"), a continuation judge decides
     # whether the engagement is genuinely complete or should push further. This caps how many times
     # the judge may override "done" and re-open the engagement, so it cannot loop forever.

@@ -75,6 +75,24 @@ def test_json_result_head_roundtrips():
     assert json.loads(_text_of(payload)) == {"a": [1, 2, 3]}
 
 
+def test_is_model_refusal_text_matches_observed_claude_code_boilerplate():
+    """Regression: a live engagement hit a genuine Claude Code safety refusal mid-dispatch (after
+    real tool calls had already run), but the SDK surfaces the eventual failure under the same
+    generic "executor loop error" label as a technical crash — with a misleading exception message
+    ("returned an error result: success"). Without this heuristic a --plain run can't tell a model
+    refusal from a bug."""
+    refusal = (
+        "API Error: Sonnet 5 has safety measures that flagged this message for a cybersecurity "
+        "topic. To learn about the Cyber Verification Program and apply for access, visit our "
+        "help center."
+    )
+    assert sdk_agent._is_model_refusal_text(refusal) is True
+
+
+def test_is_model_refusal_text_false_for_normal_narration():
+    assert sdk_agent._is_model_refusal_text("Found a reflected XSS in the search parameter.") is False
+
+
 def test_oracles_allowlist_includes_state_change():
     """Regression: state_change (the business-logic/CSRF oracle, shipped and documented in
     EXECUTOR_SYS) was missing from this allow-list, so report_finding silently rewrote every

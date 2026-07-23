@@ -81,7 +81,7 @@ class _SdkExecutor:
     transcript as prompt injection (the failure mode of the prompted-JSON path over the subscription).
     """
 
-    def __init__(self, cfg: RoleModels, client, collab, skills, active_exploit_tools, max_turns=30):
+    def __init__(self, cfg: RoleModels, client, collab, skills, active_exploit_tools, max_turns=60):
         self._model = cfg.executor.model or "sonnet"
         self._prompt = _executor_prompt(active_exploit_tools)
         self._client = client
@@ -126,7 +126,7 @@ def build_executor(
     client: Any = None,
     collab: Any = None,
     skills: list | None = None,
-    max_turns: int = 40,
+    max_turns: int = 60,
 ) -> Any:
     """Build the executor. On the ``claude-code`` subscription backend, use the native SDK
     tool-calling loop (:class:`_SdkExecutor`) — prompted-JSON tool-calling makes that model distrust

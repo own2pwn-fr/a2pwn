@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed (lessons from a live full-scope engagement)
+
+- **`--name` defaulted to the literal `"a2pwn"`.** Every unnamed run silently shared a checkpoint
+  and burpwn session with any other unnamed run — observed live as stray "Deserializing
+  unregistered type" warnings and reused session state at bootstrap. Unnamed runs now get a
+  timestamped, unique name (`a2pwn-YYYYMMDD-HHMMSS`); pass `--name` explicitly when you intend to
+  `a2pwn resume` a specific run.
+- **`burpwn_fuzz`/`burpwn_compare` had the same undocumented-contract bug as `oracle_expect`.**
+  `positions` needs `"start:end"` BYTE OFFSETS into the raw request, and `what` must be exactly one
+  of `headers`/`body`/`all` — neither constraint was stated anywhere the model could see it, so it
+  routinely guessed field names or comma-lists instead (16 of 23 tool failures on one real
+  engagement were this class of error, mostly `burpwn_fuzz`). Both tool descriptions (SDK and
+  LangChain paths) now spell out the exact expected format.
+- **A genuine model safety refusal was indistinguishable from a technical crash in the logs.** The
+  `claude-agent-sdk` surfaces both under the same generic exception (with a misleading label —
+  `"returned an error result: success"` for an actual refusal, observed live). The executor now
+  detects Claude Code's own refusal boilerplate and logs it as a distinct `MODEL REFUSAL` warning
+  instead of a generic error.
+- **`executor_max_turns` default (40) was routinely exhausted** — 16 times in one real multi-API
+  engagement, on ordinary recon→exploit→verify-retry sequences against a handful of REST endpoints.
+  Raised to 60 (all fallback defaults in `agents.py`/`sdk_agent.py` aligned for consistency; the
+  live path already threads `cfg.executor_max_turns` through explicitly).
+
 ### Fixed (real findings silently dropped from the report)
 
 Found on a live full-scope engagement: the LLM transcripts showed 4+ well-evidenced HIGH-severity

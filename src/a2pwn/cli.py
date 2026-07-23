@@ -183,7 +183,13 @@ def _emit_report(report, cfg: A2pwnConfig, thread_id: str) -> None:
 def run(
     target: list[str] = typer.Option(..., "--target", "-t", help="In-scope target URL/host (repeatable)."),
     objective: str = typer.Option(..., "--objective", "-o", help="Engagement objective for the planner."),
-    name: str = typer.Option("a2pwn", "--name", help="Engagement + burpwn session name (thread id)."),
+    name: str | None = typer.Option(
+        None,
+        "--name",
+        help="Engagement + burpwn session name (thread id). Defaults to a timestamped, unique "
+        "name so unrelated runs never silently share a checkpoint/session — pass one explicitly "
+        "only when you intend to `a2pwn resume` this exact run later.",
+    ),
     active_exploit: bool = typer.Option(
         False, "--active-exploit", help="Allow active exploitation without a per-dispatch pause."
     ),
@@ -224,6 +230,12 @@ def run(
     plain: bool = typer.Option(False, "--plain", help="Disable the live TUI; log telemetry instead."),
 ) -> None:
     """Run an autonomous, adversarially-verified engagement against the given targets."""
+    if name is None:
+        # A hardcoded default ("a2pwn") meant every unnamed run silently resumed/mixed state with
+        # whatever prior unnamed run's checkpoint existed — observed live as stray "Deserializing
+        # unregistered type" warnings and reused burpwn session state at bootstrap. A per-invocation
+        # timestamp keeps runs isolated by default; `--name` still opts into a stable id for `resume`.
+        name = f"a2pwn-{datetime.now():%Y%m%d-%H%M%S}"
     use_tui = _use_tui(plain=plain, verbose=verbose, step_through=step_through)
     _init_logging(verbose=verbose, use_tui=use_tui)
     formats = _parse_formats(format)

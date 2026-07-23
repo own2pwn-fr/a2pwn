@@ -100,9 +100,7 @@ def burpwn_tools(client: BurpwnClient, engagement: Any = None) -> list[BaseTool]
         bad = _off_scope(override_hosts)
         if bad:
             return _refuse(bad, "burpwn_req_replay Host override")
-        return await client.req_replay(
-            id, set_headers=set_headers or [], set_body=set_body, method=method
-        )
+        return await client.req_replay(id, set_headers=set_headers or [], set_body=set_body, method=method)
 
     async def burpwn_fuzz(
         flow: int,
@@ -115,6 +113,12 @@ def burpwn_tools(client: BurpwnClient, engagement: Any = None) -> list[BaseTool]
         name: str | None = None,
     ) -> dict:
         """Intruder: fuzz payload positions in a flow; results ranked by status/len/time anomaly.
+
+        ``positions`` is a list of ``"start:end"`` BYTE OFFSET strings into the flow's raw request
+        (NOT a field name or marker string) — call ``burpwn_req_show`` with ``raw=True`` first to
+        get the verbatim request bytes and compute the offset of your injection point, e.g.
+        ``["142:145"]`` to fuzz a 3-byte span starting at byte 142. ``mode`` is one of
+        sniper/battering-ram/pitchfork/cluster-bomb.
 
         Payloads that are absolute URLs to an out-of-scope host (e.g. an SSRF payload aimed
         at ``169.254.169.254``) are refused before the attack runs.
@@ -138,14 +142,16 @@ def burpwn_tools(client: BurpwnClient, engagement: Any = None) -> list[BaseTool]
             name=name,
         )
 
-    async def burpwn_fuzz_results(
-        attack_id: int, sort: str = "anomaly", limit: int | None = None
-    ) -> dict:
+    async def burpwn_fuzz_results(attack_id: int, sort: str = "anomaly", limit: int | None = None) -> dict:
         """Fetch Intruder results for an attack, anomaly-ranked (the blind oracle)."""
         return await client.fuzz_results(attack_id, sort=sort, limit=limit)
 
     async def burpwn_compare(flow_a: int, flow_b: int, what: str = "all") -> dict:
-        """Structured status/header/body diff + reflection check between two flows."""
+        """Structured status/header/body diff + reflection check between two flows.
+
+        ``what`` MUST be exactly one of ``"headers"``, ``"body"`` or ``"all"`` (a single value,
+        never a comma list) — defaults to ``"all"`` if omitted.
+        """
         return await client.compare(flow_a, flow_b, what=what)
 
     async def burpwn_tag_add(flow_id: int, name: str, color: str | None = None) -> dict:
