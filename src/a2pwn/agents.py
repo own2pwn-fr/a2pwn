@@ -81,7 +81,9 @@ class _SdkExecutor:
     transcript as prompt injection (the failure mode of the prompted-JSON path over the subscription).
     """
 
-    def __init__(self, cfg: RoleModels, client, collab, skills, active_exploit_tools, max_turns=60):
+    def __init__(
+        self, cfg: RoleModels, client, collab, skills, active_exploit_tools, max_turns=60, engagement=None
+    ):
         self._model = cfg.executor.model or "sonnet"
         self._prompt = _executor_prompt(active_exploit_tools)
         self._client = client
@@ -89,6 +91,7 @@ class _SdkExecutor:
         self._skills = skills or []
         self._blocked = list(active_exploit_tools or [])
         self._max_turns = max_turns
+        self._engagement = engagement
 
     async def ainvoke(self, state: dict, config: Any = None) -> dict:
         from langchain_core.messages import AIMessage
@@ -109,11 +112,13 @@ class _SdkExecutor:
             skills=self._skills,
             max_turns=self._max_turns,
             active_exploit_blocked=self._blocked,
+            engagement=self._engagement,
         )
         return {
             "messages": [AIMessage(content=outcome.summary or "executed task")],
             "candidate_findings": list(outcome.candidate_findings),
             "flow_batches": list(outcome.flow_batches),
+            "discovered_hosts": list(outcome.discovered_hosts),
         }
 
 
@@ -127,6 +132,7 @@ def build_executor(
     collab: Any = None,
     skills: list | None = None,
     max_turns: int = 60,
+    engagement: Any = None,
 ) -> Any:
     """Build the executor. On the ``claude-code`` subscription backend, use the native SDK
     tool-calling loop (:class:`_SdkExecutor`) — prompted-JSON tool-calling makes that model distrust
@@ -135,9 +141,13 @@ def build_executor(
 
     Active-exploitation gating is deterministic in the tool wrappers (a checkpointerless child cannot
     ``interrupt_before``); we also disclose the blocked tools in the prompt so no turns are wasted.
+    ``engagement`` scopes the native path's ``propose_targets`` tool (see :func:`run_sdk_agent`); the
+    LangChain path's tools are already scoped via ``tools`` (built by the caller with ``engagement``).
     """
     if cfg.executor.provider == "claude-code" and client is not None:
-        return _SdkExecutor(cfg, client, collab, skills, active_exploit_tools, max_turns=max_turns)
+        return _SdkExecutor(
+            cfg, client, collab, skills, active_exploit_tools, max_turns=max_turns, engagement=engagement
+        )
     model = make_model(cfg.executor)
     return create_react_agent(
         model,

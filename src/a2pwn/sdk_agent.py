@@ -24,6 +24,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -38,8 +39,9 @@ from claude_agent_sdk import (
 
 from a2pwn import progress
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
-from a2pwn.models import Finding, FlowBatchRef
+from a2pwn.models import Finding, FlowBatchRef, TaskSpec
 from a2pwn.oracles import VerificationOracle, run_oracle
+from a2pwn.scope import host_of, in_scope
 
 # Child of the "a2pwn" logger so the TUI's WARNING-silencing still applies, but `--plain` (INFO) and
 # `-v` (DEBUG) surface the sub-agent's otherwise-invisible tool calls, results and refusals.
@@ -82,6 +84,7 @@ class SdkExecOutcome:
 
     candidate_findings: list[Finding] = field(default_factory=list)
     flow_batches: list[FlowBatchRef] = field(default_factory=list)
+    discovered_hosts: list[TaskSpec] = field(default_factory=list)
     summary: str = ""
     tool_calls: int = 0
     transcript: list[str] = field(default_factory=list)
@@ -146,19 +149,29 @@ async def run_sdk_agent(
     max_turns: int = 60,
     active_exploit_blocked: list[str] | None = None,
     options_extra: dict | None = None,
+    engagement: Any = None,
 ) -> SdkExecOutcome:
     """Run the pentest executor/verifier as a native claude-agent-sdk agent loop.
 
     Exposes the burpwn hot loop, the deterministic ``run_oracle`` kernel, a ``report_finding``
-    emitter (identical construction to the LangChain path), and one on-demand info tool per
-    catalog skill, all as in-process SDK MCP tools. The SDK drives the full loop: the model
-    calls the tools, we execute them here, results are fed back until the task is done.
+    emitter (identical construction to the LangChain path), a ``propose_targets`` recon-follow-up
+    emitter, and one on-demand info tool per catalog skill, all as in-process SDK MCP tools. The SDK
+    drives the full loop: the model calls the tools, we execute them here, results are fed back
+    until the task is done.
 
     ``active_exploit_blocked`` lists tool names (e.g. ``"burpwn_exec"``, ``"burpwn_fuzz"``) that
     must hard-refuse — their bodies return an error result without touching the target.
+    ``engagement`` (optional) scopes ``propose_targets``: a proposed host outside its
+    targets/in_scope allow-list is dropped defensively — the same host would be refused at the
+    traffic layer anyway the moment a follow-up dispatch touched it, so this just keeps a
+    hallucinated/off-scope host out of the planner's queue in the first place.
     """
     blocked = set(active_exploit_blocked or [])
     findings: list[Finding] = []
+    discovered: list[TaskSpec] = []
+    eng_targets = list(getattr(engagement, "targets", None) or [])
+    eng_allow = list(getattr(engagement, "in_scope", None) or [])
+    eng_enforce = bool(engagement is not None and (eng_targets or eng_allow))
     fbm = FlowBatchManager(client)
 
     # ---- burpwn hot-loop tools (thin async wrappers over the bound client) -------------
@@ -323,6 +336,27 @@ async def run_sdk_agent(
         )
         return _text_result(summary)
 
+    # ---- recon-follow-up emitter (mirrors a2pwn.tools.recon_tools EXACTLY) --------------
+    async def _propose_targets(args: dict) -> dict:
+        proposed = 0
+        for entry in args.get("hosts") or []:
+            raw = str(entry.get("host") or "").strip()
+            if not raw:
+                continue
+            host = host_of(raw) or raw
+            if eng_enforce and not in_scope(host, eng_targets, eng_allow):
+                continue
+            note = str(entry.get("note") or "").strip()
+            url = raw if "://" in raw else f"https://{host}"
+            task_text = f"Recon and (if warranted) exploit {host}."
+            if note:
+                task_text += f" Context from discovery: {note}"
+            discovered.append(TaskSpec(task=task_text, target=url, hints=[note] if note else []))
+            proposed += 1
+        return _text_result(
+            f"proposed {proposed} follow-up target(s)" if proposed else "no new targets proposed"
+        )
+
     # ---- static tool specs: (name, description, input_schema, handler) ------------------
     specs: list[tuple[str, str, dict, object]] = [
         (
@@ -462,6 +496,15 @@ async def run_sdk_agent(
             },
             _report_finding,
         ),
+        (
+            "propose_targets",
+            "Propose concrete follow-up tasks for hosts discovered during recon (e.g. via subfinder "
+            "+ httpx). Call this once per genuinely live, distinct host worth testing — skip "
+            "parked/dead/CDN-only/duplicate entries. hosts is a list of "
+            '{"host": "<hostname or URL>", "note": "<why this host matters, e.g. status/tech seen>"}.',
+            {"hosts": list},
+            _propose_targets,
+        ),
     ]
 
     sdk_tools = []
@@ -556,6 +599,7 @@ async def run_sdk_agent(
     return SdkExecOutcome(
         candidate_findings=findings,
         flow_batches=[f.flow_batch for f in findings],
+        discovered_hosts=discovered,
         summary=summary,
         tool_calls=tool_calls,
         transcript=transcript,

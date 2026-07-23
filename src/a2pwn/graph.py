@@ -51,6 +51,7 @@ from a2pwn.models import (
     VerifierReport,
 )
 from a2pwn.oracles import VerificationOracle, run_oracle
+from a2pwn.scope import host_of, is_apex_host
 
 # The compiled child subgraph, threaded in by ``build_master_graph``. ``run_subagent``
 # references it here so the master graph never wires it as a node (clean-history guard).
@@ -134,6 +135,9 @@ class SubAgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     candidate_findings: list[Finding]
     flow_batches: list[FlowBatchRef]
+    # Recon-proposed follow-up targets (via the propose_targets tool) — mirrors candidate_findings'
+    # merge-by-key accumulation, but keyed by target since a TaskSpec has no natural finding-style key.
+    discovered_hosts: list[TaskSpec]
     critique: VerifierReport | None
     verify_round: int
     clarify_round: int
@@ -284,6 +288,7 @@ async def run_subagent(payload: SubAgentInput) -> dict:
                 "messages": [],
                 "candidate_findings": [],
                 "flow_batches": [],
+                "discovered_hosts": [],
                 "critique": None,
                 "verify_round": 0,
                 "clarify_round": 0,
@@ -390,10 +395,16 @@ def verify_gate(state: dict) -> Literal["execute", "distill"]:
     return "distill"
 
 
-def _harvest(messages: list[BaseMessage]) -> tuple[list[Finding], list[FlowBatchRef]]:
-    """Pull ``Finding`` / ``FlowBatchRef`` artifacts out of a ReAct transcript."""
+def _harvest(messages: list[BaseMessage]) -> tuple[list[Finding], list[FlowBatchRef], list[TaskSpec]]:
+    """Pull ``Finding`` / ``FlowBatchRef`` / ``TaskSpec`` artifacts out of a ReAct transcript.
+
+    ``TaskSpec`` artifacts come from ``propose_targets`` (recon-discovered follow-up hosts) — the
+    LangChain path's only way to surface them, since (unlike the SDK path) its tool results aren't
+    threaded back through a dedicated return field.
+    """
     findings: list[Finding] = []
     batches: list[FlowBatchRef] = []
+    discovered: list[TaskSpec] = []
     for m in messages:
         artifact = getattr(m, "artifact", None)
         if artifact is None:
@@ -406,7 +417,9 @@ def _harvest(messages: list[BaseMessage]) -> tuple[list[Finding], list[FlowBatch
                     batches.append(it.flow_batch)
             elif isinstance(it, FlowBatchRef):
                 batches.append(it)
-    return findings, batches
+            elif isinstance(it, TaskSpec):
+                discovered.append(it)
+    return findings, batches, discovered
 
 
 async def _invoke_agent(agent: Any, prompt: str) -> dict:
@@ -462,6 +475,7 @@ def build_subagent_graph(
         collab=collab,
         skills=skills,
         max_turns=cfg.executor_max_turns,
+        engagement=cfg.engagement,
     )
     verifier = build_verifier(cfg.models, tools, cfg.compaction_token_threshold)
     fbm = FlowBatchManager(client)
@@ -551,16 +565,29 @@ def build_subagent_graph(
         messages = list(result.get("messages", []))
         findings = list(result.get("candidate_findings", []))
         batches = list(result.get("flow_batches", []))
-        if not findings:
-            findings, harvested = _harvest(messages)
-            batches = batches or harvested
+        discovered = list(result.get("discovered_hosts", []))
+        if not findings or not discovered:
+            harvested_findings, harvested_batches, harvested_hosts = _harvest(messages)
+            if not findings:
+                findings = harvested_findings
+                batches = batches or harvested_batches
+            if not discovered:
+                discovered = harvested_hosts
         merged: dict[str, Finding] = {f.key: f for f in state.get("candidate_findings", [])}
         for f in findings:
             merged[f.key] = f
+        # discovered_hosts has no Finding-style key; dedupe by target (last-write-wins across rounds).
+        merged_hosts: dict[str, TaskSpec] = {
+            t.target: t for t in state.get("discovered_hosts", []) if t.target
+        }
+        for t in discovered:
+            if t.target:
+                merged_hosts[t.target] = t
         return {
             "messages": messages,
             "candidate_findings": list(merged.values()),
             "flow_batches": batches,
+            "discovered_hosts": list(merged_hosts.values()),
         }
 
     def _oracle_inputs(candidate: Finding) -> tuple[VerificationOracle, dict]:
@@ -734,8 +761,16 @@ def build_subagent_graph(
                         hints=[f"origin_finding={f.key}"],
                     )
                 )
+        # Recon-discovered follow-up targets (propose_targets) feed the queue exactly like a
+        # cross-chain follow-up: by the next planning phase they are concrete, ready-to-dispatch
+        # tasks, not something the planner has to independently rediscover through its own reasoning.
+        discovered = list(state.get("discovered_hosts", []))
+        next_hops += discovered
         residual = list(critique.not_done) if critique is not None else []
         summary = critique.notes if critique is not None else f"{status}: {len(findings)} finding(s)"
+        if discovered:
+            host_list = ", ".join(t.target for t in discovered if t.target)
+            summary = f"{summary} — recon proposed {len(discovered)} follow-up target(s): {host_list}"
         result = CleanResult(
             dispatch_id="",
             status=status,
@@ -799,18 +834,61 @@ async def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
         return []
 
 
+def seed_recon_tasks(engagement: EngagementSpec) -> list[TaskSpec]:
+    """One deterministic subdomain-enumeration recon task per apex-shaped target host, seeded
+    BEFORE the planner's first LLM call.
+
+    Without this, the master only ever sees whatever single hostname the operator typed and has to
+    discover the real asset surface piecemeal, phase by phase, through its own LLM reasoning — this
+    engagement's own live run against ``*.thinginthefuture.com`` needed the operator to manually
+    enumerate subdomains via crt.sh/hackertarget outside a2pwn entirely. Seeding these into
+    ``pending`` makes ``_plan_node`` skip its first planner call (pending is non-empty), so phase 0
+    is pure deterministic recon; the executor is expected to call ``propose_targets`` for every
+    genuinely live host it finds, which flows into ``next_hops`` exactly like a cross-chain
+    follow-up — by the time the planner's LLM runs for the first time (phase 1), it already has
+    concrete, discovered hosts queued instead of a single bare apex domain.
+    """
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for token in engagement.in_scope or engagement.targets:
+        host = host_of(token)
+        if host and is_apex_host(host) and host not in seen:
+            seen.add(host)
+            hosts.append(host)
+    return [
+        TaskSpec(
+            task=(
+                f"Enumerate subdomains of {host} (subfinder), probe every candidate for "
+                "liveness/tech with httpx, then call propose_targets once for each genuinely "
+                "live, distinct host worth testing (skip parked/dead/CDN-only/duplicate entries). "
+                "This is pure recon — do not attempt exploitation here."
+            ),
+            intent="recon",
+            target=host,
+            hints=["subdomain-enumeration", "seeded-before-first-planning-phase"],
+        )
+        for host in hosts
+    ]
+
+
 def _make_bootstrap(cfg: A2pwnConfig):
     def _bootstrap_node(state: MasterState) -> dict:
         # Seed verify_attempts/spent so their reducer channels initialise even when the runner's
         # stream input omits them. Set the budget CAPS authoritatively from cfg here — the caps live
         # in this overwrite channel and are never derived from a dispatch delta, so max_dispatches /
         # max_phases are actually enforced (a per-dispatch delta only bumps the separate ``spent``).
+        # ``pending`` is a plain (overwrite) channel: only inject the recon seed when the caller
+        # starts genuinely empty (the real CLI flow) — an explicitly pre-seeded pending list (tests,
+        # or any programmatic caller driving the graph from a custom initial state) is left untouched
+        # rather than clobbered.
+        existing_pending = state.get("pending") or []
         return {
             "phase": "recon",
             "round": 0,
             "verify_attempts": {},
             "continuations": 0,
             "spent": 0,
+            "pending": existing_pending or seed_recon_tasks(cfg.engagement),
             "budget": DispatchBudget(
                 max_dispatches=cfg.max_dispatches,
                 max_batch_width=cfg.max_batch_width,

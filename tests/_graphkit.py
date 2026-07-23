@@ -193,11 +193,16 @@ def arm_differential(client) -> None:
     }
 
 
-def exec_result(findings: list[Finding], batches: list[FlowBatchRef] | None = None) -> dict:
+def exec_result(
+    findings: list[Finding],
+    batches: list[FlowBatchRef] | None = None,
+    discovered_hosts: list[TaskSpec] | None = None,
+) -> dict:
     return {
         "messages": [AIMessage(content="executed task")],
         "candidate_findings": list(findings),
         "flow_batches": list(batches or []),
+        "discovered_hosts": list(discovered_hosts or []),
     }
 
 
@@ -252,6 +257,7 @@ def sub_input(cfg, *, intent, spec=None, candidate=None, dispatch_id="d-0") -> d
         "messages": [],
         "candidate_findings": [],
         "flow_batches": [],
+        "discovered_hosts": [],
         "critique": None,
         "verify_round": 0,
         "clarify_round": 0,

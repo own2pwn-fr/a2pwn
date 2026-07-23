@@ -96,3 +96,18 @@ def argv_hosts(argv: list[str]) -> list[str]:
         if host and host not in seen:
             seen.append(host)
     return seen
+
+
+def is_apex_host(host: str) -> bool:
+    """True for a bare/near-bare registrable-looking domain (``example.com``, <=2 labels) where
+    subdomain enumeration is likely to surface real additional scope — used to seed a recon pass
+    BEFORE the first planning phase so the planner starts with real host visibility instead of only
+    ever seeing whatever single hostname the operator typed.
+
+    A naive heuristic (no public-suffix-list dependency): a host under a multi-part suffix like
+    ``example.co.uk`` is misclassified as non-apex (3 labels). Acceptable for a default nudge — the
+    executor can always run subfinder again mid-engagement if it judges it useful — not a hard gate.
+    """
+    if not host or _is_ip(host):
+        return False
+    return host.count(".") <= 1

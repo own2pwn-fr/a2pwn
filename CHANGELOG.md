@@ -8,6 +8,31 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Automatic subdomain enumeration, seeded before the first planning phase.** Previously the
+  master only ever saw whatever single hostname the operator typed — auditing
+  `*.thinginthefuture.com` this session needed the operator to manually enumerate subdomains via
+  crt.sh/hackertarget entirely outside a2pwn, then pass 25 `--target` flags by hand. Bootstrap now
+  seeds one deterministic recon task (`subfinder` + `httpx`, run through the normal sandboxed
+  fork boundary) per apex-shaped target host (`a2pwn.scope.is_apex_host`: <=2 labels, e.g.
+  `example.com`; an already-specific host like `coreapi.example.com` is left alone) directly into
+  `pending`, so phase 0 is pure deterministic recon with no LLM planner call at all. The executor
+  calls a new `propose_targets` tool once per genuinely live, distinct host worth testing; each
+  proposal is threaded through exactly like a cross-chain follow-up (`CleanResult.next_hops` →
+  `pending`), so by the time the planner's LLM runs for the first time it already has concrete,
+  discovered hosts queued instead of a single bare apex domain. Available on both executor paths
+  (SDK native tools + LangChain `a2pwn.tools.recon_tools`); a discovered host outside the
+  engagement's targets/in_scope is dropped defensively before ever reaching the queue.
+- Fixed a pre-existing gap surfaced while wiring the above: `runtime.py`'s LangChain-path tool
+  assembly called `burpwn_tools(client)` without `engagement`, so the documented Python-level
+  scope refusal ("the tool wrappers deterministically refuse traffic to out-of-scope hosts") was
+  never actually engaged in a real run on that executor path — only burpwn's own server-side
+  sandbox containment applied. Now wired as `burpwn_tools(client, cfg.engagement)`. **Still open,
+  not fixed here:** the default `claude-code`/native-SDK executor path (`sdk_agent.py`) has no
+  client-side scope check on `burpwn_exec`/`req_replay`/`fuzz` at all (only the new
+  `propose_targets` tool got one, since it was being added fresh) — real containment there is
+  burpwn's own sandbox only. Retrofitting the same defense-in-depth to every SDK tool wrapper is a
+  larger, separate task.
+
 - **CVSS 3.1 + CWE on every finding, deterministic repro in every report format.** Writing a
   client-facing report by hand after a real engagement required manually computing CVSS scores and
   querying burpwn flow-by-flow for curl/raw-HTTP reproductions — the generated report had neither.

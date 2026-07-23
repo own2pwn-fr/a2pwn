@@ -32,7 +32,7 @@ from a2pwn.collaborator import Collaborator
 from a2pwn.config import A2pwnConfig
 from a2pwn.graph import build_master_graph, build_subagent_graph
 from a2pwn.report import Report, build_report
-from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools
+from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools, recon_tools
 
 _log = logging.getLogger("a2pwn")
 
@@ -227,9 +227,14 @@ async def bootstrap(
     skills = _seed_skills(cfg)
     tools = (
         as_langchain_tools(skills, client, collab)
-        + burpwn_tools(client)
+        # `engagement` was missing here: the documented Python-level scope refusal in
+        # burpwn_tools (CLAUDE.md: "the tool wrappers deterministically refuse traffic to
+        # out-of-scope hosts") was never actually engaged in a real run on this (LangChain/API
+        # backend) executor path — only burpwn's own server-side sandbox containment applied.
+        + burpwn_tools(client, cfg.engagement)
         + oracle_tools(collab, client)
         + finding_tools(client)
+        + recon_tools(cfg.engagement)
     )
 
     subgraph = build_subagent_graph(cfg, client, fork, tools, collab, skills)

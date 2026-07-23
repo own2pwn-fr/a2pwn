@@ -3,7 +3,8 @@
 from langgraph.types import Send
 
 from _graphkit import make_budget, make_cfg, make_finding, make_master_state
-from a2pwn.graph import partition_pending, route_dispatch
+from a2pwn.config import EngagementSpec
+from a2pwn.graph import partition_pending, route_dispatch, seed_recon_tasks
 from a2pwn.models import SubAgentInput, TaskSpec
 
 
@@ -128,3 +129,35 @@ def test_route_clamps_batch_to_remaining_hard_budget():
     out = route_dispatch(state)
     assert isinstance(out, list)
     assert len(out) == 1
+
+
+def _eng(**kw) -> EngagementSpec:
+    return EngagementSpec(name="e", targets=kw.pop("targets", ["https://example.com"]), session="e", **kw)
+
+
+def test_seed_recon_tasks_one_per_apex_host():
+    tasks = seed_recon_tasks(_eng(targets=["https://example.com"]))
+    assert len(tasks) == 1
+    assert tasks[0].target == "example.com"
+    assert tasks[0].intent == "recon"
+    assert "subfinder" in tasks[0].task
+    assert "propose_targets" in tasks[0].task
+
+
+def test_seed_recon_tasks_skips_already_specific_hosts():
+    # Already a specific subdomain the operator explicitly chose — not apex-shaped.
+    assert seed_recon_tasks(_eng(targets=["https://coreapi.qlf.example.com"])) == []
+
+
+def test_seed_recon_tasks_dedupes_across_targets_and_in_scope():
+    tasks = seed_recon_tasks(_eng(targets=["https://example.com"], in_scope=["example.com", "example.com"]))
+    assert len(tasks) == 1  # in_scope takes precedence over targets and is itself deduped
+
+
+def test_seed_recon_tasks_multiple_apex_targets():
+    tasks = seed_recon_tasks(_eng(targets=["https://a.com", "https://b.com", "https://sub.c.com"]))
+    assert {t.target for t in tasks} == {"a.com", "b.com"}
+
+
+def test_seed_recon_tasks_empty_for_no_apex_hosts():
+    assert seed_recon_tasks(_eng(targets=[])) == []

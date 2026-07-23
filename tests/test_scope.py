@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from a2pwn.scope import argv_hosts, host_of, in_scope
+from a2pwn.scope import argv_hosts, host_of, in_scope, is_apex_host
 from a2pwn.tools.burpwn_tools import burpwn_tools
 
 
@@ -63,6 +63,24 @@ def test_argv_hosts_extracts_and_dedups():
     assert argv_hosts(argv) == ["a.example.com", "169.254.169.254"]
 
 
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("example.com", True),
+        ("thinginthefuture.com", True),
+        ("localhost", True),  # single label, degenerate but harmless (subfinder just no-ops)
+        ("app.example.com", False),  # already a specific host the operator explicitly chose
+        ("coreapi.qlf.example.com", False),
+        ("example.co.uk", False),  # known naive-heuristic limitation (3 labels, no PSL)
+        ("169.254.169.254", False),  # an IP is never apex-shaped
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_apex_host(host, expected):
+    assert is_apex_host(host) is expected
+
+
 def _engagement(targets, allow=None):
     return SimpleNamespace(targets=targets, in_scope=allow or [])
 
@@ -70,9 +88,7 @@ def _engagement(targets, allow=None):
 async def test_burpwn_exec_refuses_out_of_scope_host(fake_client):
     eng = _engagement(["https://app.example.com/"])
     tools = {t.name: t for t in burpwn_tools(fake_client, eng)}
-    res = await tools["burpwn_exec"].ainvoke(
-        {"argv": ["curl", "http://169.254.169.254/latest/meta-data/"]}
-    )
+    res = await tools["burpwn_exec"].ainvoke({"argv": ["curl", "http://169.254.169.254/latest/meta-data/"]})
     assert res["refused"] is True
     assert res["off_scope_hosts"] == ["169.254.169.254"]
     # nothing was run
@@ -82,9 +98,7 @@ async def test_burpwn_exec_refuses_out_of_scope_host(fake_client):
 async def test_burpwn_exec_allows_in_scope_host(fake_client):
     eng = _engagement(["https://app.example.com/"])
     tools = {t.name: t for t in burpwn_tools(fake_client, eng)}
-    res = await tools["burpwn_exec"].ainvoke(
-        {"argv": ["curl", "https://api.app.example.com/health"]}
-    )
+    res = await tools["burpwn_exec"].ainvoke({"argv": ["curl", "https://api.app.example.com/health"]})
     assert res == fake_client.exec_return
     assert len(fake_client.execs) == 1
 
@@ -115,9 +129,7 @@ async def test_burpwn_req_replay_refuses_offscope_host_header(fake_client):
 
 async def test_no_engagement_means_no_enforcement(fake_client):
     tools = {t.name: t for t in burpwn_tools(fake_client)}
-    res = await tools["burpwn_exec"].ainvoke(
-        {"argv": ["curl", "http://169.254.169.254/"]}
-    )
+    res = await tools["burpwn_exec"].ainvoke({"argv": ["curl", "http://169.254.169.254/"]})
     assert res == fake_client.exec_return
     assert len(fake_client.execs) == 1
 
