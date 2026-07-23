@@ -59,6 +59,11 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed (latent bugs)
 
+- **`req_list`/`fuzz_results` choked on `limit=-1`.** Executors routinely pass `limit=-1` to mean
+  "no cap"; burpwn's MCP schema hard-rejected it (`invalid value: integer -1, expected u16`) and the
+  whole list call failed. `limit` is now sanitised to the u16 domain at the client boundary
+  (`_u16_or_none`): any negative → omitted (server default / all), overflow clamped to 65535. Caught
+  live on a real engagement via the new executor tool logging.
 - **OOB oracle was dead.** The collaborator was constructed but its in-sandbox listener was never
   started, so the `oob` oracle — the strongest 0-FP signal — could never confirm a blind
   SSRF/XXE/deserialization/SQLi. It is now started at bootstrap and stopped on teardown (serialised

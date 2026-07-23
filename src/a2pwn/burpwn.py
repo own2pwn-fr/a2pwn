@@ -54,6 +54,25 @@ def _compact(**kwargs: Any) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+def _u16_or_none(value: Any) -> int | None:
+    """Sanitise a ``limit``-style param to burpwn's ``u16`` domain (0-65535).
+
+    Models routinely pass ``limit=-1`` to mean "no cap"; burpwn's MCP schema then hard-rejects it
+    (``invalid value: integer -1, expected u16``) and the whole list call fails. Map any negative to
+    ``None`` (omit → server default / all) and clamp overflow to the u16 max so a stray large number
+    can't 400 the call either. Non-integers degrade to ``None`` rather than raising.
+    """
+    if value is None:
+        return None
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    if v < 0:
+        return None
+    return min(v, 65535)
+
+
 def _tool_text(result: dict) -> str:
     """Extract the text block from an MCP ``CallToolResult`` payload."""
 
@@ -323,7 +342,7 @@ class BurpwnClient:
                 protocol=protocol,
                 status=status,
                 method=method,
-                limit=limit,
+                limit=_u16_or_none(limit),
             ),
         )
 
@@ -372,7 +391,9 @@ class BurpwnClient:
         )
 
     async def fuzz_results(self, attack_id: int, sort: str = "anomaly", limit: int | None = None) -> dict:
-        return await self._call_tool("fuzz_results", _compact(attack_id=attack_id, sort=sort, limit=limit))
+        return await self._call_tool(
+            "fuzz_results", _compact(attack_id=attack_id, sort=sort, limit=_u16_or_none(limit))
+        )
 
     async def compare(self, flow_a: int, flow_b: int, what: str = "all") -> dict:
         return await self._call_tool("compare", {"flow_a": flow_a, "flow_b": flow_b, "what": what})
