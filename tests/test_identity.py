@@ -12,7 +12,7 @@ import asyncio
 
 import pytest
 
-from a2pwn.config import BrowserLogin, EngagementSpec, IdentitySpec, LoginRecipe
+from a2pwn.config import EngagementSpec, IdentitySpec, LoginRecipe
 from a2pwn.identity import (
     IdentityError,
     IdentityStore,
@@ -272,50 +272,25 @@ async def test_as_identity_without_declared_identities_is_refused(fake_client):
     assert fake_client.execs == []
 
 
-# --------------------------------------------------------------------------- browser login
-async def test_browser_login_parses_harvested_cookies(fake_client):
-    fake_client.exec_return = {
-        "exit_code": 0,
-        "captured_request_ids": [],
-        "exec_id": "e1",
-        "stdout": 'boot noise\n__A2PWN_IDENTITY__{"cookies":{"sid":"xyz"},"storage":{}}\n',
-    }
+# --------------------------------------------------------------------------- real exec shape
+async def test_a_login_that_captured_no_flow_says_so(fake_client):
+    # burpwn exec returns NO stdout, so a login with no captured flow has produced nothing
+    # readable. This used to fall through to an empty string and surface as the misleading
+    # "extraction did not match the response".
+    fake_client.exec_return = {"exit_code": 0, "captured_request_ids": [], "exec_id": "e1"}
     spec = IdentitySpec(
-        name="spa",
-        browser_login=BrowserLogin(url="https://app.example.com/login", username="u", password="p"),
-    )
-    resolved = await IdentityStore(fake_client, [spec]).resolve("spa")
-    assert resolved.cookies == {"sid": "xyz"}
-    # The browser runs INSIDE the sandbox, so its traffic is proxied/captured like everything else.
-    assert fake_client.execs[0]["argv"][0] == "python3"
-
-
-async def test_browser_login_injects_a_storage_token(fake_client):
-    fake_client.exec_return = {
-        "exit_code": 0,
-        "captured_request_ids": [],
-        "exec_id": "e1",
-        "stdout": '__A2PWN_IDENTITY__{"cookies":{},"storage":{"access_token":"tok"}}\n',
-    }
-    spec = IdentitySpec(
-        name="spa",
-        browser_login=BrowserLogin(
+        name="api",
+        login=LoginRecipe(
             url="https://app.example.com/login",
-            capture_local_storage=True,
-            inject={"Authorization": "Bearer {access_token}"},
+            extract={"token": r'"token":"([^"]+)"'},
+            inject={"Authorization": "Bearer {token}"},
         ),
     )
-    resolved = await IdentityStore(fake_client, [spec]).resolve("spa")
-    assert resolved.all_headers()["Authorization"] == "Bearer tok"
+    with pytest.raises(IdentityError, match="captured no flow"):
+        await IdentityStore(fake_client, [spec]).resolve("api")
 
 
-async def test_browser_login_without_playwright_reports_actionably(fake_client):
-    fake_client.exec_return = {
-        "exit_code": 1,
-        "captured_request_ids": [],
-        "exec_id": "e1",
-        "stdout": "ModuleNotFoundError: No module named 'playwright'",
-    }
-    spec = IdentitySpec(name="spa", browser_login=BrowserLogin(url="https://app.example.com/login"))
-    with pytest.raises(IdentityError, match="playwright"):
-        await IdentityStore(fake_client, [spec]).resolve("spa")
+def test_exec_stdout_tolerates_the_real_stdout_less_result():
+    from a2pwn.identity import _exec_stdout
+
+    assert _exec_stdout({"exit_code": 0, "captured_request_ids": [], "exec_id": "e1"}) == ""

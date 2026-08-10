@@ -117,6 +117,25 @@ def build_tool_specs(
             _log.warning("identity %s could not be resolved: %s", name, exc)
             return None, {"error": "identity-failed", "refused": True, "message": f"REFUSED: {exc}"}
 
+    async def _observe_exec(result: Any) -> None:
+        """Feed an ``exec``-shaped result to the breaker via its CAPTURED flow.
+
+        A burpwn ``exec`` result carries only ``captured_request_ids``/``exec_id``/``exit_code`` —
+        no status, no body (verified live). Without this the breaker saw nothing from exec-driven
+        traffic, which is most of a run's traffic, so a WAF-blocked engagement would never trip it.
+        One extra ``req_show`` per exec, only while the breaker is armed, and only on the last
+        captured flow (a consecutive-run breaker does not need every one).
+        """
+        if not throttle.block_threshold or throttle.tripped or not isinstance(result, dict):
+            return
+        flow_ids = list(result.get("captured_request_ids") or [])
+        if not flow_ids:
+            return
+        try:
+            throttle.observe(await client.req_show(flow_ids[-1]))
+        except Exception as exc:  # noqa: BLE001 - observability must never break the call it watches
+            _log.debug("breaker could not read flow %s: %s", flow_ids[-1], exc)
+
     def _maybe_reauth(name: str | None, result: Any) -> None:
         """Drop a cached identity when the target answered 401/403 — the session likely expired.
 
@@ -151,7 +170,7 @@ def build_tool_specs(
                 return err
             argv, note = apply_identity_to_argv(argv, resolved)
         result = await client.exec(argv, workspace=workspace, timeout_secs=timeout_secs)
-        throttle.observe(result)
+        await _observe_exec(result)
         if note and isinstance(result, dict):
             result = {**result, "identity_warning": note}
         return result
@@ -273,8 +292,15 @@ def build_tool_specs(
             argv += ["--data-raw", body]
         argv.append(url)
         result = await client.exec(argv, workspace=f"identity-{as_identity}")
-        throttle.observe(result)
-        _maybe_reauth(as_identity, result)
+        await _observe_exec(result)
+        # An exec result carries no status, so the 401/403 re-auth signal has to come from the
+        # captured flow too — otherwise an expired identity would never notice it expired.
+        flow_ids = list((result or {}).get("captured_request_ids") or [])
+        if flow_ids:
+            try:
+                _maybe_reauth(as_identity, await client.req_show(flow_ids[-1]))
+            except Exception as exc:  # noqa: BLE001 - best-effort; never break the request itself
+                _log.debug("could not read flow %s for re-auth check: %s", flow_ids[-1], exc)
         return result
 
     specs: list[ToolSpec] = [

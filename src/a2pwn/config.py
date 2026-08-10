@@ -74,45 +74,6 @@ class LoginRecipe(BaseModel):
     harvest_cookies: bool = True
 
 
-class BrowserStep(BaseModel):
-    """One Playwright action in a browser login sequence.
-
-    Exactly one of ``fill`` / ``click`` / ``wait_for`` / ``press`` is meaningful per step.
-    """
-
-    fill: str | None = None  # CSS selector to type into (paired with ``value``)
-    value: str | None = None
-    click: str | None = None  # CSS selector to click
-    wait_for: str | None = None  # CSS selector to await
-    press: str | None = None  # key to press (e.g. "Enter")
-    timeout_ms: int = 15_000
-
-
-class BrowserLogin(BaseModel):
-    """Headless-browser login for JS/SPA/OAuth flows that cannot be replayed as raw HTTP.
-
-    The browser runs INSIDE the burpwn sandbox (``burpwn exec``), so its traffic is proxied and
-    captured exactly like every other request — the "burpwn is the only egress" invariant holds.
-    After the steps complete, cookies (and optionally localStorage) are harvested and become the
-    identity's credentials for all subsequent requests.
-    """
-
-    url: str
-    steps: list[BrowserStep] = Field(default_factory=list)
-    # Convenience shorthand: when username/password are set and ``steps`` is empty, a default
-    # fill-fill-submit sequence is synthesised from the *_selector fields below.
-    username: str | None = None
-    password: str | None = None
-    username_selector: str = "input[type=email], input[name*=user], input[name*=email], input[type=text]"
-    password_selector: str = "input[type=password]"
-    submit_selector: str = "button[type=submit], input[type=submit]"
-    wait_after_ms: int = 3_000
-    capture_local_storage: bool = False
-    # Header template applied to a harvested localStorage/sessionStorage value, e.g.
-    # {"Authorization": "Bearer {access_token}"} where access_token is a storage key.
-    inject: dict[str, str] = Field(default_factory=dict)
-
-
 class IdentitySpec(BaseModel):
     """One named identity the executor can act as.
 
@@ -121,8 +82,7 @@ class IdentitySpec(BaseModel):
     and ideally an unauthenticated negative control C. Declaring identities here is what makes those
     oracles reachable at all; without them a run can only ever test the unauthenticated surface.
 
-    Credentials come from any combination of static ``headers``/``cookies``, a replay ``login``
-    recipe, or a ``browser_login`` sequence. Resolution is lazy and cached (see
+    Credentials come from static ``headers``/``cookies`` and/or a replay ``login`` recipe. Resolution is lazy and cached (see
     :mod:`a2pwn.identity`), and re-runs on a 401/403 so a long engagement survives session expiry.
     """
 
@@ -131,13 +91,12 @@ class IdentitySpec(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     cookies: dict[str, str] = Field(default_factory=dict)
     login: LoginRecipe | None = None
-    browser_login: BrowserLogin | None = None
     # Marks the deliberate unauthenticated identity used as the two_identity negative control.
     anonymous: bool = False
 
     @property
     def authenticated(self) -> bool:
-        return bool(self.headers or self.cookies or self.login or self.browser_login)
+        return bool(self.headers or self.cookies or self.login)
 
 
 class EngagementSpec(BaseModel):

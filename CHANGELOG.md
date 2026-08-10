@@ -16,10 +16,8 @@ All notable changes to this project are documented here. The format is based on
   owner **B**'s object with an unauthenticated **C** as the negative control — three identities
   nothing could provide. `IdentitySpec` now declares identities with static headers/cookies, a
   replay `login` recipe (one HTTP request through the sandbox, regex capture off the response, a
-  header template to inject), or a `browser_login` Playwright sequence for JS/SPA/OAuth flows that
-  cannot be replayed as raw HTTP. **The burpwn-is-the-only-egress invariant holds for all three**:
-  the browser runs inside `burpwn exec`, so Chromium boots in the sandbox network namespace and
-  every request it makes is proxied and captured like any other. New `a2pwn.identity` resolves
+  header template to inject). **The burpwn-is-the-only-egress invariant holds for both** — every
+  login request goes through `burpwn exec`. New `a2pwn.identity` resolves
   lazily, caches, shares one login across a parallel fan-out (per-name lock), and invalidates on a
   401/403 so a session expiring mid-engagement self-heals instead of turning every later probe into
   a false "access control held" negative. Exposed as `as_identity` on `burpwn_exec`/`burpwn_req_replay`
@@ -128,6 +126,24 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Two bugs found by validating against a live sandbox rather than fakes.** Both had shipped:
+  (a) `identity.py` assumed a burpwn `exec` result carries stdout — it does **not**, it carries only
+  `captured_request_ids`/`exec_id`/`exit_code`, so the replay login's fallback path was dead and a
+  login that captured no flow surfaced as a misleading "extraction did not match the response"
+  instead of "the request never reached the target"; (b) the traffic circuit breaker observed the
+  `exec` result dict directly, which contains no status, so it was **inert against exec-driven
+  traffic** — most of a run's traffic — and a WAF-blocked engagement would never have tripped it.
+  The breaker now reads the last captured flow (one extra `req_show`, only while armed). The unit
+  tests that "covered" both had invented a `stdout` key the tool never returns; they now encode the
+  real shape.
+- **A headless-browser (Playwright) identity login was built, tested live, and removed.** Chromium
+  cannot start inside the burpwn sandbox: it launches and is immediately killed with SIGTRAP because
+  its namespace/seccomp layer cannot nest inside bubblewrap, and
+  `--no-sandbox`/`--no-zygote`/`--single-process` do not help. Running it *outside* the sandbox
+  cannot capture its traffic either — burpwn's proxy is a unix socket that aborts an unattributed
+  CONNECT. Reviving it requires a burpwn-side change (a TCP proxy listener, or a Chromium-compatible
+  sandbox profile), so `BrowserLogin`/`BrowserStep` and the `browser` extra are not shipped rather
+  than shipped broken.
 - **The client-side scope refusal was OFF on the default backend.** Noted as open last release and
   now closed: `sdk_agent.py` — the `claude-code`/native-SDK path, i.e. what a normal run uses — had
   no scope check on `burpwn_exec`/`req_replay`/`fuzz` at all, so the containment documented in

@@ -1,4 +1,4 @@
-"""Named identities: static credentials, replay logins, and in-sandbox browser logins.
+"""Named identities: static credentials and replay logins, resolved through the sandbox.
 
 Access-control vulnerability classes — IDOR/BOLA, cross-tenant CRUD, privilege escalation, CSRF —
 are only *provable* with more than one identity. The ``two_identity`` oracle is written around an
@@ -7,18 +7,21 @@ that rules out "the object is simply public". Until this module existed there wa
 a2pwn a single credential, so that oracle (and the five skills built on it) could only fire if the
 executor happened to self-register accounts mid-run.
 
-Three credential sources, freely combinable per identity:
+Two credential sources, freely combinable per identity:
 
 * **static** — ``headers`` / ``cookies`` the operator already holds;
 * **replay login** (:class:`~a2pwn.config.LoginRecipe`) — one HTTP request issued through the
-  sandbox, with regex capture off the response and a header template to inject;
-* **browser login** (:class:`~a2pwn.config.BrowserLogin`) — a Playwright sequence for JS/SPA/OAuth
-  flows that cannot be replayed as raw HTTP.
+  sandbox, with regex capture off the response and a header template to inject.
 
-**The burpwn-is-the-only-egress invariant holds for all three.** The replay login is a ``curl`` run
-via ``burpwn exec``; the browser login is a Playwright script *also* run via ``burpwn exec``, so
-Chromium boots inside the sandbox network namespace and every request it makes is proxied and
-captured like any other. Nothing here opens a socket from the a2pwn process itself.
+**The burpwn-is-the-only-egress invariant holds for both.** The replay login is a ``curl`` run via
+``burpwn exec``; nothing here opens a socket from the a2pwn process itself.
+
+A headless-browser login (Playwright) for JS/SPA/OAuth flows was built and then removed: Chromium
+cannot start inside the burpwn sandbox — it is killed with SIGTRAP because its own namespace/seccomp
+layer cannot nest inside bubblewrap, and ``--no-sandbox``/``--no-zygote``/``--single-process`` do not
+help — while burpwn's proxy is a unix socket that rejects an unattributed client, so running the
+browser *outside* the sandbox cannot capture its traffic either. Reviving it needs a burpwn-side
+change (a TCP proxy listener, or a Chromium-compatible sandbox profile), not an a2pwn one.
 
 Resolution is lazy and cached: an identity is only logged in the first time it is used, and
 :meth:`IdentityStore.invalidate` drops the cache so the next use re-authenticates (the tool wrappers
@@ -32,20 +35,18 @@ or later; see the repository ``LICENSE`` for the full text.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-from a2pwn.config import BrowserLogin, BrowserStep, IdentitySpec, LoginRecipe
+from a2pwn.config import IdentitySpec, LoginRecipe
 
 _log = logging.getLogger("a2pwn.identity")
 
-# Wall-clock ceilings for the two login mechanisms (a hung login must not stall a dispatch).
+# Wall-clock ceiling for a login (a hung login must not stall a dispatch).
 _LOGIN_TIMEOUT_SECS = 60
-_BROWSER_TIMEOUT_SECS = 180
 
 # Headers a caller must never be able to override via an identity — they are properties of the
 # connection/flow, not of who you are, and letting an identity set them would silently re-target a
@@ -90,7 +91,13 @@ class ResolvedIdentity:
 
 
 def _exec_stdout(result: Any) -> str:
-    """Best-effort stdout from a burpwn ``exec`` result (shape-defensive across versions)."""
+    """Best-effort stdout from a burpwn ``exec`` result.
+
+    **burpwn does not return stdout at all** — a real ``exec`` result carries only
+    ``captured_request_ids`` / ``exec_id`` / ``exit_code`` (verified live). This helper is kept
+    because a future burpwn may add one and it costs nothing, but NOTHING here may depend on it:
+    the replay login reads its response from the captured flow instead.
+    """
     if not isinstance(result, dict):
         return str(result or "")
     for key in ("stdout", "output", "stdout_text", "text"):
@@ -138,71 +145,6 @@ def _render(template: str, values: dict[str, str]) -> str | None:
     return out
 
 
-def _browser_steps(login: BrowserLogin) -> list[BrowserStep]:
-    """Explicit steps, or a synthesised fill-fill-submit sequence from the shorthand fields."""
-    if login.steps:
-        return list(login.steps)
-    steps: list[BrowserStep] = []
-    if login.username is not None:
-        steps.append(BrowserStep(fill=login.username_selector, value=login.username))
-    if login.password is not None:
-        steps.append(BrowserStep(fill=login.password_selector, value=login.password))
-    if steps:
-        steps.append(BrowserStep(click=login.submit_selector))
-    return steps
-
-
-def _browser_script(login: BrowserLogin) -> str:
-    """A self-contained Playwright script, driven by a JSON step list passed on argv.
-
-    Runs INSIDE ``burpwn exec`` (sandbox network namespace) so Chromium's traffic is proxied and
-    captured like everything else. ``ignore_https_errors`` accepts burpwn's MITM CA without needing
-    to install it into the browser's own trust store. The harvested cookies/storage are printed as a
-    single JSON object on stdout, delimited so surrounding chatter cannot corrupt the parse.
-    """
-    payload = json.dumps(
-        {
-            "url": login.url,
-            "steps": [s.model_dump() for s in _browser_steps(login)],
-            "wait_after_ms": login.wait_after_ms,
-            "capture_local_storage": login.capture_local_storage,
-        }
-    )
-    return f"""
-import asyncio, json, sys
-CFG = json.loads({payload!r})
-
-async def main():
-    from playwright.async_api import async_playwright
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = await browser.new_context(ignore_https_errors=True)
-        page = await ctx.new_page()
-        await page.goto(CFG["url"], wait_until="domcontentloaded")
-        for step in CFG["steps"]:
-            t = step.get("timeout_ms") or 15000
-            if step.get("fill"):
-                await page.fill(step["fill"], step.get("value") or "", timeout=t)
-            elif step.get("click"):
-                await page.click(step["click"], timeout=t)
-            elif step.get("wait_for"):
-                await page.wait_for_selector(step["wait_for"], timeout=t)
-            elif step.get("press"):
-                await page.keyboard.press(step["press"])
-        await page.wait_for_timeout(CFG["wait_after_ms"])
-        cookies = {{c["name"]: c["value"] for c in await ctx.cookies()}}
-        storage = {{}}
-        if CFG["capture_local_storage"]:
-            storage = await page.evaluate(
-                "() => Object.assign({{}}, window.localStorage, window.sessionStorage)"
-            )
-        await browser.close()
-        print("__A2PWN_IDENTITY__" + json.dumps({{"cookies": cookies, "storage": storage}}))
-
-asyncio.run(main())
-"""
-
-
 class IdentityError(RuntimeError):
     """A declared identity could not be resolved (login failed / credentials unusable)."""
 
@@ -233,8 +175,6 @@ class IdentityStore:
         for spec in self._specs.values():
             if spec.anonymous or not spec.authenticated:
                 how = "anonymous (no credentials — use as the two_identity negative control)"
-            elif spec.browser_login is not None:
-                how = "browser login (Playwright, run inside the burpwn sandbox)"
             elif spec.login is not None:
                 how = "replay login (HTTP request through the sandbox)"
             else:
@@ -291,8 +231,6 @@ class IdentityStore:
             return ResolvedIdentity(name=spec.name, anonymous=True, note="anonymous (no credentials)")
         if spec.login is not None:
             await self._apply_replay_login(spec.login, resolved)
-        if spec.browser_login is not None:
-            await self._apply_browser_login(spec.browser_login, resolved)
         if not resolved.all_headers():
             raise IdentityError(
                 f"identity {spec.name!r} resolved to no credentials — the login produced neither "
@@ -318,7 +256,7 @@ class IdentityStore:
         except Exception as exc:  # noqa: BLE001 - surfaced as a typed identity failure
             raise IdentityError(f"login request for {into.name!r} failed: {exc}") from exc
 
-        body, headers = await self._login_response(result)
+        body, headers = await self._login_response(result, into.name)
         haystack = f"{headers}\n{body}"
         if login.harvest_cookies:
             into.cookies.update(_parse_set_cookie(headers))
@@ -341,73 +279,35 @@ class IdentityStore:
             into.headers[header] = rendered
         into.note = f"replay login {login.method.upper()} {login.url}"
 
-    async def _login_response(self, exec_result: Any) -> tuple[str, str]:
-        """(body, raw response headers) for a login exec — from the captured flow when available.
+    async def _login_response(self, exec_result: Any, name: str) -> tuple[str, str]:
+        """(body, raw response headers) for a login exec, read from the CAPTURED flow.
 
-        The captured flow is authoritative (decrypted by the proxy, same source the report's raw-HTTP
-        reproductions use); curl's own stdout is the fallback when nothing was captured.
+        The captured flow is the only real channel: burpwn's ``exec`` returns no stdout, so a
+        login that captured nothing has produced nothing readable. Saying so plainly beats
+        returning empty strings, which surfaced downstream as a misleading "extraction did not
+        match the response".
         """
         flow_ids = []
         if isinstance(exec_result, dict):
             flow_ids = list(exec_result.get("captured_request_ids") or [])
-        if flow_ids:
-            try:
-                flow = await self._client.req_show(flow_ids[-1], raw=True)
-            except Exception as exc:  # noqa: BLE001 - fall through to stdout
-                _log.debug("login flow fetch failed, falling back to stdout: %s", exc)
-            else:
-                resp = (flow or {}).get("response") or {}
-                return str(resp.get("body") or ""), str(resp.get("headers") or "")
-        stdout = _exec_stdout(exec_result)
-        head, _, body = stdout.partition("\r\n\r\n")
-        if not body:
-            head, _, body = stdout.partition("\n\n")
-        return body, head.replace("\n", "\r\n")
-
-    # ---- browser login ---------------------------------------------------------------
-    async def _apply_browser_login(self, login: BrowserLogin, into: ResolvedIdentity) -> None:
-        """Drive a headless Chromium inside the sandbox and harvest its cookies/storage."""
-        script = _browser_script(login)
-        try:
-            result = await asyncio.wait_for(
-                self._client.exec(
-                    ["python3", "-c", script],
-                    workspace=f"login-{into.name}",
-                    timeout_secs=_BROWSER_TIMEOUT_SECS,
-                ),
-                timeout=_BROWSER_TIMEOUT_SECS + 30,
-            )
-        except TimeoutError as exc:
-            raise IdentityError(
-                f"browser login for {into.name!r} timed out after {_BROWSER_TIMEOUT_SECS}s"
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 - surfaced as a typed identity failure
-            raise IdentityError(f"browser login for {into.name!r} failed to run: {exc}") from exc
-
-        stdout = _exec_stdout(result)
-        marker = "__A2PWN_IDENTITY__"
-        if marker not in stdout:
-            raise IdentityError(
-                f"browser login for {into.name!r} produced no credentials. Playwright must be "
-                "installed and usable inside the sandbox (`uv pip install playwright && playwright "
-                f"install chromium`). Output tail: {stdout[-400:]!r}"
-            )
-        try:
-            harvested = json.loads(stdout.split(marker, 1)[1].splitlines()[0])
-        except (ValueError, IndexError) as exc:
-            raise IdentityError(f"browser login for {into.name!r} returned unparseable output") from exc
-
-        into.cookies.update({str(k): str(v) for k, v in (harvested.get("cookies") or {}).items()})
-        storage = {str(k): str(v) for k, v in (harvested.get("storage") or {}).items()}
-        for header, template in login.inject.items():
-            rendered = _render(template, storage)
-            if rendered is None:
+        if not flow_ids:
+            stdout = _exec_stdout(exec_result)  # only if a future burpwn starts returning one
+            if not stdout:
                 raise IdentityError(
-                    f"browser login for {into.name!r}: header template {template!r} references a "
-                    f"storage key that was not captured (have {sorted(storage)})"
+                    f"login for {name!r} captured no flow — the request never reached the target "
+                    "(check the URL is in scope and the sandbox can resolve it)"
                 )
-            into.headers[header] = rendered
-        into.note = f"browser login {login.url}"
+            head, _, body = stdout.partition("\r\n\r\n")
+            if not body:
+                head, _, body = stdout.partition("\n\n")
+            return body, head.replace("\n", "\r\n")
+        try:
+            flow = await self._client.req_show(flow_ids[-1], raw=True)
+        except Exception as exc:  # noqa: BLE001 - surfaced as a typed identity failure
+            raise IdentityError(f"login for {name!r}: could not read the captured flow ({exc})") from exc
+        resp = (flow or {}).get("response") or {}
+        return str(resp.get("body") or ""), str(resp.get("headers") or "")
+
 
 
 def apply_identity_to_argv(argv: list[str], identity: ResolvedIdentity) -> tuple[list[str], str | None]:

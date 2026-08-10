@@ -153,11 +153,6 @@ identities:                    # what makes the access-control classes reachable
       body: '{"user":"bob","pass":"…"}'
       extract: {token: '"token":"([^"]+)"'}
       inject: {Authorization: "Bearer {token}"}
-  - name: carol                # or a headless-browser login for SPA/OAuth flows
-    browser_login:
-      url: https://app.example.com/login
-      username: carol@example.com
-      password: "…"
   - name: anon                 # the two_identity negative control
     anonymous: true
 
@@ -170,10 +165,15 @@ uv run a2pwn run --config engagement.yaml --active-exploit --yes
 ```
 
 Identities are resolved lazily, cached, shared across a parallel fan-out, and re-authenticated on a
-401/403 so a long engagement survives session expiry. The browser login runs Playwright **inside**
-`burpwn exec`, so Chromium boots in the sandbox network namespace and its traffic is captured like
-everything else — the "burpwn is the only egress" invariant holds. It needs Playwright available to
-the sandbox (`uv pip install playwright && playwright install chromium`).
+401/403 so a long engagement survives session expiry. Every login request goes through `burpwn exec`,
+so the "burpwn is the only egress" invariant holds.
+
+There is deliberately **no headless-browser login**: it was built and removed after live testing.
+Chromium cannot start inside the burpwn sandbox (killed with SIGTRAP — its namespace/seccomp layer
+cannot nest inside bubblewrap, and `--no-sandbox`/`--no-zygote`/`--single-process` do not help), and
+burpwn's proxy is a unix socket that rejects an unattributed client, so running the browser outside
+the sandbox cannot capture its traffic either. For a JS/SPA/OAuth flow, log in by hand once and pass
+the resulting cookie or token as a static identity.
 
 Declaring at least two authenticated identities plus `anon` is what makes the `two_identity` oracle
 usable: A reaching B's object, B fetching its own (ground truth), and the anonymous control being

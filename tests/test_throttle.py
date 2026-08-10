@@ -115,6 +115,28 @@ async def test_a_tripped_breaker_refuses_further_traffic(fake_client):
     assert fake_client.execs == []
 
 
+async def test_exec_traffic_feeds_the_breaker_via_its_captured_flow(fake_client):
+    # A real burpwn exec result carries ONLY captured_request_ids/exec_id/exit_code — no status and
+    # no body (verified live). Observing the result dict directly therefore saw NOTHING, so the
+    # breaker was inert against exec-driven traffic, which is most of a run's traffic.
+    fake_client.exec_return = {"exit_code": 0, "captured_request_ids": [9], "exec_id": "e1"}
+    fake_client.all_flows = [{"id": 9, "response": {"status": 429, "body": "cloudflare"}}]
+    throttle = Throttle(block_threshold=2)
+    tools = {t.name: t for t in burpwn_tools(fake_client, _engagement(), throttle=throttle)}
+    await tools["burpwn_exec"].ainvoke({"argv": ["curl", "https://app.example.com/"]})
+    await tools["burpwn_exec"].ainvoke({"argv": ["curl", "https://app.example.com/"]})
+    assert throttle.tripped is True
+
+
+async def test_the_breaker_costs_no_extra_call_when_disarmed(fake_client):
+    # The flow fetch is one extra round-trip per exec; it must not happen when the breaker is off.
+    fake_client.exec_return = {"exit_code": 0, "captured_request_ids": [9], "exec_id": "e1"}
+    throttle = Throttle(block_threshold=0)
+    tools = {t.name: t for t in burpwn_tools(fake_client, _engagement(), throttle=throttle)}
+    await tools["burpwn_exec"].ainvoke({"argv": ["curl", "https://app.example.com/"]})
+    assert fake_client.req_show_calls == []
+
+
 async def test_tool_results_feed_the_breaker(fake_client):
     throttle = Throttle(block_threshold=2)
     fake_client.replay_return = _blocked()
