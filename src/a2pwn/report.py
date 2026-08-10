@@ -133,6 +133,15 @@ class Report(BaseModel):
     dispatches_spent: int = 0
     started_at: str = ""
     duration_secs: float = 0.0
+    # Real model spend for the engagement (as reported by the backend, never estimated).
+    cost_usd: float = 0.0
+    tokens_spent: int = 0
+    # Traffic-policy outcome. ``blocked`` being true is load-bearing: it is the difference between
+    # "we found nothing" and "we were not allowed to look", which a bare 0-finding report cannot
+    # express and a reader would otherwise read as a clean bill of health.
+    traffic: dict = Field(default_factory=dict)
+    # Populated by `a2pwn retest`: which baseline findings are fixed, still vulnerable, or new.
+    retest: dict = Field(default_factory=dict)
 
 
 def _sort_findings(findings: list[Finding]) -> list[Finding]:
@@ -231,6 +240,8 @@ async def build_report(
     started_at: str = "",
     duration_secs: float = 0.0,
     formats: list[str] | set[str] | None = None,
+    traffic: dict | None = None,
+    baseline: list[Finding] | None = None,
 ) -> Report:
     """Promote independently-verified findings, export per-workspace HARs, map chains, and write the
     report in every requested format (md + json always; sarif/html gated on ``formats``).
@@ -289,11 +300,44 @@ async def build_report(
         targets=list(getattr(engagement, "targets", []) or []),
         models=dict(models or {}),
         dispatches_spent=int(state.get("spent", 0) or 0),
+        cost_usd=round(float(state.get("spent_usd", 0.0) or 0.0), 4),
+        tokens_spent=int(state.get("spent_tokens", 0) or 0),
+        traffic=dict(traffic or {}),
+        retest=_retest_delta(baseline, findings, confirmed_only),
         started_at=started_at,
         duration_secs=duration_secs,
     )
     report.report_paths = _write_reports(report, out_dir, formats)
     return report
+
+
+def _retest_delta(
+    baseline: list[Finding] | None,
+    verified: list[Finding],
+    confirmed_only: list[Finding],
+) -> dict:
+    """Compare a retest run against the baseline it was seeded from.
+
+    A baseline finding counts as STILL VULNERABLE only when this run re-proved it — reproduced by
+    the same fail-closed oracle kernel, not asserted by a model. Everything else in the baseline is
+    reported as ``fixed_or_unreproducible``, deliberately hedged: "we could not prove it again" is
+    genuinely weaker evidence than "it is fixed" (the endpoint may have moved, or a credential may
+    have expired), and a report that silently upgraded one to the other would let a live bug be
+    signed off as remediated.
+    """
+    if baseline is None:
+        return {}
+    reproved = {f.key for f in verified} | {f.key for f in confirmed_only}
+    baseline_keys = [f.key for f in baseline]
+    still = [k for k in baseline_keys if k in reproved]
+    gone = [k for k in baseline_keys if k not in reproved]
+    new = sorted({f.key for f in verified} - set(baseline_keys))
+    return {
+        "baseline_findings": len(baseline_keys),
+        "still_vulnerable": still,
+        "fixed_or_unreproducible": gone,
+        "new_since_baseline": new,
+    }
 
 
 def _write_reports(report: Report, out_dir: str, formats: list[str] | set[str] | None) -> dict:
@@ -350,8 +394,12 @@ def _finding_section(f: Finding, status_label: str = "independently verified") -
         lines.append(cvss_line)
     if f.cwe_ids:
         lines.append("- **CWE:** " + ", ".join(f.cwe_ids))
+    if f.identity:
+        lines.append(f"- **Proven as identity:** `{f.identity}`")
     if f.enables:
         lines.append("- **Enables:** " + ", ".join(f"`{k}`" for k in f.enables))
+    if f.remediation:
+        lines += ["", "**Remediation:**", "", f.remediation]
     lines += [
         "",
         "**Evidence:**",
@@ -407,10 +455,68 @@ def _metadata_lines(r: Report) -> list[str]:
         lines.append("- Models: " + ", ".join(f"{k}={v}" for k, v in r.models.items()))
     if r.dispatches_spent:
         lines.append(f"- Dispatches spent: {r.dispatches_spent}")
+    if r.cost_usd or r.tokens_spent:
+        lines.append(f"- Model spend: ${r.cost_usd:.2f} ({r.tokens_spent:,} tokens)")
     if r.started_at:
         lines.append(f"- Started: {r.started_at}")
     if r.duration_secs:
         lines.append(f"- Duration: {r.duration_secs:.1f}s")
+    return lines
+
+
+def _traffic_lines(r: Report) -> list[str]:
+    """A loud banner when the target was blocking us.
+
+    Without it, a run that a WAF shut down renders as an ordinary low-finding report — and a reader
+    would reasonably conclude the target is secure, which is the single most dangerous wrong
+    conclusion this tool can produce.
+    """
+    traffic = r.traffic or {}
+    if not traffic.get("tripped"):
+        return []
+    return [
+        "",
+        "> ## ⚠ TESTING WAS BLOCKED",
+        ">",
+        f"> {traffic.get('trip_reason', 'the target began refusing our traffic')}.",
+        ">",
+        f"> {traffic.get('blocked_responses', 0)} of {traffic.get('responses_observed', 0)} observed "
+        "responses were blocks. **Coverage below is incomplete and the absence of findings is NOT "
+        "evidence of security.** Get the source IP allow-listed (or lower `--max-rps`) and re-run.",
+        "",
+    ]
+
+
+def _retest_lines(r: Report) -> list[str]:
+    """The remediation-verification delta, when this run was a retest."""
+    delta = r.retest or {}
+    if not delta:
+        return []
+    still = delta.get("still_vulnerable") or []
+    gone = delta.get("fixed_or_unreproducible") or []
+    new = delta.get("new_since_baseline") or []
+    lines = [
+        "## Retest delta",
+        "",
+        f"Baseline findings re-checked: **{delta.get('baseline_findings', 0)}**",
+        "",
+        f"### Still vulnerable ({len(still)})",
+        "",
+    ]
+    lines += [f"- ✗ `{k}`" for k in still] or ["_None — no baseline finding could be re-proven._"]
+    lines += [
+        "",
+        f"### Fixed or no longer reproducible ({len(gone)})",
+        "",
+        "_Reported as fixed **or** unreproducible, deliberately: a moved endpoint or an expired "
+        "test credential is indistinguishable from a real fix, so these need a human sign-off "
+        "rather than an automatic one._",
+        "",
+    ]
+    lines += [f"- ✓ `{k}`" for k in gone] or ["_None._"]
+    if new:
+        lines += ["", f"### New since the baseline ({len(new)})", ""] + [f"- `{k}`" for k in new]
+    lines.append("")
     return lines
 
 
@@ -434,6 +540,8 @@ def render_markdown(r: Report) -> str:
         lines.append("- Severity: " + ", ".join(f"{sev} {n}" for sev, n in ordered))
     lines += _metadata_lines(r)
     lines.append("")
+    lines += _traffic_lines(r)
+    lines += _retest_lines(r)
 
     lines += ["## Findings", ""]
     if r.findings:
@@ -492,6 +600,10 @@ def _sarif_result(f: Finding, tier: str) -> dict:
     }
     if f.cwe_ids:
         props["cweIds"] = list(f.cwe_ids)
+    if f.remediation:
+        props["remediation"] = f.remediation
+    if f.identity:
+        props["provenAsIdentity"] = f.identity
     if f.cvss_vector:
         score = parse_cvss31(f.cvss_vector)
         props["cvssVector"] = f.cvss_vector
@@ -597,10 +709,11 @@ def _html_rows(findings: list[Finding]) -> str:
             f"<td>{html.escape(f.oracle_kind)}</td>"
             f"<td>{_html_cvss_cwe(f)}</td>"
             f'<td class="ev">{html.escape(f.evidence)}</td>'
+            f'<td class="ev">{html.escape(f.remediation or "—")}</td>'
             "</tr>"
         )
     if not rows:
-        return '<tr><td colspan="7" class="note">None.</td></tr>'
+        return '<tr><td colspan="8" class="note">None.</td></tr>'
     return "".join(rows)
 
 
@@ -621,13 +734,25 @@ def render_html(r: Report) -> str:
     )
     if r.dispatches_spent:
         meta_bits.append(f"<b>Dispatches</b> {r.dispatches_spent}")
+    if r.cost_usd or r.tokens_spent:
+        meta_bits.append(f"<b>Spend</b> ${r.cost_usd:.2f} / {r.tokens_spent:,} tok")
     if r.started_at:
         meta_bits.append("<b>Started</b> " + html.escape(r.started_at))
     if r.duration_secs:
         meta_bits.append(f"<b>Duration</b> {r.duration_secs:.1f}s")
+    blocked_banner = ""
+    if (r.traffic or {}).get("tripped"):
+        blocked_banner = (
+            '<p class="note" style="border-left:4px solid #b00;padding-left:10px">'
+            "<b>⚠ TESTING WAS BLOCKED.</b> "
+            + html.escape(str(r.traffic.get("trip_reason", "")))
+            + ". Coverage is incomplete — the absence of findings below is NOT evidence of security."
+            "</p>"
+        )
     head = (
         "<tr><th>Severity</th><th>Vuln class</th><th>Target</th>"
-        "<th>Param</th><th>Oracle</th><th>CVSS / CWE</th><th>Evidence</th></tr>"
+        "<th>Param</th><th>Oracle</th><th>CVSS / CWE</th><th>Evidence</th>"
+        "<th>Remediation</th></tr>"
     )
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -636,6 +761,7 @@ def render_html(r: Report) -> str:
         f'<style>{_HTML_CSS}</style></head><body><div class="wrap">'
         f"<h1>a2pwn report — {html.escape(r.engagement)}</h1>"
         f'<p class="meta">{" &nbsp;·&nbsp; ".join(meta_bits)}</p>'
+        f"{blocked_banner}"
         "<h2>Verified findings</h2>"
         f"<table><thead>{head}</thead><tbody>{_html_rows(r.findings)}</tbody></table>"
         "<h2>Confirmed, not independently reproduced</h2>"

@@ -82,7 +82,17 @@ class _SdkExecutor:
     """
 
     def __init__(
-        self, cfg: RoleModels, client, collab, skills, active_exploit_tools, max_turns=60, engagement=None
+        self,
+        cfg: RoleModels,
+        client,
+        collab,
+        skills,
+        active_exploit_tools,
+        max_turns=60,
+        engagement=None,
+        identities=None,
+        throttle=None,
+        fuzz_cap=0,
     ):
         self._model = cfg.executor.model or "sonnet"
         self._prompt = _executor_prompt(active_exploit_tools)
@@ -92,6 +102,9 @@ class _SdkExecutor:
         self._blocked = list(active_exploit_tools or [])
         self._max_turns = max_turns
         self._engagement = engagement
+        self._identities = identities
+        self._throttle = throttle
+        self._fuzz_cap = fuzz_cap
 
     async def ainvoke(self, state: dict, config: Any = None) -> dict:
         from langchain_core.messages import AIMessage
@@ -113,12 +126,17 @@ class _SdkExecutor:
             max_turns=self._max_turns,
             active_exploit_blocked=self._blocked,
             engagement=self._engagement,
+            identities=self._identities,
+            throttle=self._throttle,
+            fuzz_cap=self._fuzz_cap,
         )
         return {
             "messages": [AIMessage(content=outcome.summary or "executed task")],
             "candidate_findings": list(outcome.candidate_findings),
             "flow_batches": list(outcome.flow_batches),
             "discovered_hosts": list(outcome.discovered_hosts),
+            "cost_usd": outcome.cost_usd,
+            "tokens": outcome.tokens,
         }
 
 
@@ -133,6 +151,9 @@ def build_executor(
     skills: list | None = None,
     max_turns: int = 60,
     engagement: Any = None,
+    identities: Any = None,
+    throttle: Any = None,
+    fuzz_cap: int = 0,
 ) -> Any:
     """Build the executor. On the ``claude-code`` subscription backend, use the native SDK
     tool-calling loop (:class:`_SdkExecutor`) — prompted-JSON tool-calling makes that model distrust
@@ -146,7 +167,16 @@ def build_executor(
     """
     if cfg.executor.provider == "claude-code" and client is not None:
         return _SdkExecutor(
-            cfg, client, collab, skills, active_exploit_tools, max_turns=max_turns, engagement=engagement
+            cfg,
+            client,
+            collab,
+            skills,
+            active_exploit_tools,
+            max_turns=max_turns,
+            engagement=engagement,
+            identities=identities,
+            throttle=throttle,
+            fuzz_cap=fuzz_cap,
         )
     model = make_model(cfg.executor)
     return create_react_agent(

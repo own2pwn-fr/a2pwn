@@ -86,6 +86,13 @@ class Finding(BaseModel):
     # discipline as the oracle kernel. An unparseable vector is surfaced as-is, never silently hidden.
     cvss_vector: str | None = None  # e.g. "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
     cwe_ids: list[str] = Field(default_factory=list)  # e.g. ["CWE-306"]
+    # Concrete fix guidance for the client-facing report. The report already carried severity, CVSS,
+    # CWE and a reproduction — everything needed to CONFIRM the bug, and nothing about closing it,
+    # which is the first thing the recipient looks for.
+    remediation: str | None = None
+    # The identity the finding was proven as (an access-control finding is meaningless without it:
+    # "A reached B's order" only means something if the report says who A and B were).
+    identity: str | None = None
     # Populated by report.py at build time from the flow actually captured for this finding
     # (a real burpwn req_show, never invented) — best-effort, absent if the fetch fails.
     raw_http: str | None = None
@@ -121,6 +128,10 @@ class CleanResult(BaseModel):
     residual_gaps: list[str] = Field(default_factory=list)
     next_hops: list[TaskSpec] = Field(default_factory=list)
     summary: str = ""
+    # Real model spend for this dispatch, accumulated into the master's spent_usd/spent_tokens
+    # channels so the engagement's cost ceilings are enforced on actual spend, not a dispatch count.
+    cost_usd: float = 0.0
+    tokens: int = 0
 
 
 class DispatchRecord(BaseModel):

@@ -216,6 +216,8 @@ def make_master_state(
     round: int = 0,
     continuations: int = 0,
     spent: int = 0,
+    spent_usd: float = 0.0,
+    spent_tokens: int = 0,
     budget: DispatchBudget | None = None,
 ) -> dict:
     return {
@@ -232,18 +234,26 @@ def make_master_state(
         "round": round,
         "continuations": continuations,
         "spent": spent,
+        # Real-spend channels, accumulated exactly like ``spent`` (see MasterState).
+        "spent_usd": spent_usd,
+        "spent_tokens": spent_tokens,
         "budget": budget or make_budget(cfg),
     }
 
 
 def build_sub(monkeypatch, cfg, client, *, clarifier, executor, fork=None, collab=None):
-    """Compile a sub-agent graph with the LLM builders swapped for fakes."""
-    import a2pwn.graph as g
+    """Compile a sub-agent graph with the LLM builders swapped for fakes.
 
-    monkeypatch.setattr(g, "build_clarifier", lambda models: clarifier)
-    monkeypatch.setattr(g, "build_executor", lambda models, tools, active, *a, **k: executor)
-    monkeypatch.setattr(g, "build_verifier", lambda models, tools, *a, **k: _Dummy())
-    return g.build_subagent_graph(cfg, client, fork or FakeFork(), tools=[], collab=collab)
+    The builders are patched on ``a2pwn.subgraph``, which is where the sub-agent half lives and
+    where ``build_subagent_graph`` resolves them from — patching the ``a2pwn.graph`` re-export
+    would bind nothing.
+    """
+    import a2pwn.subgraph as sg
+
+    monkeypatch.setattr(sg, "build_clarifier", lambda models: clarifier)
+    monkeypatch.setattr(sg, "build_executor", lambda models, tools, active, *a, **k: executor)
+    monkeypatch.setattr(sg, "build_verifier", lambda models, tools, *a, **k: _Dummy())
+    return sg.build_subagent_graph(cfg, client, fork or FakeFork(), tools=[], collab=collab)
 
 
 def sub_input(cfg, *, intent, spec=None, candidate=None, dispatch_id="d-0") -> dict:

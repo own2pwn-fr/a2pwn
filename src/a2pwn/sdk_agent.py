@@ -39,9 +39,12 @@ from claude_agent_sdk import (
 
 from a2pwn import progress
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
+from a2pwn.identity import IdentityStore
 from a2pwn.models import Finding, FlowBatchRef, TaskSpec
 from a2pwn.oracles import VerificationOracle, run_oracle
-from a2pwn.scope import host_of, in_scope
+from a2pwn.scope import ScopeGuard, host_of
+from a2pwn.throttle import Throttle
+from a2pwn.toolcore import build_tool_specs
 
 # Child of the "a2pwn" logger so the TUI's WARNING-silencing still applies, but `--plain` (INFO) and
 # `-v` (DEBUG) surface the sub-agent's otherwise-invisible tool calls, results and refusals.
@@ -59,6 +62,32 @@ _ORACLES = {
     "llm_rubric",
 }
 _SEVERITIES = {"info", "low", "medium", "high", "critical"}
+
+# The fields ``report_finding`` accepts, as a module-level constant so the parity test can compare
+# it against the LangChain tool's actual signature. A field added to one path and forgotten on the
+# other is the exact shape of the ``state_change`` data-loss bug, so it is asserted, not assumed.
+REPORT_FINDING_SCHEMA: dict[str, Any] = {
+    "vuln_class": str,
+    "severity": str,
+    "target": str,
+    "evidence": str,
+    "flow_ids": list,
+    "oracle_kind": str,
+    "param": str,
+    "sub_variant": str,
+    "workspace": str,
+    "tag": str,
+    "key_flow": int,
+    "exec_ids": list,
+    "oracle_signals": list,
+    "correlation_id": str,
+    "oracle_expect": dict,
+    "enables": list,
+    "cvss_vector": str,
+    "cwe_ids": list,
+    "remediation": str,
+    "identity": str,
+}
 
 # A single MCP text block should not carry an unbounded body (a req_show can be multi-MiB);
 # cap it well above anything the model needs to reason over.
@@ -88,6 +117,29 @@ class SdkExecOutcome:
     summary: str = ""
     tool_calls: int = 0
     transcript: list[str] = field(default_factory=list)
+    # REAL spend for this run, read off the SDK's own ResultMessage — this is what makes the
+    # engagement's --max-usd/--max-tokens ceilings mean anything (a dispatch COUNT is a poor proxy:
+    # one dispatch is anywhere from 3 turns to 60 turns with a 150k-token compaction).
+    cost_usd: float = 0.0
+    tokens: int = 0
+
+
+def _usage_tokens(usage: Any) -> int:
+    """Total tokens from an SDK usage payload (input+output+cache), shape-defensive."""
+    if not isinstance(usage, dict):
+        return 0
+    total = 0
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        try:
+            total += int(usage.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def _text_result(text: str) -> dict:
@@ -150,6 +202,9 @@ async def run_sdk_agent(
     active_exploit_blocked: list[str] | None = None,
     options_extra: dict | None = None,
     engagement: Any = None,
+    identities: IdentityStore | None = None,
+    throttle: Throttle | None = None,
+    fuzz_cap: int = 0,
 ) -> SdkExecOutcome:
     """Run the pentest executor/verifier as a native claude-agent-sdk agent loop.
 
@@ -161,88 +216,33 @@ async def run_sdk_agent(
 
     ``active_exploit_blocked`` lists tool names (e.g. ``"burpwn_exec"``, ``"burpwn_fuzz"``) that
     must hard-refuse — their bodies return an error result without touching the target.
-    ``engagement`` (optional) scopes ``propose_targets``: a proposed host outside its
-    targets/in_scope allow-list is dropped defensively — the same host would be refused at the
-    traffic layer anyway the moment a follow-up dispatch touched it, so this just keeps a
-    hallucinated/off-scope host out of the planner's queue in the first place.
+    ``engagement`` (optional) drives the scope guard: every target-facing tool refuses out-of-scope
+    or explicitly excluded destinations before running, and ``propose_targets`` drops a proposal
+    outside the allow-list so a hallucinated host never even reaches the planner's queue. This
+    client-side refusal previously existed on the LangChain path ONLY — i.e. it was off on the
+    default ``claude-code`` backend — and now comes from the same shared
+    :func:`~a2pwn.toolcore.build_tool_specs` definition both paths adapt.
+
+    ``identities`` exposes the identity tools and the ``as_identity`` parameter (what makes the
+    ``two_identity`` oracle reachable at all); ``throttle``/``fuzz_cap`` apply the engagement's
+    traffic policy.
     """
     blocked = set(active_exploit_blocked or [])
     findings: list[Finding] = []
     discovered: list[TaskSpec] = []
-    eng_targets = list(getattr(engagement, "targets", None) or [])
-    eng_allow = list(getattr(engagement, "in_scope", None) or [])
-    eng_enforce = bool(engagement is not None and (eng_targets or eng_allow))
+    guard = ScopeGuard.from_engagement(engagement)
     fbm = FlowBatchManager(client)
 
-    # ---- burpwn hot-loop tools (thin async wrappers over the bound client) -------------
-    async def _burpwn_exec(args: dict) -> dict:
-        return _json_result(
-            await client.exec(
-                args["argv"],
-                workspace=args.get("workspace"),
-                timeout_secs=args.get("timeout_secs"),
-            )
-        )
+    # ---- shared tool definitions (identical to the LangChain path, by construction) -----
+    shared_specs = build_tool_specs(
+        client, guard=guard, identities=identities, throttle=throttle, fuzz_cap=fuzz_cap
+    )
 
-    async def _burpwn_req_list(args: dict) -> dict:
-        return _json_result(
-            await client.req_list(
-                workspace_id=args.get("workspace_id"),
-                host=args.get("host"),
-                protocol=args.get("protocol"),
-                status=args.get("status"),
-                method=args.get("method"),
-                limit=args.get("limit"),
-            )
-        )
+    def _adapt(fn):
+        async def _handler(args: dict) -> dict:
+            return _json_result(await fn(**{k: v for k, v in (args or {}).items() if v is not None}))
 
-    async def _burpwn_req_show(args: dict) -> dict:
-        return _json_result(await client.req_show(args["id"], raw=bool(args.get("raw", False))))
-
-    async def _burpwn_req_search(args: dict) -> dict:
-        return _json_result(await client.req_search(args["query"]))
-
-    async def _burpwn_req_replay(args: dict) -> dict:
-        return _json_result(
-            await client.req_replay(
-                args["id"],
-                set_headers=args.get("set_headers") or [],
-                set_body=args.get("set_body"),
-                method=args.get("method"),
-            )
-        )
-
-    async def _burpwn_fuzz(args: dict) -> dict:
-        return _json_result(
-            await client.fuzz(
-                args["flow"],
-                args["positions"],
-                args["payloads"],
-                mode=args.get("mode", "sniper"),
-                concurrency=args.get("concurrency"),
-                delay_ms=args.get("delay_ms"),
-                marker=args.get("marker"),
-                name=args.get("name"),
-            )
-        )
-
-    async def _burpwn_fuzz_results(args: dict) -> dict:
-        return _json_result(
-            await client.fuzz_results(
-                args["attack_id"], sort=args.get("sort", "anomaly"), limit=args.get("limit")
-            )
-        )
-
-    async def _burpwn_compare(args: dict) -> dict:
-        return _json_result(
-            await client.compare(args["flow_a"], args["flow_b"], what=args.get("what", "all"))
-        )
-
-    async def _burpwn_tag_add(args: dict) -> dict:
-        return _json_result(await client.tag_add(args["flow_id"], args["name"], color=args.get("color")))
-
-    async def _burpwn_note_add(args: dict) -> dict:
-        return _json_result(await client.note_add(args["flow_id"], args["body"]))
+        return _handler
 
     # ---- deterministic oracle (mirrors a2pwn.tools.oracle_tools) ------------------------
     async def _run_oracle(args: dict) -> dict:
@@ -286,6 +286,8 @@ async def run_sdk_agent(
         enables = args.get("enables")
         cvss_vector = args.get("cvss_vector")
         cwe_ids = args.get("cwe_ids")
+        remediation = args.get("remediation")
+        identity = args.get("identity")
 
         oracle_kind = oracle_kind if oracle_kind in _ORACLES else "signature"
         severity = severity if severity in _SEVERITIES else "medium"
@@ -320,6 +322,8 @@ async def run_sdk_agent(
             enables=list(enables or []),
             cvss_vector=cvss_vector,
             cwe_ids=list(cwe_ids or []),
+            remediation=remediation,
+            identity=identity,
         )
         findings.append(finding)
         progress.emit(
@@ -344,7 +348,7 @@ async def run_sdk_agent(
             if not raw:
                 continue
             host = host_of(raw) or raw
-            if eng_enforce and not in_scope(host, eng_targets, eng_allow):
+            if not guard.allows(host):
                 continue
             note = str(entry.get("note") or "").strip()
             url = raw if "://" in raw else f"https://{host}"
@@ -358,92 +362,11 @@ async def run_sdk_agent(
         )
 
     # ---- static tool specs: (name, description, input_schema, handler) ------------------
+    # The burpwn hot loop comes from the SHARED definition so this path and the LangChain path can
+    # never drift; only the oracle/finding/recon emitters are SDK-local.
     specs: list[tuple[str, str, dict, object]] = [
-        (
-            "burpwn_exec",
-            "Run a target-facing command inside the burpwn sandbox (all traffic captured/MITM'd). "
-            "argv is the command vector; workspace groups this run's captured flows; "
-            "timeout_secs caps a long network exec.",
-            {"argv": list, "workspace": str, "timeout_secs": int},
-            _burpwn_exec,
-        ),
-        (
-            "burpwn_req_list",
-            "List captured flows, optionally filtered by workspace_id, host, protocol, status, method, limit.",
-            {
-                "workspace_id": int,
-                "host": str,
-                "protocol": str,
-                "status": int,
-                "method": str,
-                "limit": int,
-            },
-            _burpwn_req_list,
-        ),
-        (
-            "burpwn_req_show",
-            "Show one captured flow (decrypted request+response); raw=true adds verbatim bytes.",
-            {"id": int, "raw": bool},
-            _burpwn_req_show,
-        ),
-        (
-            "burpwn_req_search",
-            "Full-text search across all decrypted request/response history; returns matching flow ids.",
-            {"query": str},
-            _burpwn_req_search,
-        ),
-        (
-            "burpwn_req_replay",
-            "Repeater: replay a flow with edited headers/body/method.",
-            {"id": int, "set_headers": list, "set_body": str, "method": str},
-            _burpwn_req_replay,
-        ),
-        (
-            "burpwn_fuzz",
-            "Intruder: fuzz payload positions in a flow; results ranked by status/len/time anomaly. "
-            'positions is a list of "start:end" BYTE OFFSET strings into the flow\'s raw request '
-            "(NOT a field name or marker string) — call burpwn_req_show with raw=true first to get "
-            "the verbatim request bytes and compute the offset of your injection point, e.g. "
-            '["142:145"] to fuzz a 3-byte span starting at byte 142. mode is one of '
-            "sniper/battering-ram/pitchfork/cluster-bomb.",
-            {
-                "flow": int,
-                "positions": list,
-                "payloads": list,
-                "mode": str,
-                "concurrency": int,
-                "delay_ms": int,
-                "marker": str,
-                "name": str,
-            },
-            _burpwn_fuzz,
-        ),
-        (
-            "burpwn_fuzz_results",
-            "Fetch Intruder results for an attack, anomaly-ranked (the blind oracle).",
-            {"attack_id": int, "sort": str, "limit": int},
-            _burpwn_fuzz_results,
-        ),
-        (
-            "burpwn_compare",
-            "Structured status/header/body diff + reflection check between two flows. what MUST be "
-            'exactly one of "headers", "body" or "all" (a single value, never a comma list) — '
-            'defaults to "all" if omitted.',
-            {"flow_a": int, "flow_b": int, "what": str},
-            _burpwn_compare,
-        ),
-        (
-            "burpwn_tag_add",
-            "Tag/highlight a flow (marks it as belonging to a finding batch).",
-            {"flow_id": int, "name": str, "color": str},
-            _burpwn_tag_add,
-        ),
-        (
-            "burpwn_note_add",
-            "Attach an evidence note to a flow.",
-            {"flow_id": int, "body": str},
-            _burpwn_note_add,
-        ),
+        (spec.name, spec.description, spec.schema, _adapt(spec.fn)) for spec in shared_specs
+    ] + [
         (
             "run_oracle",
             "Deterministically confirm a candidate finding via the named oracle "
@@ -473,27 +396,12 @@ async def run_sdk_agent(
             "ALWAYS include cvss_vector (a CVSS 3.1 vector, e.g. "
             '"AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N" — the report re-derives the numeric score from '
             'this string itself, your own score estimate is ignored) and cwe_ids (e.g. ["CWE-306"]) '
-            "so the report can cite them; omit only if genuinely no CWE applies.",
-            {
-                "vuln_class": str,
-                "severity": str,
-                "target": str,
-                "evidence": str,
-                "flow_ids": list,
-                "oracle_kind": str,
-                "param": str,
-                "sub_variant": str,
-                "workspace": str,
-                "tag": str,
-                "key_flow": int,
-                "exec_ids": list,
-                "oracle_signals": list,
-                "correlation_id": str,
-                "oracle_expect": dict,
-                "enables": list,
-                "cvss_vector": str,
-                "cwe_ids": list,
-            },
+            "so the report can cite them; omit only if genuinely no CWE applies. ALWAYS include "
+            "remediation: two or three sentences of concrete, code-level fix guidance for THIS bug "
+            "on THIS endpoint (not generic advice) — it is the first thing the report's reader "
+            "looks for. When the finding was proven while acting as a declared identity, set "
+            "identity to that name: an access-control finding is unreadable without it.",
+            REPORT_FINDING_SCHEMA,
             _report_finding,
         ),
         (
@@ -554,6 +462,8 @@ async def run_sdk_agent(
     tool_calls = 0
     summary = ""
     transcript: list[str] = []
+    cost_usd = 0.0
+    tokens = 0
     try:
         async for msg in query(prompt=task, options=opts):
             if isinstance(msg, AssistantMessage):
@@ -581,6 +491,12 @@ async def run_sdk_agent(
                 if getattr(msg, "result", None):
                     summary = msg.result
                     transcript.append(f"result {_head(msg.result)}")
+                # Real spend, straight from the SDK — never an estimate.
+                try:
+                    cost_usd += float(getattr(msg, "total_cost_usd", None) or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                tokens += _usage_tokens(getattr(msg, "usage", None))
     except Exception as exc:  # noqa: BLE001 - salvage partial work; only re-raise on a total loss
         transcript.append(f"error {_head(repr(exc))}")
         _log.warning("[%s] executor loop error: %s", progress.current_dispatch(), _head(repr(exc), 200))
@@ -603,4 +519,6 @@ async def run_sdk_agent(
         summary=summary,
         tool_calls=tool_calls,
         transcript=transcript,
+        cost_usd=cost_usd,
+        tokens=tokens,
     )

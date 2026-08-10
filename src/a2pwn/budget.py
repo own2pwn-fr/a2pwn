@@ -28,6 +28,13 @@ class DispatchBudget(BaseModel):
     # Cap on independent-verify attempts per finding key across phases; once exhausted a
     # persistently-unverifiable candidate is dropped from the verify queue (confirmed-only).
     max_verify_attempts: int = 2
+    # REAL spend ceilings, alongside the dispatch COUNT cap above. A dispatch count is a poor proxy
+    # for cost (one dispatch ranges from a few turns to 60 turns with a 150k-token compaction), so
+    # ``max_dispatches`` alone cannot bound what a run actually costs. Both are None by default,
+    # preserving the historical count-only behaviour. Accumulated spend lives in the master state's
+    # separate ``spent_usd``/``spent_tokens`` reducer channels, never on this object.
+    max_usd: float | None = None
+    max_tokens: int | None = None
     stopped: bool = False  # TaskStop kill switch (set by CLI signal / interrupt)
 
     def charge(self, n: int = 1) -> "DispatchBudget":
@@ -41,8 +48,30 @@ class DispatchBudget(BaseModel):
     # and the accumulating spend in a separate ``spent`` channel (an ``operator.add`` int), so the
     # LangGraph fan-out reducer can never overwrite the caps with a delta's defaults. The graph
     # routers use these, passing ``state["spent"]``.
-    def is_exhausted(self, spent: int) -> bool:
-        return self.stopped or STOP.is_set() or spent >= self.max_dispatches
+    def is_exhausted(self, spent: int, spent_usd: float = 0.0, spent_tokens: int = 0) -> bool:
+        """True when ANY hard stop applies: TaskStop, the dispatch count cap, or a real spend cap.
+
+        ``spent_usd``/``spent_tokens`` default to 0 so every existing call site keeps its exact
+        prior meaning (dispatch-count-only) — the cost ceilings simply never fire when the caller
+        does not track them.
+        """
+        if self.stopped or STOP.is_set() or spent >= self.max_dispatches:
+            return True
+        if self.max_usd is not None and spent_usd >= self.max_usd:
+            return True
+        return self.max_tokens is not None and spent_tokens >= self.max_tokens
+
+    def overspend_reason(self, spent: int, spent_usd: float = 0.0, spent_tokens: int = 0) -> str:
+        """Why the run stopped, for the operator-facing log/report ("" when it has not)."""
+        if self.stopped or STOP.is_set():
+            return "operator stop (Ctrl-C)"
+        if spent >= self.max_dispatches:
+            return f"dispatch cap reached ({spent}/{self.max_dispatches})"
+        if self.max_usd is not None and spent_usd >= self.max_usd:
+            return f"cost cap reached (${spent_usd:.2f}/${self.max_usd:.2f})"
+        if self.max_tokens is not None and spent_tokens >= self.max_tokens:
+            return f"token cap reached ({spent_tokens}/{self.max_tokens})"
+        return ""
 
     def clamp(self, tasks: list, spent: int) -> list:
         """Cap a phase's parallel Sends to the batch width AND the remaining hard budget, so a
