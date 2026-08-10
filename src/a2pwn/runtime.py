@@ -31,7 +31,9 @@ from a2pwn.catalog import as_langchain_tools, load_skill, retrieve
 from a2pwn.collaborator import Collaborator
 from a2pwn.config import A2pwnConfig
 from a2pwn.graph import build_master_graph, build_subagent_graph
+from a2pwn.identity import IdentityStore
 from a2pwn.report import Report, build_report
+from a2pwn.throttle import Throttle
 from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools, recon_tools
 
 _log = logging.getLogger("a2pwn")
@@ -224,6 +226,13 @@ async def bootstrap(
             _log.warning("OOB listener failed to start (blind-OOB oracle disabled): %s", exc)
     fork = MasterFork(cfg.models)
 
+    # Engagement-wide policy objects, shared by every tool wrapper on BOTH executor paths so a
+    # refusal, a rate limit or an identity means the same thing regardless of which executor runs.
+    identities = IdentityStore(client, cfg.engagement.identities) if cfg.engagement.identities else None
+    throttle = Throttle(max_rps=cfg.max_rps, block_threshold=cfg.block_threshold)
+    client._identities = identities  # for the report/summary to describe what was used
+    client._throttle = throttle
+
     skills = _seed_skills(cfg)
     tools = (
         as_langchain_tools(skills, client, collab)
@@ -231,13 +240,21 @@ async def bootstrap(
         # burpwn_tools (CLAUDE.md: "the tool wrappers deterministically refuse traffic to
         # out-of-scope hosts") was never actually engaged in a real run on this (LangChain/API
         # backend) executor path — only burpwn's own server-side sandbox containment applied.
-        + burpwn_tools(client, cfg.engagement)
+        + burpwn_tools(
+            client,
+            cfg.engagement,
+            identities=identities,
+            throttle=throttle,
+            fuzz_cap=cfg.fuzz_max_requests,
+        )
         + oracle_tools(collab, client)
         + finding_tools(client)
         + recon_tools(cfg.engagement)
     )
 
-    subgraph = build_subagent_graph(cfg, client, fork, tools, collab, skills)
+    subgraph = build_subagent_graph(
+        cfg, client, fork, tools, collab, skills, identities=identities, throttle=throttle
+    )
     graph = build_master_graph(cfg, subgraph, client, checkpointer)
     return client, graph, checkpointer
 
@@ -340,12 +357,19 @@ async def run_engagement(
     *,
     tui: bool = False,
     formats: list[str] | None = None,
+    seed_tasks: list | None = None,
+    baseline: list | None = None,
 ) -> Report:
     """Drive the master graph to completion and build the evidence-grounded report.
 
     With ``tui=True`` a live :mod:`rich` dashboard runs concurrently, fed by the display-only
     :mod:`a2pwn.progress` event bus (which never touches graph state, so clean-history holds).
-    ``formats`` selects which report artifacts are written (md+json always)."""
+    ``formats`` selects which report artifacts are written (md+json always).
+
+    ``seed_tasks`` pre-loads the master's ``pending`` queue (used by ``a2pwn retest`` to seed one
+    reproduce-this-finding task per baseline finding, skipping the planner's first LLM call exactly
+    like the recon seed does); ``baseline`` is the prior run's findings the report diffs against.
+    """
     client: BurpwnClient | None = None
     checkpointer: BaseCheckpointSaver | None = None
     out_dir = run_out_dir(cfg, thread_id)
@@ -353,6 +377,11 @@ async def run_engagement(
     queue: asyncio.Queue | None = asyncio.Queue() if tui else None
     if queue is not None:
         progress.set_sink(queue)
+    # Durable event log for EVERY run (TUI or not): dispatches, tool calls, tool failures, model
+    # refusals and adjudication reject reasons. Without it a finished run can only be diagnosed by
+    # re-reading raw model transcripts, which is how three silently-dropped-finding bugs stayed
+    # hidden until a live engagement surfaced them.
+    progress.set_file_sink(out_dir / "run.jsonl")
     model_label = f"{cfg.models.executor.provider} · {cfg.models.executor.model or 'sonnet'}"
     targets_label = ", ".join(cfg.engagement.targets)
     models_meta = _model_meta(cfg)
@@ -364,6 +393,8 @@ async def run_engagement(
             max_dispatches=cfg.max_dispatches,
             max_batch_width=cfg.max_batch_width,
             max_phases=cfg.max_phases,
+            max_usd=cfg.max_usd,
+            max_tokens=cfg.max_tokens,
         )
         install_stop_handler(budget)
 
@@ -372,7 +403,7 @@ async def run_engagement(
             "objective": objective,
             "budget": budget,
             "history": [],
-            "pending": [],
+            "pending": list(seed_tasks or []),
             "deferred": [],
             "dispatch_results": [],
             "findings": [],
@@ -382,6 +413,8 @@ async def run_engagement(
             "round": 0,
             "continuations": 0,
             "spent": 0,
+            "spent_usd": 0.0,
+            "spent_tokens": 0,
         }
 
         async def _drive_loop() -> None:
@@ -416,6 +449,7 @@ async def run_engagement(
             else:
                 await _drive_loop()
             final = (await graph.aget_state(config)).values
+            throttle = getattr(client, "_throttle", None)
             return await build_report(
                 final,
                 client,
@@ -424,6 +458,8 @@ async def run_engagement(
                 started_at=started_at,
                 duration_secs=time.monotonic() - t0,
                 formats=formats,
+                traffic=throttle.stats() if throttle is not None else None,
+                baseline=baseline,
             )
 
         if queue is not None:
@@ -451,6 +487,7 @@ async def run_engagement(
     finally:
         if queue is not None:
             progress.clear_sink()
+        progress.close_file_sink()
         # Close each subsystem independently so one failing close never orphans the other's worker
         # thread. The checkpoint is already durable, so the run stays resumable by thread_id.
         if client is not None:

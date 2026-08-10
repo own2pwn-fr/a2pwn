@@ -50,6 +50,8 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
         enables: list[str] | None = None,
         cvss_vector: str | None = None,
         cwe_ids: list[str] | None = None,
+        remediation: str | None = None,
+        identity: str | None = None,
     ):
         """Declare ONE proven candidate vulnerability, backed by captured burpwn flows.
 
@@ -69,7 +71,12 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
         ``cvss_vector`` (a CVSS 3.1 vector, e.g. ``"AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"`` — the
         report re-derives the numeric score from this string itself, your own score estimate is
         ignored) and ``cwe_ids`` (e.g. ``["CWE-306"]``) so the report can cite them; omit only if
-        genuinely no CWE applies.
+        genuinely no CWE applies. ALWAYS include ``remediation``: two or three sentences of
+        concrete, code-level fix guidance for THIS bug on THIS endpoint (not generic advice) — it
+        is the first thing the report's reader looks for. When the finding was proven while acting
+        as a declared identity, set ``identity`` to that name: an access-control finding is
+        unreadable without it ("A reached B's order" means nothing if the report never says who A
+        and B were).
         """
         flow_ids = list(flow_ids or [])
         tag = tag or vuln_class
@@ -106,6 +113,8 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
             enables=list(enables or []),
             cvss_vector=cvss_vector,
             cwe_ids=list(cwe_ids or []),
+            remediation=remediation,
+            identity=identity,
         )
         summary = (
             f"recorded candidate {finding.key} (severity={finding.severity}, "

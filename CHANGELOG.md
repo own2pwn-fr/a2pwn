@@ -8,6 +8,75 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Named identities — authenticated testing, and the `two_identity` oracle made reachable.** The
+  single largest gap in the tool: `EngagementSpec` carried no way to supply a credential, so the
+  whole authenticated surface was untestable and five skills built on it (`access-control`,
+  `idor-bola`, `jwt-auth`, `csrf`, `authentication`) could only fire if the executor happened to
+  self-register accounts. The `two_identity` oracle is written around an attacker **A** reaching
+  owner **B**'s object with an unauthenticated **C** as the negative control — three identities
+  nothing could provide. `IdentitySpec` now declares identities with static headers/cookies, a
+  replay `login` recipe (one HTTP request through the sandbox, regex capture off the response, a
+  header template to inject), or a `browser_login` Playwright sequence for JS/SPA/OAuth flows that
+  cannot be replayed as raw HTTP. **The burpwn-is-the-only-egress invariant holds for all three**:
+  the browser runs inside `burpwn exec`, so Chromium boots in the sandbox network namespace and
+  every request it makes is proxied and captured like any other. New `a2pwn.identity` resolves
+  lazily, caches, shares one login across a parallel fan-out (per-name lock), and invalidates on a
+  401/403 so a session expiring mid-engagement self-heals instead of turning every later probe into
+  a false "access control held" negative. Exposed as `as_identity` on `burpwn_exec`/`burpwn_req_replay`
+  plus new `identity_list` / `identity_request` tools, on **both** executor paths.
+- **Scope carve-outs (`exclude`, `--exclude`).** The allow-list was the only scope primitive, but
+  real scopes are stated as "`*.example.com` **except** these" — and since a2pwn now discovers hosts
+  by itself (subdomain enumeration seeded at bootstrap, previous release), an allow-list-only model
+  would happily queue a host the client explicitly carved out. Entries are host globs
+  (`legacy.example.com`, `*.internal.example.com`), URL path subtrees
+  (`https://app.example.com/admin`) or bare path globs (`/admin/billing`). Exclusions are checked
+  after the allow-list and always win. Path matching respects segment boundaries, so `/admin` does
+  not carve out an unrelated `/administration`.
+- **Real spend ceilings (`--max-usd`, `--max-tokens`).** `max_dispatches` counts dispatches, which
+  is a poor proxy for cost — one dispatch is anywhere from 3 turns to 60 with a 150k-token
+  compaction, so two runs at the same cap can differ by an order of magnitude. (The TUI even
+  labelled the dispatch bar "cost cap", which it was not.) `MasterState` gains `spent_usd` /
+  `spent_tokens` `operator.add` channels alongside `spent`, fed from the SDK's own `ResultMessage`
+  (`total_cost_usd` / `usage`) — never an estimate. Both are enforced by the same routers as the
+  dispatch cap and reported in md/html/json.
+- **Traffic policy: `--max-rps`, `--fuzz-max-requests`, and a blocked-target circuit breaker**
+  (`a2pwn.throttle`). `concurrency`/`delay_ms` previously existed only as Intruder parameters the
+  model chose for itself, so nothing bounded the aggregate rate across a parallel fan-out. More
+  importantly: once a WAF answers 429/403 to everything, every oracle legitimately fails to
+  re-derive, every candidate is rejected, and the run spends its remaining budget producing a
+  0-finding report **indistinguishable from a genuinely secure target**. The breaker trips after a
+  run of consecutive WAF-shaped blocks, refuses further target-facing calls with an explanation the
+  model can act on, and the report carries a loud "TESTING WAS BLOCKED — the absence of findings is
+  NOT evidence of security" banner. A plain 403 without a WAF body signature deliberately does not
+  count, since healthy access-control testing produces those constantly by design.
+- **`a2pwn retest --baseline <report.json|run>`** — the second half of the pentest cycle, which
+  `run` alone could not express. Seeds one dispatch per baseline finding (deterministic: no baseline
+  finding can be quietly skipped because the planner judged it uninteresting), re-derives each
+  through the same fail-closed oracle kernel, and reports the delta. Findings that no longer
+  reproduce are reported as **"fixed or unreproducible"**, never flatly as fixed: a moved endpoint
+  or an expired test credential is indistinguishable from a real fix, and signing a live bug off as
+  remediated is the one mistake this command must not make.
+- **Declarative engagement files (`--config engagement.yaml`).** Flags stopped scaling at a 25-host
+  scope (the pain that drove the subdomain-enumeration work, only half-solved by it), and
+  credentials must not go in shell history or the process table. Every key mirrors a flag and an
+  explicit flag still wins; an unknown top-level key is an **error**, because a typo'd `exlude:`
+  silently widening the tested scope is precisely what the file exists to prevent. Identities are
+  validated at load time, so a malformed credential block fails before the authorization gate and
+  before any model spend.
+- **Durable `run.jsonl` for every run** — dispatches, tool calls, tool failures, model refusals and
+  each adjudication's **reject reason**, written whether or not the TUI is on. The event bus was
+  display-only, which is why the three silently-dropped-finding bugs fixed last release could only
+  be found by re-reading raw model transcripts by hand.
+- **`remediation` and `identity` on every finding.** The report carried severity, CVSS, CWE and a
+  reproduction — everything needed to *confirm* a bug and nothing about closing it, which is the
+  first thing its reader looks for. `identity` names who the finding was proven as: "A reached B's
+  order" is unreadable if the report never says who A and B were. Rendered in md/html and exported
+  in sarif.
+- **Five new skills** (37 total): `recon/subdomain-takeover` (directly complementary to the
+  automatic subdomain enumeration — recon output *is* the vulnerability there), `web/oauth-oidc`,
+  `web/mass-assignment`, `web/websocket`, `web/api-business-logic`. The last three are the API
+  classes the `state_change` and `two_identity` oracles could already prove but no skill taught.
+
 - **Automatic subdomain enumeration, seeded before the first planning phase.** Previously the
   master only ever saw whatever single hostname the operator typed — auditing
   `*.thinginthefuture.com` this session needed the operator to manually enumerate subdomains via
@@ -26,12 +95,10 @@ All notable changes to this project are documented here. The format is based on
   assembly called `burpwn_tools(client)` without `engagement`, so the documented Python-level
   scope refusal ("the tool wrappers deterministically refuse traffic to out-of-scope hosts") was
   never actually engaged in a real run on that executor path — only burpwn's own server-side
-  sandbox containment applied. Now wired as `burpwn_tools(client, cfg.engagement)`. **Still open,
-  not fixed here:** the default `claude-code`/native-SDK executor path (`sdk_agent.py`) has no
-  client-side scope check on `burpwn_exec`/`req_replay`/`fuzz` at all (only the new
-  `propose_targets` tool got one, since it was being added fresh) — real containment there is
-  burpwn's own sandbox only. Retrofitting the same defense-in-depth to every SDK tool wrapper is a
-  larger, separate task.
+  sandbox containment applied. Now wired as `burpwn_tools(client, cfg.engagement)`. The follow-up
+  this entry flagged as still open — the default `claude-code`/native-SDK executor path
+  (`sdk_agent.py`) having no client-side scope check at all — **is closed in this same release**;
+  see "The client-side scope refusal was OFF on the default backend" under Fixed.
 
 - **CVSS 3.1 + CWE on every finding, deterministic repro in every report format.** Writing a
   client-facing report by hand after a real engagement required manually computing CVSS scores and
@@ -45,6 +112,28 @@ All notable changes to this project are documented here. The format is based on
   failure degrades to no repro block, never drops the finding). Rendered in md/html (new CVSS/CWE
   column + repro sections) and sarif (`cvssScore`/`cweIds`/the GitHub-convention
   `security-severity` property).
+
+### Changed
+
+- **One tool definition, two adapters** (new `a2pwn.toolcore`). The LangChain wrappers and the
+  native-SDK wrappers were independent hand-maintained copies of the same surface, and every
+  divergence shipped as a bug — the `state_change` allow-list, the fuzz-contract fixes written
+  twice, and the scope refusal below. Both are now thin adapters over one `ToolSpec` list, and
+  `tests/test_tool_parity.py` asserts they still agree (tool names, `report_finding` fields, oracle
+  allow-lists vs the `Finding` model *and* the dispatcher).
+- **`graph.py` split along the fork boundary** into `graph.py` (master state, routers, fork
+  boundary; 621 lines) and `subgraph.py` (everything that dies with one dispatch: clarify Q&A, the
+  ReAct loop, the verifier critique, the fail-closed adjudicator; 559 lines), down from a single
+  1117-line file. `graph.py` re-exports the sub-agent names, so existing imports are unaffected.
+
+### Fixed
+
+- **The client-side scope refusal was OFF on the default backend.** Noted as open last release and
+  now closed: `sdk_agent.py` — the `claude-code`/native-SDK path, i.e. what a normal run uses — had
+  no scope check on `burpwn_exec`/`req_replay`/`fuzz` at all, so the containment documented in
+  CLAUDE.md ("the tool wrappers deterministically refuse traffic to out-of-scope hosts") was not
+  actually running in a real engagement; only burpwn's own server-side sandbox applied. Both paths
+  now share one `ScopeGuard`, and the parity test pins it.
 
 ### Fixed (lessons from a live full-scope engagement)
 

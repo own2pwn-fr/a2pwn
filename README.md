@@ -119,8 +119,77 @@ OTP/tokens, TOCTOU) — which are surfaced for manual re-check instead of being 
 ```bash
 uv run a2pwn list                        # prior runs: verified/confirmed counts, severity tally
 uv run a2pwn resume --name <run>         # resume an interrupted run from its checkpoint
+uv run a2pwn retest --baseline <run>     # re-check a prior run's findings after remediation
 uv run a2pwn run ... --max-wall-secs 3600  # optional whole-engagement wall-clock cap
 ```
+
+Every run also writes `run.jsonl` next to the report — a durable event log of dispatches, tool
+calls, tool failures, model refusals and each adjudication's reject reason. It is written whether or
+not the TUI is on, so a finished run stays answerable after the fact.
+
+### Engagement files, scope carve-outs and identities
+
+Flags stop scaling at a real scope, and credentials must not go in shell history. `--config` takes a
+YAML engagement file; explicit flags still override it, and an unknown key is an error rather than a
+silent scope change.
+
+```yaml
+# engagement.yaml
+name: acme-q3
+objective: audit the customer portal end to end
+targets: [https://app.example.com]
+in_scope: [example.com]
+exclude:                       # always wins over the allow-list
+  - legacy.example.com         # host (and its subdomains)
+  - "*.internal.example.com"   # host glob
+  - /admin/billing             # path subtree, every in-scope host
+
+identities:                    # what makes the access-control classes reachable
+  - name: alice                # static credentials you already hold
+    headers: {Authorization: "Bearer eyJ…"}
+  - name: bob                  # or a replay login through the sandbox
+    login:
+      url: https://app.example.com/api/login
+      body: '{"user":"bob","pass":"…"}'
+      extract: {token: '"token":"([^"]+)"'}
+      inject: {Authorization: "Bearer {token}"}
+  - name: carol                # or a headless-browser login for SPA/OAuth flows
+    browser_login:
+      url: https://app.example.com/login
+      username: carol@example.com
+      password: "…"
+  - name: anon                 # the two_identity negative control
+    anonymous: true
+
+max_usd: 25                    # REAL spend ceiling, not a dispatch count
+max_rps: 5                     # global traffic throttle, enforced at the tool layer
+```
+
+```bash
+uv run a2pwn run --config engagement.yaml --active-exploit --yes
+```
+
+Identities are resolved lazily, cached, shared across a parallel fan-out, and re-authenticated on a
+401/403 so a long engagement survives session expiry. The browser login runs Playwright **inside**
+`burpwn exec`, so Chromium boots in the sandbox network namespace and its traffic is captured like
+everything else — the "burpwn is the only egress" invariant holds. It needs Playwright available to
+the sandbox (`uv pip install playwright && playwright install chromium`).
+
+Declaring at least two authenticated identities plus `anon` is what makes the `two_identity` oracle
+usable: A reaching B's object, B fetching its own (ground truth), and the anonymous control being
+denied (which rules out a merely public resource).
+
+### Spend and traffic ceilings
+
+`--max-dispatches` counts dispatches, which is a poor proxy for cost — one dispatch ranges from a few
+turns to 60 with a 150k-token compaction. `--max-usd` / `--max-tokens` bound the **real** spend
+reported by the backend; past either, the report is built from what was proven. `--max-rps` throttles
+all target-facing traffic, and `--fuzz-max-requests` clamps one Intruder attack (the clamp is
+reported, never silent).
+
+a2pwn also trips a circuit breaker after a run of consecutive 429/403-with-WAF-signature responses,
+stops probing, and says so loudly in the report. That distinction matters: a blocked run and a clean
+target both produce zero findings, and only one of them means the target is secure.
 
 `a2pwn run` also self-guards: every burpwn call is bounded by a timeout, a crashed sandbox is
 respawned, and the first Ctrl-C finalizes the report gracefully (a second forces the abort).
@@ -234,10 +303,11 @@ MASTER graph  (dispatch-only; never touches a target)
 
 `0.1.0` — early, but the full loop works end to end: the orchestration core, native-SDK executor,
 backends, burpwn integration, deterministic oracles, catalog, continuation judge, auto-compaction,
-reporting and CLI are in place and exercised by 250+ tests (clean-history / reconciliation /
-capture-alarm / fail-closed-adjudication invariants included). Validated against a live sanctioned lab
-(see [Proof it works](#proof-it-works--a-real-engagement)). The seed skill library is being expanded
-toward full depth on each class.
+identities, scope carve-outs, spend/traffic ceilings, the retest cycle, reporting and CLI are in
+place and exercised by 500+ tests (clean-history / reconciliation / capture-alarm /
+fail-closed-adjudication / executor-path-parity invariants included). Validated against a live
+sanctioned lab (see [Proof it works](#proof-it-works--a-real-engagement)). The seed skill library is
+being expanded toward full depth on each class.
 
 ## License
 

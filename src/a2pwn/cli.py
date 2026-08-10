@@ -84,6 +84,30 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+#: What each overridable flag looks like when the operator did NOT pass it. typer cannot tell an
+#: omitted flag from one passed at its default, so without this every engagement-file setting would
+#: be silently clobbered by a default the operator never typed.
+_FLAG_DEFAULTS = {
+    "targets": [],
+    "objective": "",
+    "exclude": [],
+    "active_exploit": False,
+    "dos": False,
+    "max_phases": 12,
+    "max_dispatches": 200,
+    "fuzz_max_requests": 5000,
+    "format": "md,json,sarif,html",
+}
+
+
+def _merge_config(config_path: str | None, cli_values: dict) -> dict:
+    """Engagement file (if any) merged under the explicitly-passed CLI flags."""
+    from a2pwn.runconfig import load_engagement_file, merge
+
+    file_values = load_engagement_file(config_path) if config_path else {}
+    return merge(file_values, cli_values, _FLAG_DEFAULTS)
+
+
 def _use_tui(*, plain: bool, verbose: bool, step_through: bool = False) -> bool:
     # The live TUI owns the terminal, so only enable it on an interactive stdout that isn't verbose
     # or step-through (which need the raw log / an input prompt).
@@ -119,9 +143,12 @@ def _print_run_plan(cfg: A2pwnConfig, objective: str, out_dir, *, compact: bool)
     if compact:
         typer.echo(
             f"[run-plan] targets={','.join(eng.targets)} "
+            f"exclude={','.join(eng.exclude) or 'none'} "
+            f"identities={','.join(i.name for i in eng.identities) or 'none'} "
             f"active_exploit={'ON' if ae else 'off'} dos={'on' if eng.dos_allowed else 'off'} "
             f"executor={exec_lbl} verifier={ver_lbl} "
             f"max_phases={cfg.max_phases} max_dispatches={cfg.max_dispatches} "
+            f"max_usd={cfg.max_usd or '-'} max_rps={cfg.max_rps or '-'} "
             f"executor_max_turns={cfg.executor_max_turns} out={out_dir}"
         )
         return
@@ -134,6 +161,15 @@ def _print_run_plan(cfg: A2pwnConfig, objective: str, out_dir, *, compact: bool)
     grid.add_column(justify="right", style="dim", no_wrap=True)
     grid.add_column()
     grid.add_row("targets", ", ".join(eng.targets))
+    if eng.exclude:
+        # Rendered in red: an operator scanning this panel must SEE the carve-outs, because the
+        # cost of a missed exclusion is testing something the client did not authorise.
+        grid.add_row("excluded", Text(", ".join(eng.exclude), style="bold red"))
+    if eng.identities:
+        grid.add_row(
+            "identities",
+            ", ".join(f"{i.name}{' (anon)' if i.anonymous else ''}" for i in eng.identities),
+        )
     grid.add_row("objective", _truncate(objective, 88))
     grid.add_row(
         "active-exploit",
@@ -146,8 +182,12 @@ def _print_run_plan(cfg: A2pwnConfig, objective: str, out_dir, *, compact: bool)
         "caps",
         f"max_phases={cfg.max_phases}  max_dispatches={cfg.max_dispatches}  "
         f"executor_max_turns={cfg.executor_max_turns}"
-        + (f"  max_wall_secs={cfg.max_wall_secs}" if cfg.max_wall_secs else ""),
+        + (f"  max_wall_secs={cfg.max_wall_secs}" if cfg.max_wall_secs else "")
+        + (f"  max_usd=${cfg.max_usd}" if cfg.max_usd else "")
+        + (f"  max_tokens={cfg.max_tokens}" if cfg.max_tokens else ""),
     )
+    if cfg.max_rps:
+        grid.add_row("rate limit", f"{cfg.max_rps} req/s (enforced at the tool layer)")
     grid.add_row("output", str(out_dir))
     Console().print(Panel(grid, title="Run plan", title_align="left", border_style="magenta"))
 
@@ -181,8 +221,30 @@ def _emit_report(report, cfg: A2pwnConfig, thread_id: str) -> None:
 
 @app.command()
 def run(
-    target: list[str] = typer.Option(..., "--target", "-t", help="In-scope target URL/host (repeatable)."),
-    objective: str = typer.Option(..., "--objective", "-o", help="Engagement objective for the planner."),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Engagement YAML file (targets, exclusions, identities, caps). Explicit flags override it. "
+        "This is the only sane way to declare credentials — a password in a flag lands in shell history.",
+    ),
+    target: list[str] = typer.Option(
+        [], "--target", "-t", help="In-scope target URL/host (repeatable). Required unless --config sets it."
+    ),
+    objective: str = typer.Option(
+        "",
+        "--objective",
+        "-o",
+        help="Engagement objective for the planner. Required unless --config sets it.",
+    ),
+    exclude: list[str] = typer.Option(
+        [],
+        "--exclude",
+        "-x",
+        help="Carve OUT of scope (repeatable): a host glob (legacy.example.com, *.internal.example.com), "
+        "a URL path subtree (https://app.example.com/admin), or a bare path glob (/admin/billing). "
+        "Always wins over the allow-list.",
+    ),
     name: str | None = typer.Option(
         None,
         "--name",
@@ -220,6 +282,24 @@ def run(
         "--max-wall-secs",
         help="Wall-clock deadline (seconds) for the whole engagement; past it the report is built from proven findings.",
     ),
+    max_usd: float | None = typer.Option(
+        None,
+        "--max-usd",
+        help="REAL cost ceiling in dollars. Unlike --max-dispatches (a count), this bounds what the "
+        "run actually spends; past it the report is built from proven findings.",
+    ),
+    max_tokens: int | None = typer.Option(None, "--max-tokens", help="Real token ceiling for the run."),
+    max_rps: float | None = typer.Option(
+        None,
+        "--max-rps",
+        help="Throttle ALL target-facing traffic to this many requests per second (enforced in the "
+        "tool layer, not prompt guidance).",
+    ),
+    fuzz_max_requests: int = typer.Option(
+        5000,
+        "--fuzz-max-requests",
+        help="Cap on payloads per Intruder attack (clamped, and the clamp is reported).",
+    ),
     format: str = typer.Option(
         "md,json,sarif,html",
         "--format",
@@ -230,6 +310,50 @@ def run(
     plain: bool = typer.Option(False, "--plain", help="Disable the live TUI; log telemetry instead."),
 ) -> None:
     """Run an autonomous, adversarially-verified engagement against the given targets."""
+    try:
+        settings = _merge_config(
+            config,
+            {
+                "targets": list(target),
+                "objective": objective,
+                "exclude": list(exclude),
+                "active_exploit": active_exploit,
+                "dos": dos,
+                "oob_listener": oob_listener,
+                "executor_model": executor_model,
+                "verifier_model": verifier_model,
+                "max_phases": max_phases,
+                "max_dispatches": max_dispatches,
+                "max_wall_secs": max_wall_secs,
+                "max_usd": max_usd,
+                "max_tokens": max_tokens,
+                "max_rps": max_rps,
+                "fuzz_max_requests": fuzz_max_requests,
+                "checkpoint_uri": checkpoint_uri,
+                "format": format,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - config errors are operator errors, reported cleanly
+        typer.echo(f"Invalid engagement file: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    target = settings.get("targets") or []
+    objective = settings.get("objective") or ""
+    if not target:
+        typer.echo("No targets: pass --target (repeatable) or set `targets:` in --config.", err=True)
+        raise typer.Exit(2)
+    if not objective:
+        typer.echo("No objective: pass --objective or set `objective:` in --config.", err=True)
+        raise typer.Exit(2)
+    active_exploit = bool(settings.get("active_exploit"))
+    dos = bool(settings.get("dos"))
+    oob_listener = settings.get("oob_listener")
+    executor_model = settings.get("executor_model")
+    verifier_model = settings.get("verifier_model")
+    checkpoint_uri = settings.get("checkpoint_uri")
+    format = settings.get("format") or "md,json,sarif,html"
+    if name is None:
+        name = settings.get("name")
     if name is None:
         # A hardcoded default ("a2pwn") meant every unnamed run silently resumed/mixed state with
         # whatever prior unnamed run's checkpoint existed — observed live as stray "Deserializing
@@ -243,7 +367,9 @@ def run(
     engagement = EngagementSpec(
         name=name,
         targets=target,
-        in_scope=list(target),
+        in_scope=list(settings.get("in_scope") or target),
+        exclude=list(settings.get("exclude") or []),
+        identities=list(settings.get("identities") or []),
         authorization_acknowledged=False,  # set once the gate is acknowledged below
         active_exploit_allowed=active_exploit,
         dos_allowed=dos,
@@ -254,9 +380,14 @@ def run(
         cfg = A2pwnConfig(
             engagement=engagement,
             models=_build_models(executor_model, verifier_model),
-            max_phases=max_phases,
-            max_dispatches=max_dispatches,
-            max_wall_secs=max_wall_secs,
+            max_phases=int(settings.get("max_phases") or 12),
+            max_dispatches=int(settings.get("max_dispatches") or 200),
+            max_wall_secs=settings.get("max_wall_secs"),
+            max_usd=settings.get("max_usd"),
+            max_tokens=settings.get("max_tokens"),
+            max_rps=settings.get("max_rps"),
+            fuzz_max_requests=int(settings.get("fuzz_max_requests") or 5000),
+            block_threshold=int(settings.get("block_threshold") or 25),
             checkpoint_uri=checkpoint_uri,
             disclaimer_ack=False,
             step_through=step_through,
@@ -425,6 +556,213 @@ def resume(
         raise typer.Exit(1) from exc
 
     _emit_report(report, cfg, name)
+
+
+def _load_baseline(baseline: str) -> tuple[list, dict]:
+    """Load a prior ``report.json`` (by path or by run name) into (findings, report dict)."""
+    import json
+
+    from a2pwn.models import Finding
+
+    path = Path(baseline)
+    if not path.exists():
+        prior = next((r for r in list_runs() if r["thread_id"] == baseline), None)
+        if prior is None:
+            raise typer.BadParameter(
+                f"no such baseline: {baseline!r} is neither a report.json path nor a known run "
+                "(see `a2pwn list`)."
+            )
+        path = Path(prior["path"]) / "report.json"
+    if not path.exists():
+        raise typer.BadParameter(f"baseline {path} does not exist")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    findings = [Finding(**f) for f in (data.get("findings") or [])]
+    # A retest must also chase the weaker tier: a confirmed-but-not-independently-reproduced
+    # finding is exactly the kind a client remediates and wants re-checked.
+    findings += [Finding(**f) for f in (data.get("confirmed_findings") or [])]
+    return findings, data
+
+
+def _retest_tasks(findings: list) -> list:
+    """One reproduce-this-finding task per baseline finding, seeded straight into ``pending``.
+
+    Seeding concrete tasks (rather than describing the retest in the objective and hoping the
+    planner derives them) means the first phase is deterministic: every baseline finding gets its
+    own dispatch and its own fail-closed oracle re-derivation, and none can be quietly skipped
+    because the planner judged it uninteresting.
+    """
+    from a2pwn.models import TaskSpec
+
+    tasks = []
+    for f in findings:
+        tasks.append(
+            TaskSpec(
+                task=(
+                    f"RETEST: determine whether {f.vuln_class} on {f.target} "
+                    f"(param {f.param or 'n/a'}) is still exploitable after remediation. Reproduce "
+                    f"it exactly as originally proven, then re-run the {f.oracle_kind} oracle. If it "
+                    "no longer reproduces, try the obvious bypasses of a shallow fix (encoding, "
+                    "casing, alternate verb/route, parameter pollution) before concluding it is "
+                    "fixed. Report a finding ONLY if it still reproduces with captured evidence.\n"
+                    f"Original evidence: {f.evidence[:600]}"
+                ),
+                intent="verify",
+                target=f.target,
+                hints=[f"baseline_key={f.key}", f"oracle={f.oracle_kind}", f"severity={f.severity}"],
+            )
+        )
+    return tasks
+
+
+@app.command()
+def retest(
+    baseline: str = typer.Option(
+        ...,
+        "--baseline",
+        "-b",
+        help="Prior report.json path, or a run name from `a2pwn list`, to re-check after remediation.",
+    ),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Engagement YAML (identities/exclusions). Reuses the baseline's targets if omitted.",
+    ),
+    name: str | None = typer.Option(None, "--name", help="Name for this retest run (default: timestamped)."),
+    active_exploit: bool = typer.Option(
+        False, "--active-exploit", help="Allow active exploitation without a per-dispatch pause."
+    ),
+    executor_model: str | None = typer.Option(None, "--executor-model", help="Override the executor model."),
+    verifier_model: str | None = typer.Option(None, "--verifier-model", help="Override the verifier model."),
+    max_phases: int = typer.Option(6, "--max-phases", help="Hard cap on master planning phases."),
+    max_dispatches: int = typer.Option(60, "--max-dispatches", help="Global dispatch budget ceiling."),
+    max_usd: float | None = typer.Option(None, "--max-usd", help="Real cost ceiling in dollars."),
+    max_rps: float | None = typer.Option(
+        None, "--max-rps", help="Throttle target traffic (requests/second)."
+    ),
+    format: str = typer.Option("md,json,sarif,html", "--format", help="Report artifacts to write."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactively acknowledge authorization."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose telemetry logging."),
+    plain: bool = typer.Option(False, "--plain", help="Disable the live TUI."),
+) -> None:
+    """Re-check a prior engagement's findings after remediation, and report the delta.
+
+    This is the pentest cycle's second half, which `run` alone could not express: seed one dispatch
+    per baseline finding, re-derive each through the same fail-closed oracle kernel, and report what
+    is STILL VULNERABLE versus what could no longer be reproduced. Findings that no longer reproduce
+    are reported as "fixed or unreproducible", never flatly as "fixed" — a moved endpoint or an
+    expired credential looks identical to a real fix, and signing a live bug off as remediated is
+    the one mistake this command must not make.
+    """
+    baseline_findings, baseline_data = _load_baseline(baseline)
+    if not baseline_findings:
+        typer.echo(f"Baseline {baseline!r} has no findings to retest.", err=True)
+        raise typer.Exit(2)
+
+    try:
+        settings = _merge_config(
+            config,
+            {
+                "active_exploit": active_exploit,
+                "executor_model": executor_model,
+                "verifier_model": verifier_model,
+                "max_phases": max_phases,
+                "max_dispatches": max_dispatches,
+                "max_usd": max_usd,
+                "max_rps": max_rps,
+                "format": format,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Invalid engagement file: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    targets = list(settings.get("targets") or baseline_data.get("targets") or [])
+    if not targets:
+        typer.echo("Baseline records no targets; pass --config with `targets:`.", err=True)
+        raise typer.Exit(2)
+    if name is None:
+        name = f"retest-{datetime.now():%Y%m%d-%H%M%S}"
+
+    use_tui = _use_tui(plain=plain, verbose=verbose)
+    _init_logging(verbose=verbose, use_tui=use_tui)
+    formats = _parse_formats(settings.get("format") or format)
+    objective = (
+        f"Retest {len(baseline_findings)} finding(s) from the prior engagement "
+        f"'{baseline_data.get('engagement', baseline)}' and determine which remain exploitable."
+    )
+
+    engagement = EngagementSpec(
+        name=name,
+        targets=targets,
+        in_scope=list(settings.get("in_scope") or targets),
+        exclude=list(settings.get("exclude") or []),
+        identities=list(settings.get("identities") or []),
+        authorization_acknowledged=False,
+        active_exploit_allowed=bool(settings.get("active_exploit")),
+        session=name,
+    )
+    try:
+        cfg = A2pwnConfig(
+            engagement=engagement,
+            models=_build_models(settings.get("executor_model"), settings.get("verifier_model")),
+            max_phases=int(settings.get("max_phases") or 6),
+            max_dispatches=int(settings.get("max_dispatches") or 60),
+            max_usd=settings.get("max_usd"),
+            max_rps=settings.get("max_rps"),
+            disclaimer_ack=False,
+        )
+    except ValueError as exc:
+        typer.echo(f"Invalid configuration: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    out_dir = run_out_dir(cfg, name)
+    typer.echo(f"Retesting {len(baseline_findings)} finding(s) from {baseline!r} → {out_dir}")
+    _print_run_plan(cfg, objective, out_dir, compact=yes)
+
+    try:
+        ensure_burpwn_available()
+    except BurpwnMissingError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+    ack = _authorize(yes)
+    if not ack:
+        typer.echo("Authorization not confirmed. Aborting.", err=True)
+        raise typer.Exit(2)
+    cfg.disclaimer_ack = ack
+    cfg.engagement.authorization_acknowledged = ack
+
+    try:
+        report = asyncio.run(
+            run_engagement(
+                cfg,
+                objective,
+                thread_id=name,
+                tui=use_tui,
+                formats=formats,
+                seed_tasks=_retest_tasks(baseline_findings),
+                baseline=baseline_findings,
+            )
+        )
+    except BurpwnMissingError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+    _emit_report(report, cfg, name)
+    delta = report.retest or {}
+    still = delta.get("still_vulnerable") or []
+    gone = delta.get("fixed_or_unreproducible") or []
+    typer.echo("")
+    typer.echo(f"Retest delta vs {baseline!r}:")
+    typer.echo(f"  still vulnerable       : {len(still)}")
+    for key in still:
+        typer.echo(f"      ✗ {key}")
+    typer.echo(f"  fixed / unreproducible : {len(gone)}")
+    for key in gone:
+        typer.echo(f"      ✓ {key}")
+    if delta.get("new_since_baseline"):
+        typer.echo(f"  new since baseline     : {len(delta['new_since_baseline'])}")
 
 
 @app.command()
