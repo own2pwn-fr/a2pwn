@@ -481,6 +481,49 @@ def _make_plan_node(planner: Any):
     return _plan_node
 
 
+def task_signature(spec: TaskSpec) -> tuple[str, str, str]:
+    """Identity of a unit of work, for queue bookkeeping and repeat suppression.
+
+    Deliberately coarse — intent + target + the task text, case- and whitespace-normalised. Two
+    dispatches that differ only in prose phrasing are the same work, and re-running them burns
+    budget that the untested surface needs.
+    """
+    return (spec.intent, (spec.target or "").strip().lower(), " ".join(spec.task.lower().split()))
+
+
+def _drop_answered(pending: list[TaskSpec], answered: list[TaskSpec]) -> list[TaskSpec]:
+    """Remove one queue entry per returned dispatch, preserving duplicates that were not run."""
+    remaining = list(pending)
+    for spec in answered:
+        sig = task_signature(spec)
+        for i, queued in enumerate(remaining):
+            if task_signature(queued) == sig:
+                remaining.pop(i)
+                break
+    return remaining
+
+
+def _drop_already_dispatched(pending: list[TaskSpec], history: list[DispatchRecord]) -> list[TaskSpec]:
+    """Suppress re-queued work that a prior dispatch already carried out.
+
+    `next_hops` (cross-chain edges, `propose_targets` discoveries) and the continuation judge all
+    append straight into the queue with no memory of each other, so a host discovered twice, or a
+    chain edge re-emitted every time its origin finding is re-confirmed, used to be dispatched again
+    and again. Nothing in the code prevented it — the only guard was an English sentence in the
+    planner prompt.
+    """
+    seen = {task_signature(rec.result.spec) for rec in history if rec.result.spec is not None}
+    out: list[TaskSpec] = []
+    for spec in pending:
+        sig = task_signature(spec)
+        if sig in seen:
+            _log.info("dropping already-dispatched task: %s", spec.task)
+            continue
+        seen.add(sig)
+        out.append(spec)
+    return out
+
+
 async def _integrate_node(state: MasterState) -> dict:
     processed = len(state.get("history", []))
     new_results = state.get("dispatch_results", [])[processed:]
@@ -496,12 +539,22 @@ async def _integrate_node(state: MasterState) -> dict:
             DispatchRecord(
                 dispatch_id=r.dispatch_id,
                 kind=kind,
-                task=r.summary or r.dispatch_id,
+                # The REQUESTED task, not the result summary. History that only records outcomes
+                # cannot answer "what did we ask for and never get", which is precisely the
+                # question the continuation judge is asked to answer.
+                task=(r.spec.task if r.spec else None) or r.summary or r.dispatch_id,
                 result=r,
             )
         )
     next_hops = [h for r in new_results for h in r.next_hops]
-    pending_next = list(state.get("deferred", [])) + next_hops
+    # A phase dispatches at most `max_batch_width` tasks, and a phase with anything in the verify
+    # queue dispatches verifies ONLY. Rebuilding the queue as `deferred + next_hops` therefore threw
+    # away every task that was planned but not reached this phase — silently, so a run looked
+    # complete while whole planned tasks had simply evaporated. Carry the unanswered remainder.
+    answered = [r.spec for r in new_results if r.spec is not None]
+    leftover = _drop_answered(list(state.get("pending", [])), answered)
+    pending_next = leftover + list(state.get("deferred", [])) + next_hops
+    pending_next = _drop_already_dispatched(pending_next, state.get("history", []) + records)
     return {
         "history": records,
         "pending": pending_next,

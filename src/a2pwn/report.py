@@ -129,6 +129,14 @@ class Report(BaseModel):
     # --- engagement metadata (all optional; defaults keep old constructors valid) ---
     objective: str = ""
     targets: list[str] = Field(default_factory=list)
+    # Scope envelope, recorded so `a2pwn resume` can restore it. `resume` used to rebuild the
+    # EngagementSpec from `targets` alone, which silently dropped every `exclude` carve-out — a
+    # resumed run would happily test the hosts and paths the client had explicitly put off-limits.
+    in_scope: list[str] = Field(default_factory=list)
+    exclude: list[str] = Field(default_factory=list)
+    # Identity NAMES only. The credentials themselves are deliberately never written here: a report
+    # is a deliverable that gets mailed around, and `resume` re-supplies them from --config instead.
+    identity_names: list[str] = Field(default_factory=list)
     models: dict = Field(default_factory=dict)  # e.g. {"executor": ..., "verifier": ...}
     dispatches_spent: int = 0
     started_at: str = ""
@@ -298,6 +306,9 @@ async def build_report(
         har_paths=har_paths,
         objective=str(state.get("objective", "") or ""),
         targets=list(getattr(engagement, "targets", []) or []),
+        in_scope=list(getattr(engagement, "in_scope", []) or []),
+        exclude=list(getattr(engagement, "exclude", []) or []),
+        identity_names=[i.name for i in (getattr(engagement, "identities", []) or [])],
         models=dict(models or {}),
         dispatches_spent=int(state.get("spent", 0) or 0),
         cost_usd=round(float(state.get("spent_usd", 0.0) or 0.0), 4),

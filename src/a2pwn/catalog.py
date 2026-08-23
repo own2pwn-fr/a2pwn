@@ -165,6 +165,34 @@ def _san(tag: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (tag or "").lower())
 
 
+def all_cards() -> list[SkillCard]:
+    """Every skill card on disk, name-ordered — the catalog with no relevance filter.
+
+    `retrieve` is a *relevance* prefilter: it only makes sense when the query describes the work.
+    Seeding an engagement is not that situation. The engagement query is hostnames, which share no
+    vocabulary with a methodology corpus, so FTS scored 36 of the 37 skills to zero and the executor
+    was dispatched with `burpwn` alone — the whole SQLi/XSS/SSRF/IDOR/JWT methodology silently absent
+    from every real run. Skills are cheap to seed (one zero-arg tool each, ~800 chars of description;
+    the SKILL.md body is only read when the model calls the tool), so the correct seed is all of them.
+    """
+    root = _skills_root()
+    cards: list[SkillCard] = []
+    for md in sorted(root.rglob("SKILL.md")):
+        meta, _ = parse_frontmatter(md.read_text(encoding="utf-8"))
+        if "name" not in meta or "description" not in meta:
+            continue
+        cards.append(
+            SkillCard(
+                name=meta["name"],
+                description=meta["description"],
+                tags=meta.get("tags", []) or [],
+                path=str(md.relative_to(root)),
+            )
+        )
+    cards.sort(key=lambda c: c.name)
+    return cards
+
+
 def retrieve(task: str, tags: list[str] = [], k: int = 12) -> list[SkillCard]:  # noqa: B006
     """FTS5/tag prefilter over ``_index.sqlite``; fall back to frontmatter scan if absent."""
     root = _skills_root()

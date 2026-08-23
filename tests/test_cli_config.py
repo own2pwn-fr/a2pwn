@@ -170,3 +170,58 @@ def test_a_typo_in_the_engagement_file_aborts_before_anything_runs(captured, tmp
     assert result.exit_code == 2
     assert "Invalid engagement file" in _text(result)
     assert "cfg" not in captured
+
+
+def _prior_run(monkeypatch, **over):
+    """Stub `list_runs` with one finished engagement's recorded metadata."""
+    info = {
+        "thread_id": "acme-run",
+        "targets": ["https://app.example.com"],
+        "in_scope": ["https://app.example.com"],
+        "exclude": ["legacy.example.com", "/admin/billing"],
+        "identity_names": [],
+        "objective": "audit the shop",
+    }
+    info.update(over)
+    monkeypatch.setattr(cli, "list_runs", lambda: [info])
+
+
+def test_resume_restores_the_scope_carve_outs(captured, monkeypatch):
+    """Regression: `resume` rebuilt the EngagementSpec from `targets` alone.
+
+    Every `--exclude` carve-out was dropped, so a resumed run re-authorised exactly the hosts and
+    paths the client had put off-limits — the one direction a scope mistake must never go.
+    """
+    _prior_run(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", "--name", "acme-run", "--yes", "--plain"])
+
+    assert result.exit_code == 0, result.output
+    eng = captured["cfg"].engagement
+    assert eng.exclude == ["legacy.example.com", "/admin/billing"]
+    assert eng.in_scope == ["https://app.example.com"]
+
+
+def test_resume_warns_when_identities_cannot_be_restored(captured, monkeypatch):
+    """Credentials are never written to report.json, so a resume without --config loses the
+    authenticated surface. That has to be said out loud, not discovered in an empty report."""
+    _prior_run(monkeypatch, identity_names=["alice", "bob"])
+
+    result = runner.invoke(cli.app, ["resume", "--name", "acme-run", "--yes", "--plain"])
+
+    assert result.exit_code == 0, result.output
+    assert "alice, bob" in result.output
+    assert "--config" in result.output
+
+
+def test_resume_restores_identities_from_the_engagement_file(captured, monkeypatch, tmp_path):
+    _prior_run(monkeypatch, identity_names=["alice"])
+    path = _engagement_file(
+        tmp_path,
+        "identities:\n  - name: alice\n    headers: {Authorization: 'Bearer t'}\n",
+    )
+
+    result = runner.invoke(cli.app, ["resume", "--name", "acme-run", "--config", path, "--yes", "--plain"])
+
+    assert result.exit_code == 0, result.output
+    assert [i.name for i in captured["cfg"].engagement.identities] == ["alice"]

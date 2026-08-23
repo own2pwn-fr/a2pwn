@@ -27,7 +27,7 @@ from a2pwn import progress
 from a2pwn.agents import MasterFork
 from a2pwn.budget import STOP, DispatchBudget, install_stop_handler
 from a2pwn.burpwn import BurpwnClient
-from a2pwn.catalog import as_langchain_tools, load_skill, retrieve
+from a2pwn.catalog import all_cards, as_langchain_tools, load_skill
 from a2pwn.collaborator import Collaborator
 from a2pwn.config import A2pwnConfig
 from a2pwn.graph import build_master_graph, build_subagent_graph
@@ -37,8 +37,6 @@ from a2pwn.throttle import Throttle
 from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools, recon_tools
 
 _log = logging.getLogger("a2pwn")
-
-_SEED_SKILL_LIMIT = 64
 
 
 # --------------------------------------------------------------------------- #
@@ -94,6 +92,9 @@ def list_runs() -> list[dict]:
                 info["by_severity"] = (data.get("stats") or {}).get("by_severity", {}) or {}
                 info["objective"] = data.get("objective", "") or ""
                 info["targets"] = list(data.get("targets", []) or [])
+                info["in_scope"] = list(data.get("in_scope", []) or [])
+                info["exclude"] = list(data.get("exclude", []) or [])
+                info["identity_names"] = list(data.get("identity_names", []) or [])
                 info["mtime"] = rj.stat().st_mtime
             except Exception as exc:  # noqa: BLE001 - a corrupt report.json must not break the listing
                 _log.debug("list_runs: unreadable report.json in %s: %s", d, exc)
@@ -129,11 +130,18 @@ async def _make_checkpointer(cfg: A2pwnConfig) -> BaseCheckpointSaver:
 # --------------------------------------------------------------------------- #
 # skills / tools                                                               #
 # --------------------------------------------------------------------------- #
-def _seed_skills(cfg: A2pwnConfig) -> list:
-    eng = cfg.engagement
-    query = " ".join([eng.name, *eng.targets, *eng.in_scope]).strip()
+def _seed_skills(cfg: A2pwnConfig) -> list:  # noqa: ARG001 - cfg kept for signature stability
+    """Seed the executor with the WHOLE methodology catalog.
+
+    This used to run `retrieve()` with a query built from the engagement name and its target hosts.
+    Hostnames share no vocabulary with a methodology corpus, so the FTS match was near-empty: a real
+    run against `ginandjuice.shop` seeded exactly ONE skill (`burpwn`) out of 37, and every dispatch
+    went out without the SQLi / XSS / SSRF / IDOR / JWT / GraphQL / race-condition methodology it was
+    supposed to carry. Relevance filtering at seed time is the wrong shape anyway — the executor does
+    not know which classes apply until it has seen the target, which is exactly what a pentest is.
+    """
     skills = []
-    for card in retrieve(query, k=_SEED_SKILL_LIMIT):
+    for card in all_cards():
         try:
             skills.append(load_skill(card.name))
         except Exception as exc:  # noqa: BLE001 - a broken skill card must not abort bootstrap

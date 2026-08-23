@@ -123,6 +123,12 @@ class CleanResult(BaseModel):
 
     dispatch_id: str
     status: Literal["confirmed", "partial", "no_finding", "blocked"]
+    # The task that was DISPATCHED, echoed back across the fork boundary. Without it the master
+    # only ever learned what happened, never what had been asked: `DispatchRecord.task` was filled
+    # with the result summary, so the continuation judge — whose entire job is spotting work that
+    # was not done — read a history containing no requests. It also lets `integrate` tell an
+    # answered task from one that is still queued.
+    spec: TaskSpec | None = None
     findings: list[Finding] = Field(default_factory=list)
     flow_batches: list[FlowBatchRef] = Field(default_factory=list)
     residual_gaps: list[str] = Field(default_factory=list)
