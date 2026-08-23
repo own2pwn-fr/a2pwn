@@ -171,6 +171,11 @@ class A2pwnConfig(BaseModel):
     # with an explanation instead of burning the remaining budget against a WAF — a blocked target
     # otherwise produces a 0-finding report indistinguishable from a clean one. 0 disables it.
     block_threshold: int = 25
+    # External vulnerability-intelligence lookups (OSV/deps.dev/GitHub advisories). This is the one
+    # channel that leaves the machine without going through burpwn — it can only reach public
+    # databases, never the target, but package and version names discovered on the client's estate
+    # do leave the machine, so it is announced in the run plan and can be turned off.
+    research_enabled: bool = True
     # One-time authorization acknowledgement (the CLI ToS gate). Distinct from per-dispatch approval.
     disclaimer_ack: bool = False
     # Interactive step-through: prompt the operator to approve EACH dispatch. Off by default, so

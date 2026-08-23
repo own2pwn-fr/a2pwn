@@ -42,14 +42,27 @@ from a2pwn import progress
 from a2pwn.artifacts import ArtifactStore
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
 from a2pwn.coverage import Probe
+from a2pwn.directives import DirectiveBus
 from a2pwn.identity import IdentityStore
-from a2pwn.models import Finding, FlowBatchRef, TaskSpec
+from a2pwn.jsaudit import decode_jwt_claims
+from a2pwn.models import Finding, FlowBatchRef, TaskSpec, normalise_chain_edges
 from a2pwn.oracles import VerificationOracle, run_oracle
 from a2pwn.scope import ScopeGuard, host_of
 from a2pwn.throttle import Throttle
 from a2pwn.toolcore import build_tool_specs
 from a2pwn.tools.artifact_tools import ARTIFACT_TOOL_SPECS
 from a2pwn.tools.coverage_tools import PROBE_SCHEMA, RECORD_PROBE_DESC, build_probe
+from a2pwn.tools.research_tools import (
+    CVE_LOOKUP_DESC,
+    CVE_LOOKUP_SCHEMA,
+    JS_ANALYZE_DESC,
+    JS_ANALYZE_SCHEMA,
+    JWT_DECODE_DESC,
+    JWT_DECODE_SCHEMA,
+    RESEARCH_FETCH_DESC,
+    RESEARCH_FETCH_SCHEMA,
+    run_js_analyze,
+)
 
 # Child of the "a2pwn" logger so the TUI's WARNING-silencing still applies, but `--plain` (INFO) and
 # `-v` (DEBUG) surface the sub-agent's otherwise-invisible tool calls, results and refusals.
@@ -88,6 +101,7 @@ REPORT_FINDING_SCHEMA: dict[str, Any] = {
     "correlation_id": str,
     "oracle_expect": dict,
     "enables": list,
+    "chain_edges": list,
     "cvss_vector": str,
     "cwe_ids": list,
     "remediation": str,
@@ -199,7 +213,28 @@ def _offload(name: str, result: dict, artifacts) -> dict:
     return {"content": [{"type": "text", "text": artifacts.maybe_store(text, origin=name)}]}
 
 
-def _observe_tool(name: str, handler, blocked: set, artifacts=None):
+def _annotate_directives(result: dict, directives, dispatch_id: str) -> dict:
+    """Deliver pending directives on the back of a tool result.
+
+    Chosen over a "check your messages" tool the agent might never call, and over an interrupt the
+    checkpointerless child cannot take: an agent that is still working is still reading tool
+    results, so this reaches it without needing its cooperation.
+    """
+    if directives is None or not dispatch_id:
+        return result
+    blocks = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return result
+    block = blocks[0]
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return result
+    annotated = directives.annotate(dispatch_id, block.get("text") or "")
+    if annotated == block.get("text"):
+        return result
+    return {"content": [{**block, "text": annotated}, *blocks[1:]]}
+
+
+def _observe_tool(name: str, handler, blocked: set, artifacts=None, directives=None, dispatch_id=""):
     """Wrap a tool handler with the active-exploit hard block + observability.
 
     Every call, its result head and any failure are logged (INFO/DEBUG/WARNING) and a tool error is
@@ -221,7 +256,7 @@ def _observe_tool(name: str, handler, blocked: set, artifacts=None):
             progress.emit("activity", stage="error", text=f"{name} FAILED: {_head(str(exc), 120)}")
             return _text_result(f"ERROR from {name}: {exc}")
         _log.debug("[%s] tool %s -> %s", did, name, _head(json.dumps(result, default=str), 200))
-        return _offload(name, result, artifacts)
+        return _annotate_directives(_offload(name, result, artifacts), directives, dispatch_id)
 
     return _fn
 
@@ -243,6 +278,8 @@ async def run_sdk_agent(
     fuzz_cap: int = 0,
     dispatch_id: str = "",
     artifacts: ArtifactStore | None = None,
+    directives: DirectiveBus | None = None,
+    research: Any = None,
 ) -> SdkExecOutcome:
     """Run the pentest executor/verifier as a native claude-agent-sdk agent loop.
 
@@ -323,6 +360,7 @@ async def run_sdk_agent(
         correlation_id = args.get("correlation_id")
         oracle_expect = args.get("oracle_expect")
         enables = args.get("enables")
+        chain_edges = normalise_chain_edges(args.get("chain_edges"))
         cvss_vector = args.get("cvss_vector")
         cwe_ids = args.get("cwe_ids")
         remediation = args.get("remediation")
@@ -359,6 +397,7 @@ async def run_sdk_agent(
             oracle_expect=dict(oracle_expect or {}),
             flow_batch=ref,
             enables=list(enables or []),
+            chain_edges=chain_edges,
             cvss_vector=cvss_vector,
             cwe_ids=list(cwe_ids or []),
             remediation=remediation,
@@ -447,7 +486,12 @@ async def run_sdk_agent(
             "remediation: two or three sentences of concrete, code-level fix guidance for THIS bug "
             "on THIS endpoint (not generic advice) — it is the first thing the report's reader "
             "looks for. When the finding was proven while acting as a declared identity, set "
-            "identity to that name: an access-control finding is unreadable without it.",
+            "identity to that name: an access-control finding is unreadable without it. When this "
+            "finding hands you leverage over another one, add chain_edges: a list of "
+            '{"to_key": "<enabled finding key>", "kind": "credential|token|session|internal_host|'
+            'file_read|code_exec|privilege|information|other", "material": "<the actual leverage, '
+            'verbatim>", "note": "<optional>"}. The dispatch that pursues the chain starts from an '
+            "empty transcript and can see nothing but that material.",
             REPORT_FINDING_SCHEMA,
             _report_finding,
         ),
@@ -467,6 +511,37 @@ async def run_sdk_agent(
             _record_probe,
         ),
     ]
+
+    # ---- research + deep JS analysis (mirrors a2pwn.tools.research_tools EXACTLY) --------------
+    if artifacts is not None:
+
+        async def _js_analyze(args: dict) -> dict:
+            return _json_result(await run_js_analyze(artifacts, str(args.get("artifact_id") or "")))
+
+        specs.append(("js_analyze", JS_ANALYZE_DESC, JS_ANALYZE_SCHEMA, _js_analyze))
+
+    if research is not None:
+
+        async def _cve_lookup(args: dict) -> dict:
+            return _json_result(
+                await research.osv_query(
+                    str(args.get("ecosystem") or "npm"),
+                    str(args.get("package") or ""),
+                    str(args.get("version") or ""),
+                )
+            )
+
+        async def _research_fetch(args: dict) -> dict:
+            return _json_result(await research.fetch(str(args.get("url") or "")))
+
+        async def _jwt_decode(args: dict) -> dict:
+            return _json_result({"claims": decode_jwt_claims(str(args.get("token") or ""))})
+
+        specs += [
+            ("cve_lookup", CVE_LOOKUP_DESC, CVE_LOOKUP_SCHEMA, _cve_lookup),
+            ("research_fetch", RESEARCH_FETCH_DESC, RESEARCH_FETCH_SCHEMA, _research_fetch),
+            ("jwt_decode", JWT_DECODE_DESC, JWT_DECODE_SCHEMA, _jwt_decode),
+        ]
 
     # ---- artifact access (only when a store is wired; mirrors a2pwn.tools.artifact_tools) ------
     if artifacts is not None:
@@ -496,7 +571,9 @@ async def run_sdk_agent(
     tool_names: list[str] = []
     for name, description, schema, handler in specs:
         sdk_tools.append(
-            tool(name, description, schema)(_observe_tool(name, handler, blocked, artifacts))
+            tool(name, description, schema)(
+                _observe_tool(name, handler, blocked, artifacts, directives, dispatch_id)
+            )
         )
         tool_names.append(name)
 

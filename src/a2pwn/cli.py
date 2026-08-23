@@ -96,6 +96,7 @@ _FLAG_DEFAULTS = {
     "max_phases": 12,
     "max_dispatches": 200,
     "fuzz_max_requests": 5000,
+    "no_research": False,
     "format": "md,json,sarif,html",
 }
 
@@ -149,6 +150,7 @@ def _print_run_plan(cfg: A2pwnConfig, objective: str, out_dir, *, compact: bool)
             f"executor={exec_lbl} verifier={ver_lbl} "
             f"max_phases={cfg.max_phases} max_dispatches={cfg.max_dispatches} "
             f"max_usd={cfg.max_usd or '-'} max_rps={cfg.max_rps or '-'} "
+            f"research={'on' if cfg.research_enabled else 'off'} "
             f"executor_max_turns={cfg.executor_max_turns} out={out_dir}"
         )
         return
@@ -171,6 +173,16 @@ def _print_run_plan(cfg: A2pwnConfig, objective: str, out_dir, *, compact: bool)
             ", ".join(f"{i.name}{' (anon)' if i.anonymous else ''}" for i in eng.identities),
         )
     grid.add_row("objective", _truncate(objective, 88))
+    # Stated before the authorization gate on purpose: this is the only traffic a2pwn sends that
+    # burpwn does not capture, and the operator is the one who has to be comfortable with a client's
+    # dependency names reaching a public database.
+    grid.add_row(
+        "cve research",
+        "ON — package/version names discovered on the target are sent to public vulnerability "
+        "databases (never the target itself); disable with --no-research"
+        if cfg.research_enabled
+        else "off",
+    )
     grid.add_row(
         "active-exploit",
         Text("ON", style="bold red") if ae else Text("off", style="green"),
@@ -300,6 +312,13 @@ def run(
         "--fuzz-max-requests",
         help="Cap on payloads per Intruder attack (clamped, and the clamp is reported).",
     ),
+    no_research: bool = typer.Option(
+        False,
+        "--no-research",
+        help="Disable external CVE/advisory lookups. They are the only traffic that leaves this "
+        "machine without going through burpwn — they can never reach the target, but discovered "
+        "package and version names do reach public vulnerability databases.",
+    ),
     format: str = typer.Option(
         "md,json,sarif,html",
         "--format",
@@ -329,6 +348,7 @@ def run(
                 "max_tokens": max_tokens,
                 "max_rps": max_rps,
                 "fuzz_max_requests": fuzz_max_requests,
+                "no_research": no_research,
                 "checkpoint_uri": checkpoint_uri,
                 "format": format,
             },
@@ -387,6 +407,7 @@ def run(
             max_tokens=settings.get("max_tokens"),
             max_rps=settings.get("max_rps"),
             fuzz_max_requests=int(settings.get("fuzz_max_requests") or 5000),
+            research_enabled=not bool(settings.get("no_research")),
             block_threshold=int(settings.get("block_threshold") or 25),
             checkpoint_uri=checkpoint_uri,
             disclaimer_ack=False,

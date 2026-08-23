@@ -16,12 +16,18 @@ Two credential sources, freely combinable per identity:
 **The burpwn-is-the-only-egress invariant holds for both.** The replay login is a ``curl`` run via
 ``burpwn exec``; nothing here opens a socket from the a2pwn process itself.
 
-A headless-browser login (Playwright) for JS/SPA/OAuth flows was built and then removed: Chromium
-cannot start inside the burpwn sandbox — it is killed with SIGTRAP because its own namespace/seccomp
-layer cannot nest inside bubblewrap, and ``--no-sandbox``/``--no-zygote``/``--single-process`` do not
-help — while burpwn's proxy is a unix socket that rejects an unattributed client, so running the
-browser *outside* the sandbox cannot capture its traffic either. Reviving it needs a burpwn-side
-change (a TCP proxy listener, or a Chromium-compatible sandbox profile), not an a2pwn one.
+A headless-browser login (Playwright) for JS/SPA/OAuth flows was built and then removed because
+Chromium cannot start inside the burpwn sandbox — it is killed with SIGTRAP (exit 133, no stderr at
+all) because its own namespace/seccomp layer cannot nest inside bubblewrap, and
+``--no-sandbox``/``--no-zygote``/``--single-process``/``--disable-setuid-sandbox`` do not help.
+
+That conclusion was over-generalised to browsers as a whole, and it is wrong: **headless Firefox
+starts inside ``burpwn exec`` and its traffic IS captured** (verified against burpwn 0.4.0 — a plain
+page load produced seven captured flows). The blocker is Chromium-specific, so reviving browser
+login — and with it the whole client-side class the oracles cannot otherwise reach: DOM XSS, CSP in
+practice, postMessage — needs Playwright driving **firefox** from inside the sandbox, not a
+burpwn-side change. Practical notes: pass a dedicated ``--profile`` (otherwise it hits the host
+Firefox profile lock), and avoid ``--screenshot``, which segfaults while a plain load is clean.
 
 Resolution is lazy and cached: an identity is only logged in the first time it is used, and
 :meth:`IdentityStore.invalidate` drops the cache so the next use re-authenticates (the tool wrappers

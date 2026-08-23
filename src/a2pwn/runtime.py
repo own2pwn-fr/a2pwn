@@ -32,13 +32,16 @@ from a2pwn.catalog import all_cards, as_langchain_tools, load_skill
 from a2pwn.collaborator import Collaborator
 from a2pwn.config import A2pwnConfig
 from a2pwn.coverage import SurfaceMap
+from a2pwn.directives import DirectiveBus
 from a2pwn.graph import build_master_graph, build_subagent_graph
 from a2pwn.identity import IdentityStore
 from a2pwn.report import Report, build_report
+from a2pwn.research import ResearchClient
 from a2pwn.throttle import Throttle
 from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools, recon_tools
 from a2pwn.tools.artifact_tools import artifact_tools
 from a2pwn.tools.coverage_tools import coverage_tools
+from a2pwn.tools.research_tools import research_tools
 
 _log = logging.getLogger("a2pwn")
 
@@ -241,7 +244,10 @@ async def bootstrap(
     # Engagement-wide policy objects, shared by every tool wrapper on BOTH executor paths so a
     # refusal, a rate limit or an identity means the same thing regardless of which executor runs.
     identities = IdentityStore(client, cfg.engagement.identities) if cfg.engagement.identities else None
-    throttle = Throttle(max_rps=cfg.max_rps, block_threshold=cfg.block_threshold)
+    directives = DirectiveBus()
+    throttle = Throttle(
+        max_rps=cfg.max_rps, block_threshold=cfg.block_threshold, directives=directives
+    )
     client._identities = identities  # for the report/summary to describe what was used
     client._throttle = throttle
 
@@ -250,6 +256,16 @@ async def bootstrap(
     # the run's other evidence so a bulky body stays inspectable after the run.
     artifacts = ArtifactStore(spill_dir=Path(run_out_dir(cfg, cfg.engagement.name)) / "artifacts")
     client._artifacts = artifacts
+    # Out-of-band channel to running dispatches, shared with the throttle so a tripped circuit
+    # breaker reaches every sibling immediately instead of each one rediscovering it by wasting
+    # turns against a WAF wall.
+    client._directives = directives
+    # The ONE channel that leaves the machine without burpwn, narrowly scoped to public
+    # vulnerability databases (see a2pwn.research). Off entirely under --no-research.
+    research = ResearchClient(
+        enabled=cfg.research_enabled,
+        in_scope_hosts=[*cfg.engagement.targets, *cfg.engagement.in_scope],
+    )
 
     skills = _seed_skills(cfg)
     tools = (
@@ -270,6 +286,7 @@ async def bootstrap(
         + recon_tools(cfg.engagement)
         + coverage_tools()
         + artifact_tools(artifacts)
+        + research_tools(artifacts, research)
     )
 
     subgraph = build_subagent_graph(
@@ -282,6 +299,8 @@ async def bootstrap(
         identities=identities,
         throttle=throttle,
         artifacts=artifacts,
+        directives=directives,
+        research=research,
     )
     graph = build_master_graph(cfg, subgraph, client, checkpointer)
     return client, graph, checkpointer
