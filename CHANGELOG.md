@@ -124,6 +124,54 @@ All notable changes to this project are documented here. The format is based on
   ReAct loop, the verifier critique, the fail-closed adjudicator; 559 lines), down from a single
   1117-line file. `graph.py` re-exports the sub-agent names, so existing imports are unaffected.
 
+### Fixed (coverage: the executor was working almost blind)
+
+- **The executor was seeded with 1 skill out of 37.** `_seed_skills` built its FTS query from the
+  engagement name and its target **hostnames**, then asked the catalog for the most *relevant*
+  skills. Hostnames share no vocabulary with a methodology corpus, so the match scored 36 of the 37
+  skills to zero: a real run against `ginandjuice.shop` seeded `burpwn` and nothing else, and every
+  dispatch went out with no SQLi, XSS, SSRF, IDOR, JWT, GraphQL, race-condition or smuggling
+  methodology at all. Relevance filtering is the wrong shape here anyway — which classes apply is
+  not known until the target has been seen, which is the whole point of a pentest. New
+  `catalog.all_cards()` seeds the entire catalog; skills are cheap (one zero-arg tool each, ~800
+  chars of description, the SKILL.md body loaded only when the model calls the tool).
+- **Independent verification could pass by doing nothing.** `accepted = not rejected` made "the
+  fresh child reported no candidates" indistinguishable from "the fresh child reproduced it": a
+  verify dispatch that gave up, refused, exhausted its turns or crashed on a swallowed retry round
+  produced zero candidates, hence zero rejections, hence `accepted=True` — and distill then promoted
+  the **original** candidate to `independently_verified`. That is a hole straight through the
+  product's headline 0-FP guarantee. A verify dispatch must now re-derive **the** candidate it was
+  sent to check (matched on the canonical key, falling back to vuln_class+target), so stumbling onto
+  an unrelated bug no longer verifies the one that was asked about.
+- **Planned tasks evaporated between phases.** `integrate` rebuilt the queue as
+  `deferred + next_hops`, discarding everything that was planned but not dispatched. A phase is
+  clamped to `max_batch_width`, and a phase with anything in the verify queue dispatches verifies
+  **only** — so in the common case the entire task batch was dropped and the run looked complete
+  with whole planned tasks never attempted. `CleanResult` now echoes back the `TaskSpec` that was
+  dispatched, and the queue keeps every entry no dispatch answered.
+- **History recorded what happened, never what was asked.** `DispatchRecord.task` was filled with
+  the *result summary*; the dispatched `TaskSpec` was never persisted anywhere. The continuation
+  judge — whose entire job is spotting in-scope work that was not done — was therefore reading a
+  history that contained no requests. It now records the requested task.
+- **Nothing stopped the same work being dispatched twice.** `next_hops` (cross-chain edges,
+  `propose_targets` discoveries) and the continuation judge all append into the queue with no memory
+  of each other, and the only guard against repeats was an English sentence in the planner prompt. A
+  host discovered by two dispatches, or a chain edge re-emitted each time its origin finding is
+  re-confirmed, burned budget the untested surface needed. Repeat work is now dropped deterministically
+  on an intent+target+normalised-text signature.
+- **`a2pwn resume` re-authorised excluded scope.** It rebuilt the `EngagementSpec` from `targets`
+  alone, silently dropping every `exclude` carve-out — so resuming a run probed exactly the hosts and
+  paths the client had put off-limits, the one direction a scope mistake must never go. It also lost
+  all identities, making the whole authenticated surface untestable without saying so. The scope
+  envelope (`in_scope`, `exclude`) is now recorded in `report.json` and restored; **credentials are
+  deliberately still never written there** (a report is a deliverable that gets mailed around), so
+  `resume` gains `--config` to re-supply them and warns loudly, naming the identities, when a prior
+  run used some and none were provided. `--exclude` can add carve-outs on resume.
+- **`a2pwn retest` ignored the baseline's scope and traffic policy.** Carve-outs were dropped unless
+  restated in `--config`, and `block_threshold` / `max_tokens` / `fuzz_max_requests` were pinned to
+  their defaults no matter what the config said — even though a retest hits the same WAF as the run
+  it re-checks.
+
 ### Fixed
 
 - **Two bugs found by validating against a live sandbox rather than fakes.** Both had shipped:

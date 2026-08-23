@@ -201,6 +201,23 @@ async def _verifier_notes(verifier: Any, rejected: list[Finding], not_done: list
         return ""
 
 
+def _reproduces(candidate: Finding | None, confirmed: list[Finding]) -> bool:
+    """Did an independent-verify dispatch actually re-derive THE candidate it was sent to check?
+
+    Requiring merely "some candidate survived adjudication" would let a fresh child that stumbled
+    onto an unrelated bug promote the one it was asked about. Match on the canonical key first, then
+    fall back to (vuln_class, target) so a differently-normalised param does not read as a failure.
+    """
+    if candidate is None:
+        return bool(confirmed)
+    for f in confirmed:
+        if f.key == candidate.key:
+            return True
+        if f.vuln_class == candidate.vuln_class and f.target == candidate.target:
+            return True
+    return False
+
+
 def build_subagent_graph(
     cfg: A2pwnConfig,
     client: BurpwnClient,
@@ -443,6 +460,14 @@ def build_subagent_graph(
                 if "ALARM" in reason or "capture" in reason.lower():
                     capture_ok = False
         accepted = not rejected
+        if state["intent"] == "verify":
+            # An INDEPENDENT-VERIFY dispatch must produce its OWN proof. `accepted = not rejected`
+            # alone made "reported nothing" indistinguishable from "reproduced it": a child that
+            # gave up, refused, ran out of turns, or crashed on a retry round (swallowed above)
+            # yields zero candidates, hence zero rejections, hence accepted=True — and `_distill`
+            # then promoted the ORIGINAL candidate to `independently_verified`. That is a hole
+            # straight through the product's 0-FP guarantee: not proving became proving.
+            accepted = accepted and _reproduces(state.get("candidate"), confirmed)
         notes = f"verified {len(confirmed)}/{len(candidates)} candidate(s); round {round_}"
         if rejected:
             adversarial = await _verifier_notes(verifier, rejected, not_done)
@@ -530,6 +555,7 @@ def build_subagent_graph(
         result = CleanResult(
             dispatch_id="",
             status=status,
+            spec=state.get("spec"),
             findings=findings,
             flow_batches=batches,
             residual_gaps=residual,

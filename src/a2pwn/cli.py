@@ -466,6 +466,16 @@ def resume(
     objective: str | None = typer.Option(
         None, "--objective", "-o", help="Objective (defaults to the prior run's, if recorded)."
     ),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Engagement YAML — the only way to restore IDENTITIES on a resume (credentials are "
+        "deliberately never written to report.json).",
+    ),
+    exclude: list[str] = typer.Option(  # noqa: B008 - typer option factory
+        [], "--exclude", "-x", help="Extra scope carve-out, on top of the prior run's."
+    ),
     active_exploit: bool = typer.Option(
         False, "--active-exploit", help="Allow active exploitation without a per-dispatch pause."
     ),
@@ -509,10 +519,37 @@ def resume(
     _init_logging(verbose=verbose, use_tui=use_tui)
     formats = _parse_formats(format)
 
+    # Restore the FULL scope envelope, not just the targets. Rebuilding from `targets` alone
+    # re-authorised every host and path the operator had carved out with `--exclude`, which is the
+    # one direction a scope mistake must never go.
+    prior_exclude = list(prior.get("exclude") or [])
+    prior_in_scope = list(prior.get("in_scope") or []) or list(targets)
+    file_values: dict = {}
+    if config:
+        from a2pwn.runconfig import ConfigError, load_engagement_file
+
+        try:
+            file_values = load_engagement_file(config)
+        except ConfigError as exc:
+            typer.echo(f"Invalid engagement file: {exc}", err=True)
+            raise typer.Exit(2) from exc
+    identities = list(file_values.get("identities") or [])
+    prior_exclude += [x for x in (file_values.get("exclude") or []) if x not in prior_exclude]
+    prior_identity_names = list(prior.get("identity_names") or [])
+    if prior_identity_names and not identities:
+        typer.echo(
+            f"WARNING: run '{name}' used identities ({', '.join(prior_identity_names)}) but none were "
+            "supplied. Credentials are never stored in report.json, so the whole authenticated "
+            "surface will be untestable on this resume — pass --config <engagement.yaml> to restore "
+            "them.",
+            err=True,
+        )
     engagement = EngagementSpec(
         name=name,
         targets=targets,
-        in_scope=list(targets),
+        in_scope=prior_in_scope,
+        exclude=prior_exclude + list(exclude),
+        identities=identities,
         authorization_acknowledged=False,
         active_exploit_allowed=active_exploit,
         session=name,
@@ -695,8 +732,11 @@ def retest(
     engagement = EngagementSpec(
         name=name,
         targets=targets,
-        in_scope=list(settings.get("in_scope") or targets),
-        exclude=list(settings.get("exclude") or []),
+        in_scope=list(settings.get("in_scope") or baseline_data.get("in_scope") or targets),
+        # Carve-outs are inherited from the baseline the same way targets are. A retest that
+        # forgot the original exclusions would probe hosts the client put off-limits, on a run
+        # the operator reasonably assumes is narrower than the engagement it re-checks.
+        exclude=list(settings.get("exclude") or baseline_data.get("exclude") or []),
         identities=list(settings.get("identities") or []),
         authorization_acknowledged=False,
         active_exploit_allowed=bool(settings.get("active_exploit")),
@@ -709,7 +749,12 @@ def retest(
             max_phases=int(settings.get("max_phases") or 6),
             max_dispatches=int(settings.get("max_dispatches") or 60),
             max_usd=settings.get("max_usd"),
+            max_tokens=settings.get("max_tokens"),
             max_rps=settings.get("max_rps"),
+            fuzz_max_requests=int(settings.get("fuzz_max_requests") or 5000),
+            # A retest hits the same WAF as the run it re-checks, so it needs the same tuned
+            # breaker threshold; it was pinned to the default 25 no matter what the config said.
+            block_threshold=int(settings.get("block_threshold") or 25),
             disclaimer_ack=False,
         )
     except ValueError as exc:

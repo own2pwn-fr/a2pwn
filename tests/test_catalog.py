@@ -391,3 +391,34 @@ async def test_langchain_tool_threads_target_into_argv(tmp_path, monkeypatch):
     argv, ws = client.calls[0]
     assert ws == "ws"
     assert "https://victim/?id=1" in argv and "id" in argv  # target/param reached the binary
+
+
+def test_all_cards_returns_the_whole_catalog(tmp_path, monkeypatch):
+    """`all_cards` is the seed path — it must never relevance-filter.
+
+    Regression: bootstrap seeded skills via `retrieve()` with a query built from the engagement's
+    HOSTNAMES. Hostnames share no vocabulary with a methodology corpus, so a real run seeded one
+    skill out of 37 and every dispatch went out without its SQLi/XSS/SSRF/IDOR methodology.
+    """
+    root = tmp_path / "skills"
+    for rel, name, desc, tags in (
+        ("web/sqli", "web-sqli", "SQL injection", "[web, sqli]"),
+        ("web/xxe", "web-xxe", "XML external entity", "[web, xxe]"),
+        ("recon/tech", "recon-tech", "Fingerprint the stack", "[recon]"),
+    ):
+        d = root / rel
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\ntags: {tags}\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setenv("A2PWN_SKILLS_DIR", str(root))
+    catalog.build_index(root, repo_root=root)  # the FTS index is what starved the old seed
+
+    cards = catalog.all_cards()
+
+    assert [c.name for c in cards] == ["recon-tech", "web-sqli", "web-xxe"]
+    # The exact query shape bootstrap used to build (engagement name + target hosts) scores every
+    # methodology skill to zero. `all_cards` must be immune to that.
+    starved = catalog.retrieve("ginandjuice.shop https://ginandjuice.shop", k=64)
+    assert len(starved) < len(cards)

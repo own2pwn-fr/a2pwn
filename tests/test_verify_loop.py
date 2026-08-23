@@ -151,3 +151,55 @@ async def test_fail_closed_unprovable_oracle_kind_is_rejected(monkeypatch, fake_
     )
     assert out["clean_result"].status == "partial"
     assert out["clean_result"].findings == []
+
+
+async def test_independent_verify_needs_its_own_proof(monkeypatch, fake_client):
+    """A verify dispatch that proves NOTHING must not promote the candidate.
+
+    Regression: ``accepted = not rejected`` made "reported no candidates" indistinguishable from
+    "reproduced it" — a child that gave up, refused or exhausted its turns produced zero
+    candidates, hence zero rejections, hence accepted=True, and ``_distill`` promoted the ORIGINAL
+    candidate to ``independently_verified``. Not proving must never read as proving.
+    """
+    cfg = make_cfg(max_verify_rounds=1)
+    arm_differential(fake_client)
+    candidate = make_finding(confirmed=True)
+    executor = FakeExecutor(exec_result([]))  # the fresh child comes back empty-handed
+    sub = build_sub(monkeypatch, cfg, fake_client, clarifier=_NO_QUESTIONS, executor=executor)
+
+    out = await sub.ainvoke(sub_input(cfg, intent="verify", candidate=candidate))
+
+    assert out["clean_result"].findings == []
+    assert out["clean_result"].status != "confirmed"
+
+
+async def test_independent_verify_promotes_on_own_reproduction(monkeypatch, fake_client):
+    """The same path, but the fresh child actually re-derives the bug -> promotion."""
+    cfg = make_cfg(max_verify_rounds=1)
+    arm_differential(fake_client)
+    candidate = make_finding(confirmed=True)
+    reproduced = make_finding(flow_ids=(301, 302), exec_ids=("e-ok",))
+    executor = FakeExecutor(exec_result([reproduced]))
+    sub = build_sub(monkeypatch, cfg, fake_client, clarifier=_NO_QUESTIONS, executor=executor)
+
+    out = await sub.ainvoke(sub_input(cfg, intent="verify", candidate=candidate))
+
+    findings = out["clean_result"].findings
+    assert len(findings) == 1
+    assert findings[0].independently_verified is True
+
+
+async def test_independent_verify_rejects_an_unrelated_bug(monkeypatch, fake_client):
+    """Stumbling onto a DIFFERENT vulnerability does not verify the one that was dispatched."""
+    cfg = make_cfg(max_verify_rounds=1)
+    arm_differential(fake_client)
+    candidate = make_finding(vuln="sqli", target="https://app.example.com/login", param="user")
+    unrelated = make_finding(
+        vuln="xss", target="https://app.example.com/search", param="q", flow_ids=(401,), exec_ids=("e-ok",)
+    )
+    executor = FakeExecutor(exec_result([unrelated]))
+    sub = build_sub(monkeypatch, cfg, fake_client, clarifier=_NO_QUESTIONS, executor=executor)
+
+    out = await sub.ainvoke(sub_input(cfg, intent="verify", candidate=candidate))
+
+    assert out["clean_result"].findings == []
