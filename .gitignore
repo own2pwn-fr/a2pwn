@@ -17,6 +17,10 @@ runs.db
 out/
 runs/
 .a2pwn/
+# In-sandbox helpers write their results under the cwd: ~/.local/share and ~/.cache are mounted
+# READ-ONLY inside burpwn's sandbox and /tmp there is a private tmpfs the host cannot read.
+.a2pwn-browser/
+.a2pwn-ws/
 
 # skill index (generated from frontmatter)
 skills/_index.json

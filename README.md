@@ -28,6 +28,12 @@ prototype pollution, deserialization, XXE, path traversal / LFI, open redirect, 
 JS supply-chain (de-bundle the app → identify a library → pull it → check known CVEs → prove it on the
 live site) — chaining primitives across findings.
 
+DOM XSS, CSP-in-practice and postMessage are reached with a **real browser** driven inside the
+sandbox, so page traffic stays captured; WebSockets are driven by a stdlib RFC 6455 client that can
+replay a captured, already-authorised channel with tampered content. CVE research runs against public
+vulnerability databases over the one narrowly-bounded channel that does not go through the sandbox
+(`--no-research` disables it).
+
 Two mandates drive every design decision:
 
 1. **Clean history by construction.** The master reasons over an append-only chain of
@@ -285,11 +291,31 @@ MASTER graph  (dispatch-only; never touches a target)
   workspace, tagged (e.g. `xss`, red) and annotated — so "this batch == the XSS" is queryable and
   exports cleanly to HAR.
 
+### Coverage: what was tested, not just what was found
+
+A 0-finding report is meaningless unless it can say what it looked at. a2pwn maintains an
+**attack-surface inventory harvested from the traffic burpwn actually captured** — hosts, endpoints,
+query/body/JSON parameters, JS bundles, WebSocket channels — crossed with the vulnerability classes
+applicable to each. Every `(asset × class)` cell carries a verdict, and sub-agents record the
+*negative* results too (`record_probe`), which the oracle kernel structurally cannot: it only ever
+promotes proof.
+
+That matters twice. The report gains a **Coverage** section stating plainly what was never probed
+(untested cells are not evidence of security). And when the planner runs dry, untested cells are
+expanded into real dispatches automatically — the model prioritises, the matrix enumerates, so
+thoroughness stops depending on an LLM remembering every endpoint it has seen.
+
+`a2pwn doctor` additionally proves **capture** works before a run, not just that the sandbox starts:
+an uncaptured engagement still probes, still rejects every candidate for an empty flow batch, and
+still reports a clean target.
+
 ## Skills & tools
 
 - **Skills** (`skills/`) are curated, self-describing security knowledge — Claude-Code-faithful
-  frontmatter plus a2pwn extensions (tags, tools, payload sources, a `verify.py` oracle). Sub-agents
-  discover them by an FTS/tag prefilter, then load the relevant one(s).
+  frontmatter plus a2pwn extensions (tags, tools, payload sources, a `verify.py` oracle). The **whole**
+  catalog is seeded on every engagement — each skill is one zero-argument tool whose body loads only
+  when the agent asks — so no relevance filter can decide, from a hostname, that a class is not worth
+  teaching.
 - **Payloads** are *referenced* (for attribution), never copied, from pinned vendored sources
   ([PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings) MIT,
   [HackTricks](https://github.com/HackTricks-wiki/hacktricks) CC-BY-SA, nuclei-templates MIT). They
@@ -303,8 +329,8 @@ MASTER graph  (dispatch-only; never touches a target)
 
 `0.1.0` — early, but the full loop works end to end: the orchestration core, native-SDK executor,
 backends, burpwn integration, deterministic oracles, catalog, continuation judge, auto-compaction,
-identities, scope carve-outs, spend/traffic ceilings, the retest cycle, reporting and CLI are in
-place and exercised by 500+ tests (clean-history / reconciliation / capture-alarm /
+identities, scope carve-outs, spend/traffic ceilings, the retest cycle, the coverage matrix, browser
+and WebSocket testing, CVE research, reporting and CLI are in place and exercised by 800+ tests (clean-history / reconciliation / capture-alarm /
 fail-closed-adjudication / executor-path-parity invariants included). Validated against a live
 sanctioned lab (see [Proof it works](#proof-it-works--a-real-engagement)). The seed skill library is
 being expanded toward full depth on each class.
