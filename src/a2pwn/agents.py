@@ -97,6 +97,7 @@ class _SdkExecutor:
         artifacts=None,
         directives=None,
         research=None,
+        browser=None,
     ):
         self._model = cfg.executor.model or "sonnet"
         self._prompt = _executor_prompt(active_exploit_tools)
@@ -112,6 +113,7 @@ class _SdkExecutor:
         self._artifacts = artifacts
         self._directives = directives
         self._research = research
+        self._browser = browser
 
     async def ainvoke(self, state: dict, config: Any = None) -> dict:
         from langchain_core.messages import AIMessage
@@ -139,6 +141,7 @@ class _SdkExecutor:
             artifacts=self._artifacts,
             directives=self._directives,
             research=self._research,
+            browser=self._browser,
             # The dispatch id is the mailbox address; without it a directive has nowhere to land.
             dispatch_id=progress.current_dispatch() or "",
         )
@@ -170,6 +173,7 @@ def build_executor(
     artifacts: Any = None,
     directives: Any = None,
     research: Any = None,
+    browser: Any = None,
 ) -> Any:
     """Build the executor. On the ``claude-code`` subscription backend, use the native SDK
     tool-calling loop (:class:`_SdkExecutor`) — prompted-JSON tool-calling makes that model distrust
@@ -196,6 +200,7 @@ def build_executor(
             artifacts=artifacts,
             directives=directives,
             research=research,
+            browser=browser,
         )
     model = make_model(cfg.executor)
     return create_react_agent(

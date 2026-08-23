@@ -22,6 +22,10 @@ def _engagement(targets, exclude=None) -> EngagementSpec:
         in_scope=list(targets),
         exclude=list(exclude or []),
         session="t",
+        # These tests exercise SCOPE, so they authorise active exploitation: the wrappers now refuse
+        # mutating tools before scope is consulted otherwise, and the refusal under test would be
+        # masked by the active-exploit one.
+        active_exploit_allowed=True,
     )
 
 

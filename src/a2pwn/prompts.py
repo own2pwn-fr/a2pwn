@@ -138,6 +138,15 @@ form with SQLi payloads, inject into every reflected parameter, fuzz with burpwn
 burpwn_req_replay. Keep going until you have either PROVEN a vulnerability or genuinely exhausted the
 in-scope surface for this task.
 
+WEBSOCKETS AND THE DOM ARE IN SCOPE, NOT EXEMPT. If `burpwn_req_list(protocol="ws")` shows a
+WebSocket channel, TEST it: `ws_replay` takes a captured flow, reuses its URL and credentials, and
+resends a message you tampered with — that is where the authorisation and business-logic bugs of a
+realtime app live, and nothing else in your toolset can reach them. For anything the server cannot
+prove on its own, drive the real browser: `browser_render` gives you the post-JavaScript DOM (forms,
+links, script srcs, postMessage listeners, storage keys) that a curl of the same URL never shows, and
+`browser_probe_dom_xss` is the only way to prove DOM XSS — it distinguishes a payload that merely
+REFLECTS from one that actually EXECUTED, and only the second is a finding.
+
 GO DEEP ON CLIENT-SIDE CODE. A front-end bundle names every endpoint the application calls,
 including the admin and internal routes no crawl will ever link to. Fetch each `.js` asset through
 the sandbox, then call `js_analyze` on the resulting artifact instead of reading it: you get the URLs
