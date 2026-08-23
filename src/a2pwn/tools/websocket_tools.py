@@ -64,7 +64,9 @@ WS_REPLAY_DESC = (
     "trusts every message. Find the flow id with burpwn_req_list(protocol=\"ws\") or "
     "burpwn_req_search for \"Upgrade: websocket\". Pass extra_headers to override what was captured "
     "(set Origin to a foreign site for the CSWSH test). Per-connection handshake headers "
-    "(Sec-WebSocket-Key, Upgrade, Host) are regenerated, never replayed."
+    "(Sec-WebSocket-Key, Upgrade, Host) are regenerated, never replayed. The result carries "
+    "captured_request_ids: pass them to report_finding as the flow_ids that prove the bug, or the "
+    "finding is rejected as unevidenced no matter how clearly the frames demonstrate it."
 )
 
 WS_CONNECT_SCHEMA: dict = {
