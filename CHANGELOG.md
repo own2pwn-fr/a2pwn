@@ -186,6 +186,71 @@ All notable changes to this project are documented here. The format is based on
   a `compact_boundary` is logged, counted on the dispatch outcome and emitted to `run.jsonl`. When a
   dispatch appears to have lost the plot, this is the event that explains it.
 
+### Added (deep application research: CVEs and client-side code)
+
+- **CVE / advisory lookups** (`a2pwn.research`, `cve_lookup`, `research_fetch`). The
+  `recon/js-supplychain` skill has always instructed the model to "query OSV.dev / deps.dev / GitHub
+  Advisory", and no mechanism existed that could: a2pwn had no web tool at all, and the scope guard
+  correctly refused `osv.dev` because it is not an engagement target. So the entire dependency-CVE
+  half of an application audit was unreachable. This module is the one place that talks to the
+  network without burpwn, and it is bounded so that exception stays narrow: a **fixed** allow-list of
+  public vulnerability databases (not config-extensible, or an engagement file could re-open the
+  off-sandbox egress), plus an explicit refusal when the requested host is inside the engagement
+  scope, so a redirected or hallucinated URL cannot turn an intel lookup into uncaptured target
+  traffic. Package and version names discovered on the client's estate do leave the machine, so it
+  is stated in the run plan **before** the authorization gate and `--no-research` turns it off.
+- **Deep JavaScript audit** (`a2pwn.jsaudit`, `js_analyze`). Auditing a bundle used to mean handing
+  three megabytes of minified code to a language model and hoping — which fails twice, because the
+  blob evicts the engagement context and a model skimming minified code is a bad grep. Everything
+  worth extracting is a pattern match, so it is done in code: every URL and API path the bundle
+  references (**including the admin and internal routes nothing links to** — the actual reason to
+  read a bundle), `sourceMappingURL` targets, library name/version pairs to feed straight into
+  `cve_lookup`, credential-shaped literals (vendor-prefixed tokens matched exactly, generic
+  assignments entropy-gated so the bundle's own identifiers do not drown the real hits, and every
+  value redacted in the digest because reports and screen-shared TUIs are not credential stores),
+  and the DOM sinks worth manual review. The model receives that digest instead of the bytes. Hits
+  are LEADS, carrying no `confirmed` flag: the oracle kernel is still the only thing that makes a
+  finding.
+- **`jwt_decode`** — read a token's claims (alg, kid, iss, exp, role/tenant) before deciding how to
+  attack it, without pretending to validate its signature.
+
+### Added (peer review, real adversarial verification, and course correction)
+
+- **The adversarial verifier now gets a vote.** The architecture always claimed a two-layer
+  discipline — a deterministic oracle plus an independent, stronger role-model — and `config.py`
+  even refuses to start if the verifier backend equals the executor's. But the verifier agent was
+  only ever asked to *narrate* rejections the oracle had already made; it had no say in any verdict,
+  so the second layer did not exist. It now runs against oracle-CONFIRMED candidates and may
+  **veto** them. Reject-only by construction: a veto can produce a false negative, never a false
+  positive, so the fail-closed kernel stays fail-closed while the stronger model catches what a
+  mechanical oracle cannot (a differential that differs for an unrelated reason, a signature matched
+  against the attacker's own echoed request). It **fails open** on any error or unparseable reply —
+  the oracle already confirmed, and a flaky verifier call must not silently delete a proven finding —
+  and every veto must cite a reason, which lands in the residual gaps and in `run.jsonl`.
+- **Deterministic completeness review of every dispatch.** Coverage-expanded tasks name the classes
+  they were dispatched for, so "was the work actually done?" is answerable without an LLM: the ask
+  is compared against what `record_probe` and the oracle settled, and any shortfall is reported as a
+  residual gap. This is the peer-review step the design was missing — until `CleanResult.spec`
+  existed the master could not compare a request against its result at all, because history recorded
+  only outcomes.
+- **Typed cross-chain edges that carry their material** (`ChainEdge`). `enables` was a bare list of
+  finding keys, and the follow-up task generated from it was literally "Pursue cross-chain: A
+  enables B." The dispatch that picked it up started from an empty transcript with a 240-character
+  evidence snippet, so the credential, token or internal host the first finding yielded — the entire
+  reason the chain exists — never reached the agent meant to use it, which then spent its budget
+  re-deriving what its predecessor had already held. An edge now declares its `kind` (credential /
+  token / session / internal_host / file_read / code_exec / privilege / information) and the
+  verbatim `material`, and the generated task hands it over explicitly.
+- **A directive channel to RUNNING dispatches** (`a2pwn.directives`). Fan-out was fire-and-forget:
+  nothing could tell a sub-agent that the target had started blocking, that a sibling had just
+  proven the very bug it was working on, or that the engagement was nearly out of budget — all
+  known *while* it burned turns on the wrong thing. Directives ride on the next tool result, which
+  deliberately requires no cooperation from the model: there is no "check your messages" tool it
+  might not call, and no interrupt the checkpointerless child could take. Three producers so far:
+  the circuit breaker (once, on trip), a dispatch proving findings (so siblings stop re-proving
+  them), and the 80% budget mark (a sub-agent otherwise opens a new line of investigation on the
+  last dispatch the run can afford).
+
 ### Fixed (coverage: the executor was working almost blind)
 
 - **The executor was seeded with 1 skill out of 37.** `_seed_skills` built its FTS query from the

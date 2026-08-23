@@ -241,18 +241,24 @@ def make_master_state(
     }
 
 
-def build_sub(monkeypatch, cfg, client, *, clarifier, executor, fork=None, collab=None):
+def build_sub(monkeypatch, cfg, client, *, clarifier, executor, fork=None, collab=None, verifier=None):
     """Compile a sub-agent graph with the LLM builders swapped for fakes.
 
     The builders are patched on ``a2pwn.subgraph``, which is where the sub-agent half lives and
     where ``build_subagent_graph`` resolves them from — patching the ``a2pwn.graph`` re-export
     would bind nothing.
+
+    ``verifier`` defaults to an object with no ``ainvoke``, which is how every adjudication test
+    keeps the verifier role-model out of the loop. Pass a fake to exercise the paths that DO call
+    it (the adversarial veto, the narrative critique); the graph binds it at build time, so it
+    cannot be swapped in afterwards.
     """
     import a2pwn.subgraph as sg
 
+    bound = verifier if verifier is not None else _Dummy()
     monkeypatch.setattr(sg, "build_clarifier", lambda models: clarifier)
     monkeypatch.setattr(sg, "build_executor", lambda models, tools, active, *a, **k: executor)
-    monkeypatch.setattr(sg, "build_verifier", lambda models, tools, *a, **k: _Dummy())
+    monkeypatch.setattr(sg, "build_verifier", lambda models, tools, *a, **k: bound)
     return sg.build_subagent_graph(cfg, client, fork or FakeFork(), tools=[], collab=collab)
 
 

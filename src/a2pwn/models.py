@@ -38,6 +38,64 @@ class ContinuationVerdict(BaseModel):
     remaining_work: list[TaskSpec] = Field(default_factory=list)
 
 
+class ChainEdge(BaseModel):
+    """A typed enabling edge between two findings, carrying the MATERIAL the next hop needs.
+
+    `Finding.enables` was a bare list of finding keys, and the follow-up task generated from it was
+    literally "Pursue cross-chain: A enables B." The child that picked that up started from an empty
+    transcript with a 240-character evidence snippet, so the credential, token or internal host the
+    first finding actually yielded — the entire reason the chain exists — never reached the agent
+    meant to use it. An edge that does not carry its material is a suggestion, not a chain.
+    """
+
+    to_key: str
+    # How the first finding enables the second: what kind of leverage was obtained.
+    kind: Literal[
+        "credential",
+        "token",
+        "session",
+        "internal_host",
+        "file_read",
+        "code_exec",
+        "privilege",
+        "information",
+        "other",
+    ] = "other"
+    # The concrete leverage, verbatim: the cookie, the API key, the 169.254.169.254 reachability,
+    # the path that reads arbitrary files. This is what gets handed to the next dispatch.
+    material: str = ""
+    note: str = ""
+
+
+_CHAIN_KINDS = set(ChainEdge.model_fields["kind"].annotation.__args__)
+
+
+def normalise_chain_edges(raw) -> list[ChainEdge]:
+    """Build ChainEdges from a model's raw tool argument, shape-defensively.
+
+    Shared by both executor adapters on purpose: a hand-maintained copy per path is exactly the
+    divergence class `tests/test_tool_parity.py` exists to catch. A malformed edge degrades to no
+    edge and never aborts the finding — the proof is the valuable part, the chain hint rides on top.
+    """
+    out: list[ChainEdge] = []
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        to_key = str(entry.get("to_key") or "").strip()
+        if not to_key:
+            continue
+        kind = str(entry.get("kind") or "other")
+        out.append(
+            ChainEdge(
+                to_key=to_key,
+                kind=kind if kind in _CHAIN_KINDS else "other",  # type: ignore[arg-type]
+                material=str(entry.get("material") or "")[:2000],
+                note=str(entry.get("note") or "")[:400],
+            )
+        )
+    return out
+
+
 class FlowBatchRef(BaseModel):
     """A burpwn workspace of captured flows that is the evidence backing a finding."""
 
@@ -80,6 +138,10 @@ class Finding(BaseModel):
     oracle_expect: dict = Field(default_factory=dict)
     flow_batch: FlowBatchRef
     enables: list[str] = Field(default_factory=list)
+    # Typed edges carrying the material the next hop needs. `enables` stays as the plain key list
+    # for back-compat (the report's chain map, SARIF, existing baselines); when both are present
+    # `chain_edges` is the richer statement of the same relationship.
+    chain_edges: list[ChainEdge] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)
     # Executor-supplied classification (optional/additive). The numeric CVSS score shown in reports
     # is NEVER taken from the model — it is re-derived deterministically from cvss_vector at report

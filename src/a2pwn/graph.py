@@ -77,6 +77,9 @@ __all__ = [
 # The compiled child subgraph, threaded in by ``build_master_graph``. ``run_subagent``
 # references it here so the master graph never wires it as a node (clean-history guard).
 SUBAGENT_GRAPH: CompiledStateGraph | None = None
+# Out-of-band channel to running dispatches (see a2pwn.directives). Module-level for the same
+# reason SUBAGENT_GRAPH is: run_subagent is a plain function reached by the graph, not a closure.
+DIRECTIVE_BUS: Any = None
 
 _log = logging.getLogger("a2pwn")
 
@@ -296,6 +299,12 @@ async def run_subagent(payload: SubAgentInput) -> dict:
     if sub is None:  # pragma: no cover - build_master_graph always sets it
         raise RuntimeError("SUBAGENT_GRAPH is not initialised; build the master graph first")
     thread_id = f"{payload.master_ctx.engagement.name}:{payload.dispatch_id}"
+    if DIRECTIVE_BUS is not None:
+        # Register at dispatch START, not at the first tool call. The lazy join inside `drain` sets
+        # the cursor to the current end of the log, so a broadcast posted while this dispatch was
+        # still clarifying (the breaker tripping just as a sibling spins up) would be skipped
+        # entirely by the one dispatch that most needed to hear it.
+        DIRECTIVE_BUS.join(payload.dispatch_id)
     # A verify dispatch counts as one independent-verify attempt for its candidate key even when
     # it fails/errors, so a persistently-unverifiable finding drains from the queue (capped).
     attempt_key = (
@@ -361,6 +370,15 @@ async def run_subagent(payload: SubAgentInput) -> dict:
         tokens=clean.tokens,
     )
     verify_q = [f for f in confirmed if not f.independently_verified] if payload.intent == "task" else []
+    # Tell the siblings still running. Parallel dispatches routinely overlap on a target, and
+    # without this two of them prove the same bug independently — the second one's turns bought the
+    # engagement nothing it did not already have.
+    if DIRECTIVE_BUS is not None and confirmed and payload.intent == "task":
+        DIRECTIVE_BUS.post(
+            f"Dispatch {payload.dispatch_id} has PROVEN: {', '.join(f.key for f in confirmed[:4])}. "
+            "Do not spend turns re-proving these — move to a different vulnerability class, a "
+            "different asset, or a cross-chain step that escalates one of them."
+        )
     # Coverage cells settled by this dispatch, carried across the fork boundary as a surface
     # delta. The reducer merges deltas from every sibling in the fan-out.
     delta = SurfaceMap()
@@ -584,6 +602,33 @@ def _drop_already_dispatched(pending: list[TaskSpec], history: list[DispatchReco
     return out
 
 
+_BUDGET_WARN_AT = 0.8
+
+
+def _warn_on_budget(state: MasterState) -> None:
+    """Tell running dispatches once the engagement is close to its ceiling.
+
+    A sub-agent has no view of the engagement budget — it only knows its own turn cap — so without
+    this it happily opens a new line of investigation on the last dispatch the run can afford, and
+    the report is built from work that was one turn from being useful.
+    """
+    if DIRECTIVE_BUS is None:
+        return
+    budget = state["budget"]
+    fractions = [_spent(state) / budget.max_dispatches if budget.max_dispatches else 0.0]
+    if budget.max_usd:
+        fractions.append(_spent_usd(state) / budget.max_usd)
+    if budget.max_tokens:
+        fractions.append(_spent_tokens(state) / budget.max_tokens)
+    if max(fractions, default=0.0) < _BUDGET_WARN_AT:
+        return
+    DIRECTIVE_BUS.post_once(
+        "budget-ceiling",
+        f"The engagement is near its budget ceiling ({_budget_line(state)}). Wrap up: report what "
+        "you have already PROVEN rather than opening a new line of investigation.",
+    )
+
+
 _HARVEST_LIMIT = 5000
 _BODY_HARVEST_LIMIT = 40
 
@@ -657,6 +702,7 @@ def _make_integrate_node(client):
         # Coverage is the number a watching operator uses to decide whether to let a run continue,
         # so it belongs on the live dashboard and in the durable run.jsonl, not only in the report.
         progress.emit("coverage", coverage=surface.stats())
+        _warn_on_budget(state)
         return out
 
     return _integrate
@@ -787,8 +833,9 @@ def build_master_graph(
     ``interrupt_before=['run_subagent']`` unless the engagement pre-authorises active
     exploitation, so a human approves each dispatch.
     """
-    global SUBAGENT_GRAPH
+    global SUBAGENT_GRAPH, DIRECTIVE_BUS
     SUBAGENT_GRAPH = subgraph
+    DIRECTIVE_BUS = getattr(client, "_directives", None)
 
     planner = make_model(cfg.models.master)
     judge = build_continuation_judge(cfg.models)
