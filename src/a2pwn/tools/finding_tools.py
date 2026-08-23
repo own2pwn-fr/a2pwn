@@ -13,7 +13,7 @@ from __future__ import annotations
 from langchain_core.tools import BaseTool, StructuredTool
 
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
-from a2pwn.models import Finding, FlowBatchRef
+from a2pwn.models import Finding, FlowBatchRef, normalise_chain_edges
 
 _ORACLES = {
     "differential",
@@ -48,6 +48,7 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
         correlation_id: str | None = None,
         oracle_expect: dict | None = None,
         enables: list[str] | None = None,
+        chain_edges: list[dict] | None = None,
         cvss_vector: str | None = None,
         cwe_ids: list[str] | None = None,
         remediation: str | None = None,
@@ -111,6 +112,7 @@ def finding_tools(client: BurpwnClient) -> list[BaseTool]:
             oracle_expect=dict(oracle_expect or {}),
             flow_batch=ref,
             enables=list(enables or []),
+            chain_edges=normalise_chain_edges(chain_edges),
             cvss_vector=cvss_vector,
             cwe_ids=list(cwe_ids or []),
             remediation=remediation,

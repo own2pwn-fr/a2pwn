@@ -87,7 +87,9 @@ class Throttle:
     of ``None``/0 disables pacing; ``block_threshold`` of 0 disables the breaker.
     """
 
-    def __init__(self, max_rps: float | None = None, block_threshold: int = 25) -> None:
+    def __init__(
+        self, max_rps: float | None = None, block_threshold: int = 25, directives: Any = None
+    ) -> None:
         self.max_rps = float(max_rps) if max_rps else 0.0
         self.block_threshold = int(block_threshold or 0)
         self._interval = 1.0 / self.max_rps if self.max_rps > 0 else 0.0
@@ -98,6 +100,7 @@ class Throttle:
         self.blocked_total = 0
         self.tripped = False
         self.trip_reason = ""
+        self.directives = directives
 
     # ---- pacing ----------------------------------------------------------------------
     async def acquire(self) -> None:
@@ -130,6 +133,17 @@ class Throttle:
                         "WAF-blocking this engagement"
                     )
                     _log.warning("traffic circuit breaker TRIPPED: %s", self.trip_reason)
+                    # Tell every dispatch at once. Otherwise each sibling in the fan-out rediscovers
+                    # the wall independently, burning its remaining turns against a WAF before its
+                    # own next tool call happens to be refused.
+                    if self.directives is not None:
+                        self.directives.post_once(
+                            "circuit-breaker",
+                            "The target has started blocking (circuit breaker tripped): "
+                            f"{self.trip_reason}. Stop probing. Report what you have already PROVEN "
+                            "and say plainly that coverage was cut short by blocking — a blocked run "
+                            "that reports nothing reads as a clean target."
+                        )
                     return
             else:
                 self.consecutive_blocked = 0

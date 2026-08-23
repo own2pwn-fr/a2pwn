@@ -23,6 +23,7 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 
 import a2pwn.prompts as P
+from a2pwn import progress
 from a2pwn.backends import make_model
 from a2pwn.compaction import make_compaction_hook
 from a2pwn.config import RoleModels
@@ -94,6 +95,8 @@ class _SdkExecutor:
         throttle=None,
         fuzz_cap=0,
         artifacts=None,
+        directives=None,
+        research=None,
     ):
         self._model = cfg.executor.model or "sonnet"
         self._prompt = _executor_prompt(active_exploit_tools)
@@ -107,6 +110,8 @@ class _SdkExecutor:
         self._throttle = throttle
         self._fuzz_cap = fuzz_cap
         self._artifacts = artifacts
+        self._directives = directives
+        self._research = research
 
     async def ainvoke(self, state: dict, config: Any = None) -> dict:
         from langchain_core.messages import AIMessage
@@ -132,6 +137,10 @@ class _SdkExecutor:
             throttle=self._throttle,
             fuzz_cap=self._fuzz_cap,
             artifacts=self._artifacts,
+            directives=self._directives,
+            research=self._research,
+            # The dispatch id is the mailbox address; without it a directive has nowhere to land.
+            dispatch_id=progress.current_dispatch() or "",
         )
         return {
             "messages": [AIMessage(content=outcome.summary or "executed task")],
@@ -159,6 +168,8 @@ def build_executor(
     throttle: Any = None,
     fuzz_cap: int = 0,
     artifacts: Any = None,
+    directives: Any = None,
+    research: Any = None,
 ) -> Any:
     """Build the executor. On the ``claude-code`` subscription backend, use the native SDK
     tool-calling loop (:class:`_SdkExecutor`) — prompted-JSON tool-calling makes that model distrust
@@ -183,6 +194,8 @@ def build_executor(
             throttle=throttle,
             fuzz_cap=fuzz_cap,
             artifacts=artifacts,
+            directives=directives,
+            research=research,
         )
     model = make_model(cfg.executor)
     return create_react_agent(

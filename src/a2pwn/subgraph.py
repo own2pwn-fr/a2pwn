@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import operator
+import re
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -212,6 +213,86 @@ async def _verifier_notes(verifier: Any, rejected: list[Finding], not_done: list
         return ""
 
 
+_VETO_RE = re.compile(r"^\s*VETO\s+(?P<key>\S+)\s*:\s*(?P<reason>.+)$", re.M)
+
+
+async def _adversarial_veto(verifier: Any, confirmed: list[Finding]) -> dict[str, str]:
+    """Let the independent role-model REJECT an oracle-confirmed candidate. It can never accept one.
+
+    The architecture always claimed a two-layer discipline — a deterministic oracle plus an
+    adversarial verifier on a distinct, stronger model — but the verifier agent was only ever asked
+    to narrate *existing* rejections. It had no say in any verdict. This gives it one, in the only
+    direction that is safe: a veto can produce a false negative, never a false positive, so the
+    fail-closed kernel stays fail-closed and the stronger model gets to catch what a mechanical
+    oracle cannot (a "differential" that differs for an unrelated reason, an oracle re-derived
+    against the attacker's own echoed request, a capture that proves the wrong thing).
+
+    Fail-OPEN on any error or unparseable reply: the oracle already confirmed, so a flaky verifier
+    call must not silently delete a proven finding. Vetoes must cite a reason, which is carried into
+    residual gaps and `run.jsonl` so nothing disappears without a trace.
+    """
+    if getattr(verifier, "ainvoke", None) is None or not confirmed:
+        return {}
+    listing = "\n".join(
+        f"- key={c.key} oracle={c.oracle_kind} target={c.target} param={c.param or '*'} "
+        f"flows={c.flow_batch.flow_ids} evidence={c.evidence[:300]}"
+        for c in confirmed
+    )
+    prompt = (
+        "These candidates PASSED the deterministic oracle. Re-examine each one in the sandbox and "
+        "try to REFUTE it. You cannot approve anything — silence means it stands. Emit one line per "
+        "candidate you can actually refute, in exactly this form and nothing else:\n"
+        "VETO <key>: <the concrete reason the oracle fired for something other than the claimed "
+        "vulnerability>\n"
+        "Refute only on evidence you verified yourself. A hunch is not a veto.\n\n" + listing
+    )
+    try:
+        text = _last_text(await _invoke_agent(verifier, prompt))
+    except Exception as exc:  # noqa: BLE001 - fail OPEN: never drop a proven finding on an error
+        _log.warning("adversarial veto pass failed, keeping oracle verdicts: %s", exc)
+        return {}
+    keys = {c.key for c in confirmed}
+    vetoes = {
+        m.group("key"): m.group("reason").strip()
+        for m in _VETO_RE.finditer(text or "")
+        if m.group("key") in keys
+    }
+    if vetoes:
+        _log.warning("adversarial verifier vetoed %d oracle-confirmed candidate(s)", len(vetoes))
+    return vetoes
+
+
+def _unmet_task_classes(spec: TaskSpec | None, probes: list[Probe]) -> list[str]:
+    """Which classes the dispatch was ASKED to test but never recorded a verdict for.
+
+    Coverage-expanded tasks name their classes in a `classes=` hint, so "was the work actually done"
+    is answerable without an LLM: compare the ask against what `record_probe` and the oracle
+    settled. This is the peer-review step the architecture was missing — until `CleanResult.spec`
+    existed, the master could not compare a request against its result at all, because history only
+    ever recorded outcomes.
+
+    Reported as residual gaps, which the planner and the report both already read, rather than
+    silently re-queued: the operator should be able to see that a dispatch was asked for eight
+    classes and settled three.
+    """
+    if spec is None:
+        return []
+    asked: list[str] = []
+    for hint in spec.hints:
+        if hint.startswith("classes="):
+            asked = [c.strip() for c in hint[len("classes=") :].split(",") if c.strip()]
+    if not asked:
+        return []
+    settled = {p.vuln_class for p in probes}
+    missed = [c for c in asked if c not in settled]
+    if not missed:
+        return []
+    return [
+        f"NOT DONE: dispatch was asked to test {', '.join(asked)} but recorded no verdict for "
+        f"{', '.join(missed)}"
+    ]
+
+
 def _reproduces(candidate: Finding | None, confirmed: list[Finding]) -> bool:
     """Did an independent-verify dispatch actually re-derive THE candidate it was sent to check?
 
@@ -239,6 +320,8 @@ def build_subagent_graph(
     identities: Any = None,
     throttle: Any = None,
     artifacts: Any = None,
+    directives: Any = None,
+    research: Any = None,
 ) -> CompiledStateGraph:
     """Compile the stateless sub-agent subgraph (``checkpointer=False`` HARD)."""
     clarifier = build_clarifier(cfg.models)
@@ -256,6 +339,8 @@ def build_subagent_graph(
         throttle=throttle,
         fuzz_cap=cfg.fuzz_max_requests,
         artifacts=artifacts,
+        directives=directives,
+        research=research,
     )
     verifier = build_verifier(cfg.models, tools, cfg.compaction_token_threshold)
     fbm = FlowBatchManager(client)
@@ -481,6 +566,32 @@ def build_subagent_graph(
                 )
                 if "ALARM" in reason or "capture" in reason.lower():
                     capture_ok = False
+        # The second layer: an independent, stronger role-model gets to REFUTE what the mechanical
+        # oracle accepted. Reject-only by construction, so this can never manufacture a finding.
+        if confirmed:
+            vetoes = await _adversarial_veto(verifier, confirmed)
+            if vetoes:
+                survived = []
+                for c in confirmed:
+                    reason = vetoes.get(c.key)
+                    if reason is None:
+                        survived.append(c)
+                        continue
+                    rejected.append(c)
+                    not_done.append(f"VETOED {c.key}: {reason}")
+                    _log.warning("candidate %s VETOED by the adversarial verifier: %s", c.key, reason)
+                    progress.emit(
+                        "finding",
+                        status="rejected",
+                        vuln_class=c.vuln_class,
+                        severity=c.severity,
+                        target=c.target,
+                        param=c.param,
+                        reason=f"adversarial veto: {reason}",
+                        oracle_kind=c.oracle_kind,
+                    )
+                confirmed = survived
+
         accepted = not rejected
         if state["intent"] == "verify":
             # An INDEPENDENT-VERIFY dispatch must produce its OWN proof. `accepted = not rejected`
@@ -555,14 +666,25 @@ def build_subagent_graph(
         batches = state.get("flow_batches", []) or [f.flow_batch for f in findings]
         next_hops: list[TaskSpec] = []
         for f in findings:
-            for enabled in f.enables:
-                next_hops.append(
-                    TaskSpec(
-                        task=f"Pursue cross-chain: {f.key} enables {enabled}.",
-                        intent="chain",
-                        target=f.target,
-                        hints=[f"origin_finding={f.key}"],
+            # A typed edge states what leverage was obtained; hand that leverage to the next hop.
+            # Without it the follow-up dispatch was told "A enables B" and started from an empty
+            # transcript, with no access to the credential or host that made the chain a chain.
+            typed = {e.to_key: e for e in f.chain_edges}
+            for enabled in dict.fromkeys([*typed, *f.enables]):
+                edge = typed.get(enabled)
+                hints = [f"origin_finding={f.key}"]
+                if edge is not None and edge.material:
+                    task = (
+                        f"Pursue cross-chain: {f.key} yielded {edge.kind} that should enable "
+                        f"{enabled}. USE THIS MATERIAL, do not re-derive it: {edge.material}"
                     )
+                    if edge.note:
+                        task += f" ({edge.note})"
+                    hints += [f"chain_kind={edge.kind}", f"chain_material={edge.material}"]
+                else:
+                    task = f"Pursue cross-chain: {f.key} enables {enabled}."
+                next_hops.append(
+                    TaskSpec(task=task, intent="chain", target=f.target, hints=hints)
                 )
         # Recon-discovered follow-up targets (propose_targets) feed the queue exactly like a
         # cross-chain follow-up: by the next planning phase they are concrete, ready-to-dispatch
@@ -570,6 +692,7 @@ def build_subagent_graph(
         discovered = list(state.get("discovered_hosts", []))
         next_hops += discovered
         residual = list(critique.not_done) if critique is not None else []
+        residual += _unmet_task_classes(state.get("spec"), state.get("probes", []))
         summary = critique.notes if critique is not None else f"{status}: {len(findings)} finding(s)"
         if discovered:
             host_list = ", ".join(t.target for t in discovered if t.target)
