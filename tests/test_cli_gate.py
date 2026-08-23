@@ -295,16 +295,42 @@ def test_doctor_missing_burpwn_exits_1(monkeypatch):
     assert "a2pwn install-burpwn" in out
 
 
-def test_doctor_ok_exits_0(monkeypatch):
+def _doctor_env(monkeypatch, capture: dict):
     from a2pwn.burpwn import BurpwnClient
 
     monkeypatch.setattr(cli.shutil, "which", lambda _: "/usr/local/bin/burpwn")
     monkeypatch.setattr(BurpwnClient, "cli_doctor", staticmethod(lambda: {"ok": True, "namespaces": "ok"}))
+    monkeypatch.setattr(cli, "_probe_capture", lambda: capture)
+
+
+def test_doctor_ok_exits_0(monkeypatch):
+    _doctor_env(monkeypatch, {"ok": True, "detail": "cleartext HTTP captured (1 flow(s))"})
     res = runner.invoke(cli.app, ["doctor"])
     assert res.exit_code == 0, _text(res)
     out = _text(res)
     assert "burpwn on PATH" in out
     assert "ready to run" in out
+
+
+def test_doctor_fails_when_traffic_is_not_actually_captured(monkeypatch):
+    """Prerequisites present but nothing captured is the DANGEROUS failure, so it must exit non-zero.
+
+    An uncaptured run is not a broken run from the outside: every probe still fires, every candidate
+    is rejected for an empty flow batch, and the report says the target is clean. `burpwn doctor`
+    only answers "can the sandbox start", which is a different question.
+    """
+    _doctor_env(monkeypatch, {"ok": False, "detail": "captured ZERO flows (curl exit 56)"})
+    res = runner.invoke(cli.app, ["doctor"])
+    assert res.exit_code == 1
+    assert "ZERO flows" in _text(res)
+
+
+def test_doctor_treats_an_unrunnable_probe_as_unknown_not_broken(monkeypatch):
+    """A probe that could not execute must not block a run — unknown is not the same as broken."""
+    _doctor_env(monkeypatch, {"ok": None, "detail": "capture probe could not run: boom"})
+    res = runner.invoke(cli.app, ["doctor"])
+    assert res.exit_code == 0, _text(res)
+    assert "capture unverified" in _text(res)
 
 
 def test_doctor_prerequisites_incomplete_exits_1(monkeypatch):

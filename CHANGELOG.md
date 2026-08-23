@@ -186,6 +186,63 @@ All notable changes to this project are documented here. The format is based on
   a `compact_boundary` is logged, counted on the dispatch outcome and emitted to `run.jsonl`. When a
   dispatch appears to have lost the plot, this is the event that explains it.
 
+### Fixed (a safety toggle that gated nothing on most backends)
+
+- **`--active-exploit` is now enforced at the tool layer on EVERY backend.** The hard block existed
+  only on the native-SDK executor path, inside `_observe_tool`'s blocked set. On any other backend
+  the same tool list reached `_executor_prompt` as prose and the tools stayed callable — so an
+  operator who deliberately started a passive engagement got `burpwn_exec`, `burpwn_fuzz`,
+  `burpwn_req_replay` and `identity_request` anyway, while `build_executor`'s own docstring claimed
+  the gating was "deterministic in the tool wrappers". A safety toggle that gates nothing is worse
+  than no toggle, because the operator believes they are running a passive engagement. The check now
+  lives in the tool wrappers' `_gate`, next to the scope guard and the circuit breaker, and covers
+  the new `ws_connect` / `ws_replay` / `browser_*` tools too. Read-only reconnaissance is unaffected:
+  a passive engagement is still an engagement.
+
+### Added (a preflight for the failure that reports success)
+
+- **`a2pwn doctor` now proves capture, not just prerequisites** (`a2pwn.preflight`). `burpwn doctor`
+  answers "can the sandbox start" — namespaces, nftables, bubblewrap. It does not answer the
+  question a pentest depends on: does traffic that goes through the sandbox come back out as a
+  captured flow. That second failure is far more dangerous, because it is silent **in the wrong
+  direction**: every probe still runs, every oracle legitimately fails to re-derive, every candidate
+  is rejected for an empty flow batch, and the run produces a clean report about a target nobody
+  successfully tested. The preflight fetches a loopback HTTP/1.1 page through the sandbox and checks
+  the flow came back, in seconds, before the authorization gate and before any model spend. A probe
+  that cannot execute reports **unknown**, never broken — refusing to start a run over an
+  unrunnable probe would be worse than the bug it hunts.
+  This is not hypothetical: **burpwn 0.4.0 captures ZERO flows for every cleartext HTTP/1.1 target**
+  (`header_read_timeout` set on hyper's h1 builder with no timer installed, so the proxy panics per
+  connection and the client sees a reset). HTTPS/h2 is unaffected, which is exactly why it can go
+  unnoticed. On this machine `burpwn doctor` reports fully green while `a2pwn doctor` now reports
+  the capture failure.
+
+### Added (the two classes the tool could see but never test)
+
+- **A real browser, and DOM XSS made provable** (`a2pwn.browser`, `browser_render` / `browser_eval` /
+  `browser_probe_dom_xss`). `identity.py` recorded that a headless browser "cannot start inside the
+  burpwn sandbox", and that conclusion — drawn from Chromium — was generalised to browsers as a
+  whole, which quietly wrote off every client-side vulnerability class: DOM XSS, CSP in practice,
+  postMessage, and any SPA route that only exists after JavaScript runs. Re-tested against burpwn
+  0.4.0: Chromium is indeed killed by a silent SIGTRAP (exit 133, no stderr) even with
+  `--no-sandbox --no-zygote --single-process`, but **headless Firefox starts and its traffic is
+  captured**. So Playwright drives *firefox* from inside `burpwn exec`, the egress invariant holds,
+  and `browser_render` returns the post-JavaScript DOM a curl of the same URL can never show —
+  forms, links, script srcs, `postMessage` listeners, storage keys, console errors.
+  `browser_probe_dom_xss` is the part that matters: it injects a payload carrying a unique marker
+  and reports whether the marker's assignment **actually ran**, so a payload that merely reflects
+  is classified `reflected-not-executed` and never counts. Reflection is not execution, and the
+  whole point of a DOM oracle is refusing to confuse them.
+- **WebSocket testing** (`ws_connect`, `ws_replay`), on a **stdlib-only** RFC 6455 client that runs
+  inside the sandbox — no `websocat`, no `websockets` package, nothing that has to happen to be
+  installed. `ws` flows were already capturable and completely untestable: the skill declared tools
+  that were not in the registry, so the `websocket` coverage cell could never be cleared by anything
+  but a guess. `ws_replay` is the higher-value half — it takes a *captured* flow, reuses its URL and
+  credentials, and resends a tampered message, which is how the authorization and business-logic
+  bugs of a realtime app are reached at all: such a channel is authorised once, at the handshake,
+  and never again. Both tools go through the same scope guard, circuit breaker and rate limiter as
+  every other target-facing tool, and both are in `ACTIVE_TOOL_NAMES`.
+
 ### Added (deep application research: CVEs and client-side code)
 
 - **CVE / advisory lookups** (`a2pwn.research`, `cve_lookup`, `research_fetch`). The

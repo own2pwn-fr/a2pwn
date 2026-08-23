@@ -55,7 +55,21 @@ class ToolSpec:
 
 # Tool names that must hard-block when the engagement did not pre-authorise active exploitation.
 ACTIVE_TOOL_NAMES = frozenset(
-    {"burpwn_exec", "burpwn_fuzz", "burpwn_req_replay", "burpwn_intercept_forward", "identity_request"}
+    {
+        "burpwn_exec",
+        "burpwn_fuzz",
+        "burpwn_req_replay",
+        "burpwn_intercept_forward",
+        "identity_request",
+        # These send real, attacker-controlled traffic to the target exactly like a replay does:
+        # ws_replay resends a captured authenticated channel with tampered content, and
+        # browser_probe_dom_xss navigates the target with a live payload.
+        "ws_connect",
+        "ws_replay",
+        "browser_render",
+        "browser_eval",
+        "browser_probe_dom_xss",
+    }
 )
 
 
@@ -69,6 +83,19 @@ def _identity_help(store: IdentityStore | None) -> str:
     )
 
 
+def active_refusal(name: str) -> dict:
+    """The envelope an active tool returns when active exploitation is not authorised."""
+    return {
+        "error": "active-exploit-not-authorised",
+        "refused": True,
+        "message": (
+            f"BLOCKED: active exploitation not authorised for {name}. This engagement was started "
+            "without --active-exploit, so mutating/destructive traffic is refused at the tool layer. "
+            "Passive reconnaissance and read-only probing are still available."
+        ),
+    }
+
+
 def build_tool_specs(
     client: Any,
     *,
@@ -76,6 +103,7 @@ def build_tool_specs(
     identities: IdentityStore | None = None,
     throttle: Throttle | None = None,
     fuzz_cap: int = 0,
+    active_allowed: bool = True,
 ) -> list[ToolSpec]:
     """Build every tool spec bound to one client + engagement policy.
 
@@ -87,8 +115,21 @@ def build_tool_specs(
     throttle = throttle or Throttle()
     ident_help = _identity_help(identities)
 
-    async def _gate(where: str, tokens: list[str]) -> dict | None:
-        """Scope + breaker + rate limit. Returns a refusal envelope, or ``None`` to proceed."""
+    async def _gate(where: str, tokens: list[str], *, active: bool = True) -> dict | None:
+        """Active-exploit authorisation + scope + breaker + rate limit. Returns a refusal envelope,
+        or ``None`` to proceed.
+
+        The active-exploit check lives HERE, next to the other deterministic controls, because it
+        used to live only in the native-SDK executor's blocked set. On any other backend the tool
+        list reached the prompt as prose and the tools stayed callable, so `--active-exploit` was a
+        request rather than a control — while `build_executor`'s docstring claimed the gating was
+        "deterministic in the tool wrappers". A safety toggle that gates nothing is worse than no
+        toggle, because the operator believes they are running a passive engagement.
+        """
+        if active and not active_allowed:
+            name = where.split()[0]
+            _log.warning("%s REFUSED: active exploitation not authorised", name)
+            return active_refusal(name)
         bad = guard.off_scope_tokens(tokens)
         if bad:
             _log.warning("%s REFUSED: out-of-scope destination(s) %s", where, bad)

@@ -51,6 +51,17 @@ from a2pwn.scope import ScopeGuard, host_of
 from a2pwn.throttle import Throttle
 from a2pwn.toolcore import build_tool_specs
 from a2pwn.tools.artifact_tools import ARTIFACT_TOOL_SPECS
+from a2pwn.tools.browser_tools import (
+    BROWSER_EVAL_DESC,
+    BROWSER_EVAL_SCHEMA,
+    BROWSER_PROBE_DOM_XSS_DESC,
+    BROWSER_PROBE_DOM_XSS_SCHEMA,
+    BROWSER_RENDER_DESC,
+    BROWSER_RENDER_SCHEMA,
+    run_browser_eval,
+    run_browser_probe_dom_xss,
+    run_browser_render,
+)
 from a2pwn.tools.coverage_tools import PROBE_SCHEMA, RECORD_PROBE_DESC, build_probe
 from a2pwn.tools.research_tools import (
     CVE_LOOKUP_DESC,
@@ -63,6 +74,7 @@ from a2pwn.tools.research_tools import (
     RESEARCH_FETCH_SCHEMA,
     run_js_analyze,
 )
+from a2pwn.tools.websocket_tools import build_ws_tool_specs
 
 # Child of the "a2pwn" logger so the TUI's WARNING-silencing still applies, but `--plain` (INFO) and
 # `-v` (DEBUG) surface the sub-agent's otherwise-invisible tool calls, results and refusals.
@@ -280,6 +292,7 @@ async def run_sdk_agent(
     artifacts: ArtifactStore | None = None,
     directives: DirectiveBus | None = None,
     research: Any = None,
+    browser: Any = None,
 ) -> SdkExecOutcome:
     """Run the pentest executor/verifier as a native claude-agent-sdk agent loop.
 
@@ -450,8 +463,15 @@ async def run_sdk_agent(
     # ---- static tool specs: (name, description, input_schema, handler) ------------------
     # The burpwn hot loop comes from the SHARED definition so this path and the LangChain path can
     # never drift; only the oracle/finding/recon emitters are SDK-local.
+    # WebSocket comes from its own spec builder but is the same ToolSpec shape, so it adapts
+    # identically — a ws flow was capturable and untestable before this, which is the shape of a
+    # coverage cell that can never be cleared.
+    ws_specs = build_ws_tool_specs(
+        client, guard=guard, identities=identities, throttle=throttle
+    )
     specs: list[tuple[str, str, dict, object]] = [
-        (spec.name, spec.description, spec.schema, _adapt(spec.fn)) for spec in shared_specs
+        (spec.name, spec.description, spec.schema, _adapt(spec.fn))
+        for spec in [*shared_specs, *ws_specs]
     ] + [
         (
             "run_oracle",
@@ -541,6 +561,40 @@ async def run_sdk_agent(
             ("cve_lookup", CVE_LOOKUP_DESC, CVE_LOOKUP_SCHEMA, _cve_lookup),
             ("research_fetch", RESEARCH_FETCH_DESC, RESEARCH_FETCH_SCHEMA, _research_fetch),
             ("jwt_decode", JWT_DECODE_DESC, JWT_DECODE_SCHEMA, _jwt_decode),
+        ]
+
+    # ---- real browser (mirrors a2pwn.tools.browser_tools EXACTLY) ------------------------------
+    if browser is not None:
+
+        async def _browser_render(args: dict) -> dict:
+            return _json_result(await run_browser_render(browser, str(args.get("url") or "")))
+
+        async def _browser_eval(args: dict) -> dict:
+            return _json_result(
+                await run_browser_eval(
+                    browser, str(args.get("url") or ""), str(args.get("expression") or "")
+                )
+            )
+
+        async def _browser_probe_dom_xss(args: dict) -> dict:
+            return _json_result(
+                await run_browser_probe_dom_xss(
+                    browser,
+                    str(args.get("url") or ""),
+                    str(args.get("param") or "hash"),
+                    str(args.get("payload") or ""),
+                )
+            )
+
+        specs += [
+            ("browser_render", BROWSER_RENDER_DESC, BROWSER_RENDER_SCHEMA, _browser_render),
+            ("browser_eval", BROWSER_EVAL_DESC, BROWSER_EVAL_SCHEMA, _browser_eval),
+            (
+                "browser_probe_dom_xss",
+                BROWSER_PROBE_DOM_XSS_DESC,
+                BROWSER_PROBE_DOM_XSS_SCHEMA,
+                _browser_probe_dom_xss,
+            ),
         ]
 
     # ---- artifact access (only when a store is wired; mirrors a2pwn.tools.artifact_tools) ------

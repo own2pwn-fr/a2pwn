@@ -42,6 +42,7 @@ def burpwn_tools(
         identities=identities,
         throttle=throttle,
         fuzz_cap=fuzz_cap,
+        active_allowed=bool(getattr(engagement, "active_exploit_allowed", True)),
     )
     return [
         StructuredTool.from_function(coroutine=spec.fn, name=spec.name, description=spec.description)

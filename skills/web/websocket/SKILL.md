@@ -7,7 +7,7 @@ description: >
   applied only at handshake, message-level injection (XSS/SQLi through the socket),
   IDOR on subscription topics, and rate/flood limits absent on the message channel.
 tags: [web, websocket, ws, cswsh, origin, realtime, access-control, injection]
-tools: [curl, websocat, python3]
+tools: [ws_connect, ws_replay, curl]
 payloads:
   - {kind: glob, path: "vendor/PayloadsAllTheThings/Web Sockets/*.md", license: MIT, credit: "swisskyrepo/PayloadsAllTheThings"}
 verification:
@@ -65,16 +65,29 @@ the message is rendered into another user's DOM. A marker delivered to a SECOND
 identity's session is the `marker` oracle, and is the strongest stored-XSS proof
 available on this channel.
 
-## Driving a socket inside the sandbox
-Use `burpwn_exec` so the traffic is captured like everything else — a raw socket
-opened outside the sandbox is uncaptured and its evidence is worthless:
+## Driving a socket
+Use the dedicated tools — they run a stdlib RFC 6455 client inside the sandbox, so
+the frames are captured like any other traffic and can back a finding. Do NOT reach
+for `websocat` or a hand-written `python3 -c` script: neither is guaranteed to exist
+in the sandbox, and an uncaptured socket produces evidence worth nothing.
 
 ```
-burpwn_exec argv=["websocat", "-H=Origin: https://attacker.tld", "wss://target/ws"]
+ws_connect url="wss://target/ws" headers=["Origin: https://attacker.tld"]
+           messages=["{\"action\":\"subscribe\",\"topic\":\"orders/1337\"}"]
 ```
 
-When `websocat` is unavailable, drive it with a short `python3 -c` script using
-`websockets`/`websocket-client`. Either way it runs through `burpwn_exec`.
+`ws_replay` is the higher-value one: give it a CAPTURED ws flow id and it reuses that
+flow's URL and credentials while sending a message you tampered with. That is how you
+reach authorization and business-logic bugs on a channel that was authorised once, at
+the handshake, and never again.
+
+```
+ws_replay flow_id=42 message="{\"action\":\"admin_broadcast\"}"
+```
+
+For CSWSH, `ws_connect` with a foreign `Origin` header and no cookies is the attacker
+case; the same call carrying the victim identity's cookies is the one that must be
+compared against it.
 
 ## Oracle
 - `two_identity` for CSWSH and cross-subscription IDOR (always include the

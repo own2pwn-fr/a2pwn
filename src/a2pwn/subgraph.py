@@ -322,6 +322,7 @@ def build_subagent_graph(
     artifacts: Any = None,
     directives: Any = None,
     research: Any = None,
+    browser: Any = None,
 ) -> CompiledStateGraph:
     """Compile the stateless sub-agent subgraph (``checkpointer=False`` HARD)."""
     clarifier = build_clarifier(cfg.models)
@@ -341,6 +342,7 @@ def build_subagent_graph(
         artifacts=artifacts,
         directives=directives,
         research=research,
+        browser=browser,
     )
     verifier = build_verifier(cfg.models, tools, cfg.compaction_token_threshold)
     fbm = FlowBatchManager(client)

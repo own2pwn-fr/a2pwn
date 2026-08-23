@@ -34,6 +34,8 @@ def _engagement(identities=None) -> EngagementSpec:
         in_scope=["app.example.com"],
         identities=list(identities or []),
         session="t",
+        # identity_request is an active tool; these tests are about credentials, not authorisation.
+        active_exploit_allowed=True,
     )
 
 

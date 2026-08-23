@@ -43,6 +43,10 @@ vertex = ["langchain-google-vertexai>=2.0"]
 google = ["langchain-google-genai>=2.0"]
 litellm = ["langchain-litellm>=0.1"]
 postgres = ["langgraph-checkpoint-postgres>=2.0", "psycopg[binary]>=3.2"]
+# Headless-browser capability (a2pwn.browser). Optional because it drags in a ~50 MB Firefox
+# build that only matters for the client-side classes (DOM XSS, postMessage, CSP-in-practice);
+# every import of it is lazy, so a base install degrades to "browser unavailable", never a crash.
+browser = ["playwright>=1.44"]
 all = [
     "langchain-openai>=0.2",
     "langchain-aws>=0.2",
@@ -51,6 +55,7 @@ all = [
     "langchain-litellm>=0.1",
     "langgraph-checkpoint-postgres>=2.0",
     "psycopg[binary]>=3.2",
+    "playwright>=1.44",
 ]
 
 [project.scripts]

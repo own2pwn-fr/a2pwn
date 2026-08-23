@@ -17,9 +17,16 @@ from a2pwn.throttle import Throttle, clamp_fuzz_payloads
 from a2pwn.tools import burpwn_tools
 
 
-def _engagement() -> EngagementSpec:
+def _engagement(active: bool = True) -> EngagementSpec:
+    # These tests are about pacing and the breaker, so they authorise active exploitation: without
+    # it the tool wrappers now refuse before any traffic policy is consulted (see
+    # test_active_exploit_is_blocked_at_the_tool_layer_on_the_langchain_path).
     return EngagementSpec(
-        name="t", targets=["https://app.example.com/"], in_scope=["app.example.com"], session="t"
+        name="t",
+        targets=["https://app.example.com/"],
+        in_scope=["app.example.com"],
+        session="t",
+        active_exploit_allowed=active,
     )
 
 
@@ -190,3 +197,33 @@ def test_html_report_shows_the_blocked_banner():
 
 def test_clean_run_has_no_blocked_banner():
     assert "TESTING WAS BLOCKED" not in render_markdown(Report(engagement="t", traffic={"tripped": False}))
+
+
+async def test_active_exploit_is_blocked_at_the_tool_layer_on_the_langchain_path(fake_client):
+    """`--active-exploit` must be a control on EVERY backend, not only the native-SDK one.
+
+    The block used to live solely in the SDK executor's `_observe_tool` blocked set. On any other
+    backend the same tool list reached the prompt as prose and the tools stayed callable, so an
+    operator who deliberately started a passive engagement got mutating traffic anyway — while
+    `build_executor`'s docstring claimed the gating was "deterministic in the tool wrappers".
+    """
+    tools = {t.name: t for t in burpwn_tools(fake_client, _engagement(active=False))}
+
+    for name, kwargs in (
+        ("burpwn_exec", {"argv": ["curl", "https://app.example.com/"]}),
+        ("burpwn_req_replay", {"id": 1}),
+        ("burpwn_fuzz", {"flow": 1, "positions": ["0:1"], "payloads": ["x"]}),
+    ):
+        out = await tools[name].coroutine(**kwargs)
+        assert out["refused"] is True, name
+        assert out["error"] == "active-exploit-not-authorised", name
+    assert fake_client.execs == []  # nothing was run, not merely discouraged
+
+
+async def test_read_only_tools_stay_available_without_active_exploit(fake_client):
+    """A passive engagement is still an engagement: recon must keep working."""
+    tools = {t.name: t for t in burpwn_tools(fake_client, _engagement(active=False))}
+
+    out = await tools["burpwn_req_list"].coroutine()
+
+    assert "refused" not in out

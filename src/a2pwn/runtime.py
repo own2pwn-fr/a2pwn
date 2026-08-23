@@ -26,6 +26,7 @@ from langgraph.types import Command
 from a2pwn import progress
 from a2pwn.agents import MasterFork
 from a2pwn.artifacts import ArtifactStore
+from a2pwn.browser import BrowserDriver
 from a2pwn.budget import STOP, DispatchBudget, install_stop_handler
 from a2pwn.burpwn import BurpwnClient
 from a2pwn.catalog import all_cards, as_langchain_tools, load_skill
@@ -37,11 +38,14 @@ from a2pwn.graph import build_master_graph, build_subagent_graph
 from a2pwn.identity import IdentityStore
 from a2pwn.report import Report, build_report
 from a2pwn.research import ResearchClient
+from a2pwn.scope import ScopeGuard
 from a2pwn.throttle import Throttle
 from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools, recon_tools
 from a2pwn.tools.artifact_tools import artifact_tools
+from a2pwn.tools.browser_tools import browser_tools
 from a2pwn.tools.coverage_tools import coverage_tools
 from a2pwn.tools.research_tools import research_tools
+from a2pwn.tools.websocket_tools import websocket_tools
 
 _log = logging.getLogger("a2pwn")
 
@@ -267,6 +271,19 @@ async def bootstrap(
         in_scope_hosts=[*cfg.engagement.targets, *cfg.engagement.in_scope],
     )
 
+    # A real browser, driven inside the sandbox so its traffic stays captured. Firefox, not
+    # Chromium: Chromium is killed with a silent SIGTRAP in there (see a2pwn.identity), which was
+    # long read as "browsers are impossible" and left the whole DOM class unprovable.
+    # NOT run_out_dir(): ~/.local/share is mounted READ-ONLY inside the sandbox, so the driver
+    # could not write its digest there.
+    guard = ScopeGuard.from_engagement(cfg.engagement)
+    browser = BrowserDriver(
+        client,
+        work_dir=Path.cwd() / ".a2pwn-browser",
+        guard=guard,
+        throttle=throttle,
+    )
+
     skills = _seed_skills(cfg)
     tools = (
         as_langchain_tools(skills, client, collab)
@@ -287,6 +304,8 @@ async def bootstrap(
         + coverage_tools()
         + artifact_tools(artifacts)
         + research_tools(artifacts, research)
+        + websocket_tools(client, cfg.engagement, identities=identities, throttle=throttle)
+        + browser_tools(browser, cfg.engagement)
     )
 
     subgraph = build_subagent_graph(
@@ -301,6 +320,7 @@ async def bootstrap(
         artifacts=artifacts,
         directives=directives,
         research=research,
+        browser=browser,
     )
     graph = build_master_graph(cfg, subgraph, client, checkpointer)
     return client, graph, checkpointer

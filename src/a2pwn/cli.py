@@ -831,6 +831,26 @@ def retest(
         typer.echo(f"  new since baseline     : {len(delta['new_since_baseline'])}")
 
 
+def _probe_capture() -> dict:
+    """Run the live cleartext-capture probe against a throwaway burpwn session."""
+    import asyncio
+
+    from a2pwn.burpwn import BurpwnClient
+    from a2pwn.preflight import probe_cleartext_capture
+
+    async def _run() -> dict:
+        client = BurpwnClient(session="a2pwn-doctor")
+        try:
+            return await probe_cleartext_capture(client)
+        finally:
+            await client.close()
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001 - unknown beats a false alarm
+        return {"ok": None, "detail": f"capture probe could not run: {exc}"}
+
+
 @app.command()
 def doctor() -> None:
     """Preflight the host: is burpwn installed, and does the sandbox have what it needs?
@@ -862,7 +882,20 @@ def doctor() -> None:
                 continue
             typer.echo(f"    {key}: {value}")
     if ok:
-        typer.echo("✓ sandbox prerequisites OK — you're ready to run.")
+        typer.echo("✓ sandbox prerequisites OK.")
+        # The prerequisites being present does not mean traffic is actually captured, and the
+        # difference is the whole product: an uncaptured run still probes, still rejects every
+        # candidate for an empty flow batch, and still reports a clean target.
+        capture = _probe_capture()
+        if capture["ok"] is True:
+            typer.echo(f"✓ capture: {capture['detail']}")
+            typer.echo("✓ ready to run.")
+        elif capture["ok"] is None:
+            typer.echo(f"? capture: {capture['detail']}")
+            typer.echo("✓ prerequisites OK; capture unverified.")
+        else:
+            typer.echo(f"✗ capture: {capture['detail']}", err=True)
+            ok = False
     else:
         typer.echo(
             "✗ sandbox prerequisites incomplete (rootless user/network namespaces). "
