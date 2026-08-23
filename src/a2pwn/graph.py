@@ -35,6 +35,16 @@ from a2pwn.backends import make_model
 from a2pwn.budget import DispatchBudget
 from a2pwn.burpwn import BurpwnClient
 from a2pwn.config import A2pwnConfig
+from a2pwn.coverage import (
+    Asset,
+    SurfaceMap,
+    coverage_digest,
+    expand_coverage_tasks,
+    harvest,
+    merge_surface,
+    needs_body_harvest,
+    params_from_detail,
+)
 from a2pwn.models import (
     CleanResult,
     DispatchRecord,
@@ -138,6 +148,12 @@ class MasterState(TypedDict):
     verify_queue: Annotated[list[Finding], operator.add]
     # finding.key -> count of independent-verify dispatches spent on it (capped drain).
     verify_attempts: Annotated[dict[str, int], _merge_attempts]
+    # The attack surface and the coverage matrix over it. This is what makes exhaustiveness a
+    # property of the data rather than of how forcefully the prompts phrase it: assets are
+    # harvested deterministically from captured traffic, cells carry a verdict, and the untested
+    # cells are a work-list. Reduced monotonically so a parallel fan-out cannot lose a sibling's
+    # coverage, exactly like `findings`.
+    surface: Annotated[SurfaceMap, merge_surface]
     phase: str
     round: int
     # How many times the continuation judge re-opened the engagement after a natural "done" (capped).
@@ -345,7 +361,13 @@ async def run_subagent(payload: SubAgentInput) -> dict:
         tokens=clean.tokens,
     )
     verify_q = [f for f in confirmed if not f.independently_verified] if payload.intent == "task" else []
+    # Coverage cells settled by this dispatch, carried across the fork boundary as a surface
+    # delta. The reducer merges deltas from every sibling in the fan-out.
+    delta = SurfaceMap()
+    for probe in clean.probes:
+        delta.record(probe)
     return {
+        "surface": delta,
         "dispatch_results": [clean],
         "findings": confirmed,
         "verify_queue": verify_q,
@@ -365,6 +387,17 @@ class _PlanOut(BaseModel):
     tasks: list[TaskSpec] = Field(default_factory=list)
 
 
+def _budget_line(state: MasterState) -> str:
+    """One line of remaining budget, for roles that are asked to pace themselves."""
+    budget = state["budget"]
+    parts = [f"dispatches {_spent(state)}/{budget.max_dispatches}", f"phases {state['round']}/{budget.max_phases}"]
+    if budget.max_usd:
+        parts.append(f"usd {state.get('spent_usd', 0.0):.2f}/{budget.max_usd:.2f}")
+    if budget.max_tokens:
+        parts.append(f"tokens {state.get('spent_tokens', 0)}/{budget.max_tokens}")
+    return ", ".join(parts)
+
+
 async def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
     """Ask the master planner for fresh TaskSpecs. Degrades to ``[]`` on any error so a
     missing/offline model ends the run cleanly instead of hanging.
@@ -377,6 +410,12 @@ async def propose_tasks(planner: Any, state: MasterState) -> list[TaskSpec]:
             "engagement": state["engagement"],
             "history": state["history"][-8:],
             "findings": state.get("findings", []),
+            # History is truncated to the last 8 records, so the planner cannot enumerate what it
+            # has not yet tried by reading it. The digest states that directly.
+            "coverage": coverage_digest(state.get("surface") or SurfaceMap()),
+            # It was told to "stop planning when the budget is near exhaustion" while being shown
+            # no budget at all.
+            "budget_remaining": _budget_line(state),
         }
         messages = P.render_messages(P.MASTER_PLAN_SYS, ctx)
         out = await planner.with_structured_output(_PlanOut).ainvoke(messages)
@@ -437,7 +476,16 @@ def _make_bootstrap(cfg: A2pwnConfig):
         # or any programmatic caller driving the graph from a custom initial state) is left untouched
         # rather than clobbered.
         existing_pending = state.get("pending") or []
+        # Seed the surface with the declared scope so the matrix is populated before a single
+        # packet is sent: the host-level classes (fingerprinting, content discovery, CORS, host
+        # header, smuggling, cache) are known to apply from the engagement definition alone.
+        seed_surface = SurfaceMap()
+        for raw in cfg.engagement.targets or []:
+            host = host_of(raw) or raw
+            if host:
+                seed_surface.add_asset(Asset(kind="host", host=host, source="config"))
         return {
+            "surface": seed_surface,
             "phase": "recon",
             "round": 0,
             "verify_attempts": {},
@@ -473,6 +521,18 @@ def _make_plan_node(planner: Any):
         pending = list(state.get("pending") or [])
         if not pending and not _pending_verify(state):
             pending = await propose_tasks(planner, state)
+            if not pending:
+                # The planner is a good PRIORITISER and a poor ENUMERATOR: it sees eight history
+                # records and is asked to remember every endpoint it has seen and every class it
+                # has not yet tried. When it runs dry, the matrix still knows. Expanding untested
+                # cells here is what makes exhaustiveness structural rather than exhortative — the
+                # run cannot quietly stop while applicable classes have no verdict.
+                pending = expand_coverage_tasks(
+                    state.get("surface") or SurfaceMap(), limit=state["budget"].max_batch_width
+                )
+                pending = _drop_already_dispatched(pending, state.get("history", []))
+                if pending:
+                    _log.info("planner dry; expanded %d untested coverage cell(s)", len(pending))
         parallel, deferred = partition_pending(pending)
         clamped = state["budget"].clamp(parallel, _spent(state))
         overflow = parallel[len(clamped) :]
@@ -522,6 +582,84 @@ def _drop_already_dispatched(pending: list[TaskSpec], history: list[DispatchReco
         seen.add(sig)
         out.append(spec)
     return out
+
+
+_HARVEST_LIMIT = 5000
+_BODY_HARVEST_LIMIT = 40
+
+
+async def _harvest_surface(client, surface: SurfaceMap) -> SurfaceMap:
+    """Fold newly-captured burpwn flows into the surface map.
+
+    The traffic is the ground truth about what surface exists: it cannot invent an endpoint nobody
+    reached, and it cannot forget one the model neglected to mention. Incremental via
+    ``harvest_cursor`` so a long engagement does not re-scan its whole capture every phase.
+    Best-effort — a burpwn hiccup degrades coverage tracking, it must never abort a phase.
+    """
+    try:
+        listing = await client.req_list(limit=_HARVEST_LIMIT)
+    except Exception as exc:  # noqa: BLE001 - coverage is diagnostic, never load-bearing for a dispatch
+        _log.warning("surface harvest skipped (burpwn req_list failed): %s", exc)
+        return surface
+    flows = listing.get("flows") if isinstance(listing, dict) else None
+    if not isinstance(flows, list):
+        return surface
+    if len(flows) >= _HARVEST_LIMIT:
+        _log.info(
+            "surface harvest hit the %s-flow listing cap; older flows may be missing from the matrix",
+            _HARVEST_LIMIT,
+        )
+    rows = [f for f in flows if isinstance(f, dict)]
+    # The listing shows the query string but never the request body, and a JSON API keeps every one
+    # of its injection sinks there. Pay one req_show per new body-bearing flow to enumerate them,
+    # bounded per phase so a chatty API cannot turn coverage bookkeeping into the run's main cost.
+    cursor = surface.harvest_cursor
+    body_assets: list = []
+    budget = _BODY_HARVEST_LIMIT
+    for row in rows:
+        if budget <= 0:
+            break
+        try:
+            fid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not fid or fid <= cursor or not needs_body_harvest(row):
+            continue
+        budget -= 1
+        try:
+            detail = await client.req_show(fid)
+        except Exception as exc:  # noqa: BLE001 - a single unreadable flow must not stop the harvest
+            _log.debug("body harvest skipped flow %s: %s", fid, exc)
+            continue
+        if isinstance(detail, dict):
+            detail.setdefault("id", fid)
+            # `req_show` is not guaranteed to carry a top-level scheme, and the listing row is the
+            # only place it is known. Without this, body-derived params on an http-only or
+            # odd-port target fall back to https:// while query-derived params on the SAME flow
+            # get it right — two code paths disagreeing about one address.
+            if row.get("scheme"):
+                detail.setdefault("scheme", row["scheme"])
+            body_assets.extend(params_from_detail(detail))
+    out = harvest(surface, rows)
+    for asset in body_assets:
+        out.add_asset(asset)
+    return out
+
+
+def _make_integrate_node(client):
+    """`integrate` needs the burpwn client to harvest surface from the capture, so it is built
+    rather than referenced directly. The module-level name stays for tests and back-compat."""
+
+    async def _integrate(state: MasterState) -> dict:
+        out = await _integrate_node(state)
+        surface = await _harvest_surface(client, state.get("surface") or SurfaceMap())
+        out["surface"] = surface
+        # Coverage is the number a watching operator uses to decide whether to let a run continue,
+        # so it belongs on the live dashboard and in the durable run.jsonl, not only in the report.
+        progress.emit("coverage", coverage=surface.stats())
+        return out
+
+    return _integrate
 
 
 async def _integrate_node(state: MasterState) -> dict:
@@ -598,6 +736,7 @@ def _make_judge_node(judge: Any, cfg: A2pwnConfig):
             "in_scope": state["engagement"].in_scope or state["engagement"].targets,
             "history": state.get("history", []),
             "findings": state.get("findings", []),
+            "coverage": coverage_digest(state.get("surface") or SurfaceMap(), max_lines=40),
         }
         try:
             verdict = await judge.ainvoke(ctx)
@@ -606,6 +745,10 @@ def _make_judge_node(judge: Any, cfg: A2pwnConfig):
             return {"pending": [], "phase": "complete"}
         remaining = list(getattr(verdict, "remaining_work", []) or [])
         if getattr(verdict, "complete", True) or not remaining:
+            # No matrix override here on purpose: `plan` already expands untested cells before the
+            # run can ever reach this node, so a second expansion would be unreachable code. What
+            # the judge gets instead is the coverage digest in its context, so its verdict is made
+            # against the ledger rather than against a truncated narrative.
             _log.info("continuation judge: engagement complete — %s", getattr(verdict, "rationale", ""))
             return {"pending": [], "phase": "complete"}
         _log.info(
@@ -654,7 +797,7 @@ def build_master_graph(
     builder.add_node("bootstrap", _make_bootstrap(cfg))
     builder.add_node("plan", _make_plan_node(planner))
     builder.add_node("run_subagent", run_subagent)
-    builder.add_node("integrate", _integrate_node)
+    builder.add_node("integrate", _make_integrate_node(client))
     builder.add_node("judge", _make_judge_node(judge, cfg))
     builder.add_node("report", _report_node)
 

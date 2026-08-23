@@ -93,6 +93,7 @@ class _SdkExecutor:
         identities=None,
         throttle=None,
         fuzz_cap=0,
+        artifacts=None,
     ):
         self._model = cfg.executor.model or "sonnet"
         self._prompt = _executor_prompt(active_exploit_tools)
@@ -105,6 +106,7 @@ class _SdkExecutor:
         self._identities = identities
         self._throttle = throttle
         self._fuzz_cap = fuzz_cap
+        self._artifacts = artifacts
 
     async def ainvoke(self, state: dict, config: Any = None) -> dict:
         from langchain_core.messages import AIMessage
@@ -129,12 +131,14 @@ class _SdkExecutor:
             identities=self._identities,
             throttle=self._throttle,
             fuzz_cap=self._fuzz_cap,
+            artifacts=self._artifacts,
         )
         return {
             "messages": [AIMessage(content=outcome.summary or "executed task")],
             "candidate_findings": list(outcome.candidate_findings),
             "flow_batches": list(outcome.flow_batches),
             "discovered_hosts": list(outcome.discovered_hosts),
+            "probes": list(outcome.probes),
             "cost_usd": outcome.cost_usd,
             "tokens": outcome.tokens,
         }
@@ -154,6 +158,7 @@ def build_executor(
     identities: Any = None,
     throttle: Any = None,
     fuzz_cap: int = 0,
+    artifacts: Any = None,
 ) -> Any:
     """Build the executor. On the ``claude-code`` subscription backend, use the native SDK
     tool-calling loop (:class:`_SdkExecutor`) — prompted-JSON tool-calling makes that model distrust
@@ -177,6 +182,7 @@ def build_executor(
             identities=identities,
             throttle=throttle,
             fuzz_cap=fuzz_cap,
+            artifacts=artifacts,
         )
     model = make_model(cfg.executor)
     return create_react_agent(

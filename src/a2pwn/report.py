@@ -19,6 +19,7 @@ import shlex
 from pydantic import BaseModel, Field
 
 from a2pwn.burpwn import BurpwnClient
+from a2pwn.coverage import SurfaceMap, applicable_classes
 from a2pwn.cvss import parse_cvss31
 from a2pwn.models import Finding
 
@@ -150,6 +151,10 @@ class Report(BaseModel):
     traffic: dict = Field(default_factory=dict)
     # Populated by `a2pwn retest`: which baseline findings are fixed, still vulnerable, or new.
     retest: dict = Field(default_factory=dict)
+    # Frozen snapshot of the coverage matrix (`coverage.SurfaceMap`), as plain JSON. Same argument
+    # as ``traffic``: without it a 0-finding report is indistinguishable from a target nobody ever
+    # visited, and the reader has no way to tell which endpoints the absence of findings covers.
+    coverage: dict = Field(default_factory=dict)
 
 
 def _sort_findings(findings: list[Finding]) -> list[Finding]:
@@ -239,6 +244,32 @@ def _compute_stats(
     }
 
 
+def _coverage_payload(surface) -> dict:
+    """Freeze the coverage matrix into plain JSON the renderers can work from.
+
+    The renderers deliberately never touch a live :class:`SurfaceMap`: ``report.json`` is the
+    archival artifact, and a reader (or ``a2pwn retest``) reconstructing what was tested must not
+    need the object graph — or the same a2pwn version — to do it.
+    """
+    if not surface:
+        return {}
+    if isinstance(surface, dict):  # a checkpoint restored through a plain-JSON path
+        surface = SurfaceMap.model_validate(surface)
+    by_asset: list[dict] = []
+    for asset in surface.assets.values():
+        classes = applicable_classes(asset)
+        if not classes:
+            continue
+        by_asset.append(
+            {
+                "label": asset.label(),
+                "kind": asset.kind,
+                "verdicts": {c: surface.verdict_of(asset.key, c) for c in classes},
+            }
+        )
+    return {**surface.stats(), "by_asset": by_asset}
+
+
 async def build_report(
     state,
     client: BurpwnClient,
@@ -314,6 +345,7 @@ async def build_report(
         cost_usd=round(float(state.get("spent_usd", 0.0) or 0.0), 4),
         tokens_spent=int(state.get("spent_tokens", 0) or 0),
         traffic=dict(traffic or {}),
+        coverage=_coverage_payload(state.get("surface")),
         retest=_retest_delta(baseline, findings, confirmed_only),
         started_at=started_at,
         duration_secs=duration_secs,
@@ -498,6 +530,82 @@ def _traffic_lines(r: Report) -> list[str]:
     ]
 
 
+# Enough rows to be useful in a document a human reads, few enough that a wide engagement does not
+# bury the findings under a thousand matrix lines; report.json keeps the full matrix either way.
+_MAX_COVERAGE_ROWS = 25
+_MAX_CLASSES_PER_ROW = 10
+
+_COVERAGE_BLURB = (
+    "What was actually tested. A cell is one (asset × vulnerability class) pair, and it counts as "
+    "covered only once a dispatch recorded a verdict for it. **Untested cells are not evidence of "
+    "security**: nothing was sent at them, so their absence from the findings above means nothing. "
+    "The matrix also only spans surface that was *discovered* — an endpoint no crawl, wordlist or "
+    "link ever reached is not represented here at all."
+)
+
+
+def _untested_by_asset(coverage: dict) -> list[tuple[str, list[str]]]:
+    """(asset label, untested classes) for every asset with at least one unprobed cell."""
+    out: list[tuple[str, list[str]]] = []
+    for entry in coverage.get("by_asset") or []:
+        untested = [c for c, verdict in (entry.get("verdicts") or {}).items() if verdict == "untested"]
+        if untested:
+            out.append((str(entry.get("label") or "?"), untested))
+    return out
+
+
+def _coverage_lines(r: Report) -> list[str]:
+    """The exhaustiveness statement: what was probed, and — bluntly — what was not."""
+    cov = r.coverage or {}
+    if not cov:
+        return []
+    by_kind = cov.get("assets_by_kind") or {}
+    kinds = ", ".join(f"{k} {n}" for k, n in sorted(by_kind.items()))
+    lines = [
+        "## Coverage",
+        "",
+        _COVERAGE_BLURB,
+        "",
+        f"- Assets discovered: **{cov.get('assets', 0)}**" + (f" ({kinds})" if kinds else ""),
+        f"- Matrix cells: **{cov.get('cells', 0)}** — covered **{cov.get('covered_pct', 0.0)}%**, "
+        f"untested **{cov.get('untested', 0)}**",
+    ]
+    by_verdict = cov.get("by_verdict") or {}
+    if by_verdict:
+        lines.append("- Verdicts: " + ", ".join(f"{v} {n}" for v, n in sorted(by_verdict.items())))
+    lines.append("")
+    if (r.traffic or {}).get("tripped"):
+        lines += _traffic_lines(r)
+        lines += [
+            "_Read the percentage above as a **floor, not a measurement**: while the target was "
+            "refusing traffic, a cell can be recorded as probed on the strength of a response the "
+            "WAF wrote rather than the application._",
+            "",
+        ]
+    untested = _untested_by_asset(cov)
+    if not untested:
+        lines += [
+            "**Not tested:** nothing — every applicable class has a verdict on every discovered asset.",
+            "",
+        ]
+        return lines
+    lines += [
+        f"### Not tested ({len(untested)} asset(s))",
+        "",
+        "_These pairs were never probed. Each one is an open question, not a clean result._",
+        "",
+    ]
+    for label, classes in untested[:_MAX_COVERAGE_ROWS]:
+        shown = ", ".join(classes[:_MAX_CLASSES_PER_ROW])
+        if len(classes) > _MAX_CLASSES_PER_ROW:
+            shown += f" (+{len(classes) - _MAX_CLASSES_PER_ROW} more)"
+        lines.append(f"- `{label}` → {shown}")
+    if len(untested) > _MAX_COVERAGE_ROWS:
+        lines.append(f"- … and {len(untested) - _MAX_COVERAGE_ROWS} more asset(s) with untested classes")
+    lines.append("")
+    return lines
+
+
 def _retest_lines(r: Report) -> list[str]:
     """The remediation-verification delta, when this run was a retest."""
     delta = r.retest or {}
@@ -576,6 +684,8 @@ def render_markdown(r: Report) -> str:
         lines.append("_No cross-chains derived._")
     lines.append("")
 
+    lines += _coverage_lines(r)
+
     lines += ["## Evidence artifacts (HAR)", ""]
     if r.har_paths:
         for p in r.har_paths:
@@ -645,21 +755,24 @@ def render_sarif(r: Report) -> str:
         if f.vuln_class not in rule_ids:
             rule_ids.append(f.vuln_class)
     rules = [{"id": rid, "name": rid} for rid in rule_ids]
+    run: dict = {
+        "tool": {
+            "driver": {
+                "name": "a2pwn",
+                "informationUri": "https://github.com/own2pwn-fr/a2pwn",
+                "rules": rules,
+            }
+        },
+        "results": results,
+    }
+    if r.coverage:
+        # Run-level, never per-result: coverage is a property of the engagement, and a consumer
+        # merging SARIF from several tools must not see it attached to one finding.
+        run["properties"] = {"coverage": {k: v for k, v in r.coverage.items() if k != "by_asset"}}
     doc = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [
-            {
-                "tool": {
-                    "driver": {
-                        "name": "a2pwn",
-                        "informationUri": "https://github.com/own2pwn-fr/a2pwn",
-                        "rules": rules,
-                    }
-                },
-                "results": results,
-            }
-        ],
+        "runs": [run],
     }
     return json.dumps(doc, indent=2)
 
@@ -728,6 +841,65 @@ def _html_rows(findings: list[Finding]) -> str:
     return "".join(rows)
 
 
+# The markdown blurb carries `**` emphasis that would render literally in HTML.
+_COVERAGE_PLAIN_BLURB = _COVERAGE_BLURB.replace("**", "")
+
+
+def _blocked_banner_html(r: Report) -> str:
+    """The HTML twin of :func:`_traffic_lines`; rendered wherever a number could be misread as
+    complete."""
+    if not (r.traffic or {}).get("tripped"):
+        return ""
+    return (
+        '<p class="note" style="border-left:4px solid #b00;padding-left:10px">'
+        "<b>⚠ TESTING WAS BLOCKED.</b> "
+        + html.escape(str(r.traffic.get("trip_reason", "")))
+        + ". Coverage is incomplete — the absence of findings below is NOT evidence of security."
+        "</p>"
+    )
+
+
+def _coverage_html(r: Report) -> str:
+    cov = r.coverage or {}
+    if not cov:
+        return ""
+    by_kind = cov.get("assets_by_kind") or {}
+    kinds = ", ".join(f"{k} {n}" for k, n in sorted(by_kind.items()))
+    summary = (
+        f"<b>Assets</b> {cov.get('assets', 0)}"
+        + (f" ({html.escape(kinds)})" if kinds else "")
+        + f" &nbsp;·&nbsp; <b>Cells</b> {cov.get('cells', 0)}"
+        f" &nbsp;·&nbsp; <b>Covered</b> {cov.get('covered_pct', 0.0)}%"
+        f" &nbsp;·&nbsp; <b>Untested</b> {cov.get('untested', 0)}"
+    )
+    rows: list[str] = []
+    for entry in (cov.get("by_asset") or [])[:_MAX_COVERAGE_ROWS]:
+        verdicts = entry.get("verdicts") or {}
+        untested = [c for c, verdict in verdicts.items() if verdict == "untested"]
+        rows.append(
+            "<tr>"
+            f"<td><code>{html.escape(str(entry.get('label') or '?'))}</code></td>"
+            f"<td>{html.escape(str(entry.get('kind') or '?'))}</td>"
+            f"<td>{len(verdicts) - len(untested)}/{len(verdicts)}</td>"
+            f'<td class="ev">{html.escape(", ".join(untested)) or "—"}</td>'
+            "</tr>"
+        )
+    extra = len(cov.get("by_asset") or []) - len(rows)
+    if extra > 0:
+        rows.append(f'<tr><td colspan="4" class="note">… and {extra} more asset(s).</td></tr>')
+    if not rows:
+        rows.append('<tr><td colspan="4" class="note">No surface recorded.</td></tr>')
+    return (
+        "<h2>Coverage</h2>"
+        f'<p class="meta">{summary}</p>'
+        f'<p class="note">{html.escape(_COVERAGE_PLAIN_BLURB)}</p>'
+        f"{_blocked_banner_html(r)}"
+        "<table><thead><tr><th>Asset</th><th>Kind</th><th>Covered</th><th>Not tested</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+
 def render_html(r: Report) -> str:
     """Self-contained (inline CSS, no external assets) HTML summary with escaped user/finding text."""
 
@@ -751,15 +923,6 @@ def render_html(r: Report) -> str:
         meta_bits.append("<b>Started</b> " + html.escape(r.started_at))
     if r.duration_secs:
         meta_bits.append(f"<b>Duration</b> {r.duration_secs:.1f}s")
-    blocked_banner = ""
-    if (r.traffic or {}).get("tripped"):
-        blocked_banner = (
-            '<p class="note" style="border-left:4px solid #b00;padding-left:10px">'
-            "<b>⚠ TESTING WAS BLOCKED.</b> "
-            + html.escape(str(r.traffic.get("trip_reason", "")))
-            + ". Coverage is incomplete — the absence of findings below is NOT evidence of security."
-            "</p>"
-        )
     head = (
         "<tr><th>Severity</th><th>Vuln class</th><th>Target</th>"
         "<th>Param</th><th>Oracle</th><th>CVSS / CWE</th><th>Evidence</th>"
@@ -772,11 +935,12 @@ def render_html(r: Report) -> str:
         f'<style>{_HTML_CSS}</style></head><body><div class="wrap">'
         f"<h1>a2pwn report — {html.escape(r.engagement)}</h1>"
         f'<p class="meta">{" &nbsp;·&nbsp; ".join(meta_bits)}</p>'
-        f"{blocked_banner}"
+        f"{_blocked_banner_html(r)}"
         "<h2>Verified findings</h2>"
         f"<table><thead>{head}</thead><tbody>{_html_rows(r.findings)}</tbody></table>"
         "<h2>Confirmed, not independently reproduced</h2>"
         f'<p class="note">{html.escape(_CONFIRMED_TIER_BLURB)}</p>'
         f"<table><thead>{head}</thead><tbody>{_html_rows(r.confirmed_findings)}</tbody></table>"
+        f"{_coverage_html(r)}"
         "</div></body></html>"
     )

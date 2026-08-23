@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from a2pwn.config import EngagementSpec
+from a2pwn.coverage import Probe
 
 _EVIDENCE_SNIPPET = 240
 _SUMMARY_SNIPPET = 400
@@ -133,6 +134,10 @@ class CleanResult(BaseModel):
     flow_batches: list[FlowBatchRef] = Field(default_factory=list)
     residual_gaps: list[str] = Field(default_factory=list)
     next_hops: list[TaskSpec] = Field(default_factory=list)
+    # Coverage cells this dispatch settled — including the ones it cleared. A negative result that
+    # is not carried back across the fork boundary is a negative result the engagement forgets, and
+    # forgetting it is what made "probed and clean" indistinguishable from "never visited".
+    probes: list[Probe] = Field(default_factory=list)
     summary: str = ""
     # Real model spend for this dispatch, accumulated into the master's spent_usd/spent_tokens
     # channels so the engagement's cost ceilings are enforced on actual spend, not a dispatch count.

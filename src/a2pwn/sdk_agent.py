@@ -30,6 +30,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
     create_sdk_mcp_server,
@@ -38,13 +39,17 @@ from claude_agent_sdk import (
 )
 
 from a2pwn import progress
+from a2pwn.artifacts import ArtifactStore
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
+from a2pwn.coverage import Probe
 from a2pwn.identity import IdentityStore
 from a2pwn.models import Finding, FlowBatchRef, TaskSpec
 from a2pwn.oracles import VerificationOracle, run_oracle
 from a2pwn.scope import ScopeGuard, host_of
 from a2pwn.throttle import Throttle
 from a2pwn.toolcore import build_tool_specs
+from a2pwn.tools.artifact_tools import ARTIFACT_TOOL_SPECS
+from a2pwn.tools.coverage_tools import PROBE_SCHEMA, RECORD_PROBE_DESC, build_probe
 
 # Child of the "a2pwn" logger so the TUI's WARNING-silencing still applies, but `--plain` (INFO) and
 # `-v` (DEBUG) surface the sub-agent's otherwise-invisible tool calls, results and refusals.
@@ -114,6 +119,12 @@ class SdkExecOutcome:
     candidate_findings: list[Finding] = field(default_factory=list)
     flow_batches: list[FlowBatchRef] = field(default_factory=list)
     discovered_hosts: list[TaskSpec] = field(default_factory=list)
+    # Coverage declarations: what this dispatch TESTED, including the classes it cleared. Without
+    # them a probed-and-clean asset is indistinguishable from one no dispatch ever reached.
+    probes: list[Probe] = field(default_factory=list)
+    # How many times the SDK compacted its own transcript during this dispatch. A non-zero count
+    # is the explanation for a long dispatch that appears to have lost the plot.
+    compactions: int = 0
     summary: str = ""
     tool_calls: int = 0
     transcript: list[str] = field(default_factory=list)
@@ -163,7 +174,32 @@ def _head(text: str, n: int = _HEAD) -> str:
     return text if len(text) <= n else text[:n] + "…"
 
 
-def _observe_tool(name: str, handler, blocked: set):
+_ARTIFACT_TOOLS = {"artifact_grep", "artifact_slice", "artifact_list", "artifact_drop"}
+
+
+def _offload(name: str, result: dict, artifacts) -> dict:
+    """Route a bulky tool result into the artifact store instead of the transcript.
+
+    The old behaviour truncated at 200 000 characters, which is the worst of both worlds: the model
+    pays for 200 kB of noise and still cannot see the part it needed, because the interesting string
+    in a minified bundle is almost never in the first 200 kB. Here it gets a short envelope and
+    greps into the blob, paying only for what it reads.
+    """
+    if artifacts is None or name in _ARTIFACT_TOOLS:
+        return result
+    blocks = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(blocks, list) or len(blocks) != 1:
+        return result
+    block = blocks[0]
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return result
+    text = block.get("text") or ""
+    if len(text) <= artifacts.inline_limit:
+        return result
+    return {"content": [{"type": "text", "text": artifacts.maybe_store(text, origin=name)}]}
+
+
+def _observe_tool(name: str, handler, blocked: set, artifacts=None):
     """Wrap a tool handler with the active-exploit hard block + observability.
 
     Every call, its result head and any failure are logged (INFO/DEBUG/WARNING) and a tool error is
@@ -185,7 +221,7 @@ def _observe_tool(name: str, handler, blocked: set):
             progress.emit("activity", stage="error", text=f"{name} FAILED: {_head(str(exc), 120)}")
             return _text_result(f"ERROR from {name}: {exc}")
         _log.debug("[%s] tool %s -> %s", did, name, _head(json.dumps(result, default=str), 200))
-        return result
+        return _offload(name, result, artifacts)
 
     return _fn
 
@@ -205,6 +241,8 @@ async def run_sdk_agent(
     identities: IdentityStore | None = None,
     throttle: Throttle | None = None,
     fuzz_cap: int = 0,
+    dispatch_id: str = "",
+    artifacts: ArtifactStore | None = None,
 ) -> SdkExecOutcome:
     """Run the pentest executor/verifier as a native claude-agent-sdk agent loop.
 
@@ -230,6 +268,7 @@ async def run_sdk_agent(
     blocked = set(active_exploit_blocked or [])
     findings: list[Finding] = []
     discovered: list[TaskSpec] = []
+    probes: list[Probe] = []
     guard = ScopeGuard.from_engagement(engagement)
     fbm = FlowBatchManager(client)
 
@@ -361,6 +400,14 @@ async def run_sdk_agent(
             f"proposed {proposed} follow-up target(s)" if proposed else "no new targets proposed"
         )
 
+    # ---- coverage declaration (mirrors a2pwn.tools.coverage_tools EXACTLY) --------------
+    async def _record_probe(args: dict) -> dict:
+        probe = build_probe(args, dispatch_id)
+        if probe is None:
+            return _text_result("record_probe needs at least host and vuln_class")
+        probes.append(probe)
+        return _text_result(f"recorded {probe.vuln_class} = {probe.verdict} on {probe.asset_key}")
+
     # ---- static tool specs: (name, description, input_schema, handler) ------------------
     # The burpwn hot loop comes from the SHARED definition so this path and the LangChain path can
     # never drift; only the oracle/finding/recon emitters are SDK-local.
@@ -413,12 +460,44 @@ async def run_sdk_agent(
             {"hosts": list},
             _propose_targets,
         ),
+        (
+            "record_probe",
+            RECORD_PROBE_DESC,
+            PROBE_SCHEMA,
+            _record_probe,
+        ),
     ]
+
+    # ---- artifact access (only when a store is wired; mirrors a2pwn.tools.artifact_tools) ------
+    if artifacts is not None:
+        _art_handlers = {
+            "artifact_grep": lambda a: _text_result(
+                artifacts.grep(str(a.get("id") or ""), str(a.get("pattern") or ""), int(a.get("max_matches") or 40))
+            ),
+            "artifact_slice": lambda a: _text_result(
+                artifacts.slice(str(a.get("id") or ""), int(a.get("offset") or 0), int(a.get("limit") or 8000))
+            ),
+            "artifact_list": lambda a: _text_result(artifacts.listing()),  # noqa: ARG005
+            "artifact_drop": lambda a: _text_result(
+                artifacts.drop(str(a.get("id") or ""), str(a.get("reason") or ""))
+            ),
+        }
+
+        def _make_art(fn):
+            async def _run(args: dict) -> dict:
+                return fn(args)
+
+            return _run
+
+        for _name, _desc, _schema in ARTIFACT_TOOL_SPECS:
+            specs.append((_name, _desc, _schema, _make_art(_art_handlers[_name])))
 
     sdk_tools = []
     tool_names: list[str] = []
     for name, description, schema, handler in specs:
-        sdk_tools.append(tool(name, description, schema)(_observe_tool(name, handler, blocked)))
+        sdk_tools.append(
+            tool(name, description, schema)(_observe_tool(name, handler, blocked, artifacts))
+        )
         tool_names.append(name)
 
     # ---- one on-demand info tool per skill (loads methodology when the agent asks) ------
@@ -464,6 +543,7 @@ async def run_sdk_agent(
     transcript: list[str] = []
     cost_usd = 0.0
     tokens = 0
+    compactions = 0
     try:
         async for msg in query(prompt=task, options=opts):
             if isinstance(msg, AssistantMessage):
@@ -487,6 +567,27 @@ async def run_sdk_agent(
                             else:
                                 _log.info("[%s] say %s", progress.current_dispatch(), _head(block.text, 200))
                             progress.emit("thought", text=_head(block.text, 140))
+            elif isinstance(msg, SystemMessage) and getattr(msg, "subtype", "") == "compact_boundary":
+                # The SDK compacts its own conversation when the context window fills; a2pwn's
+                # `compaction.py` hook only ever applied to the LangChain path. Compaction is the
+                # moment a long exploit leg loses detail — including, potentially, the wording of
+                # the task itself, which lives in the (compactable) first user turn rather than the
+                # system prompt. When a dispatch "forgets" what it was doing, this is the event that
+                # explains it, so record it instead of letting it pass silently.
+                meta = (getattr(msg, "data", None) or {}).get("compact_metadata") or {}
+                compactions += 1
+                _log.info(
+                    "[%s] SDK auto-compacted the transcript (trigger=%s, pre_tokens=%s)",
+                    progress.current_dispatch(),
+                    meta.get("trigger", "?"),
+                    meta.get("pre_tokens", "?"),
+                )
+                transcript.append(f"compact trigger={meta.get('trigger', '?')}")
+                progress.emit(
+                    "activity",
+                    stage="exploit",
+                    text=f"context compacted ({meta.get('pre_tokens', '?')} tokens)",
+                )
             elif isinstance(msg, ResultMessage):
                 if getattr(msg, "result", None):
                     summary = msg.result
@@ -516,6 +617,8 @@ async def run_sdk_agent(
         candidate_findings=findings,
         flow_batches=[f.flow_batch for f in findings],
         discovered_hosts=discovered,
+        probes=probes,
+        compactions=compactions,
         summary=summary,
         tool_calls=tool_calls,
         transcript=transcript,

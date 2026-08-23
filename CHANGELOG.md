@@ -124,6 +124,68 @@ All notable changes to this project are documented here. The format is based on
   ReAct loop, the verifier critique, the fail-closed adjudicator; 559 lines), down from a single
   1117-line file. `graph.py` re-exports the sub-agent names, so existing imports are unaffected.
 
+### Added (exhaustiveness as a data structure, not a prompt)
+
+- **Attack-surface inventory and a coverage matrix** (`a2pwn.coverage`). Until now the answer to
+  "did we test everything?" lived entirely in prose: the executor prompt said to "walk the
+  co-located class checklist", the continuation judge was told to "bias toward THOROUGHNESS", and
+  no structure anywhere recorded which endpoint had been probed for which class. The master carried
+  tasks, findings and a budget — a *negative* result left no trace at all, so an endpoint probed and
+  found clean was indistinguishable from one no dispatch ever reached, and a 0-finding report could
+  not say which of the two it was describing.
+  - `Asset` is one addressable unit of surface (host, endpoint, parameter, JS bundle, WebSocket,
+    GraphQL). Assets are harvested **deterministically from captured burpwn flows**, not from the
+    model's narration: the traffic cannot invent an endpoint nobody reached, and cannot forget one
+    the model neglected to mention. Path segments that look like ids (numeric, UUID, long hex)
+    collapse to `{id}`, so a paginated site yields one endpoint rather than ten thousand.
+  - `Probe` is one `(asset, vuln_class)` cell with a verdict. The cross product of applicable
+    classes over discovered assets **is** the coverage matrix, and its untested cells are a
+    work-list. Classes are attached at the coarsest level that makes sense — `cors` is a property
+    of an origin and is tested once per host, not once per parameter — so the matrix stays a
+    work-list rather than a combinatorial explosion.
+  - The `surface` channel is reduced monotonically, exactly like `findings`: a cell only moves
+    toward more knowledge, so a parallel `Send` fan-out cannot let one sibling erase another's
+    coverage.
+- **`record_probe`**, on both executor paths. This is how a sub-agent writes a *negative* result
+  down — the thing the oracle kernel structurally could not record, since it only ever promotes
+  proof. A class the model claims as `proven` here is **downgraded to `probed`**: only the
+  deterministic oracle promotes a cell, so a model cannot talk its way into a covered matrix.
+- **Deterministic coverage expansion.** When the planner returns no tasks, `plan` expands untested
+  matrix cells into concrete dispatches instead of letting the run stop. The LLM planner is a good
+  *prioritiser* and a poor *enumerator* — it sees eight history records and is asked to remember
+  every endpoint it has seen and every class it has not yet tried. The matrix remembers instead, so
+  exhaustiveness stops depending on the planner's recall. The planner and the continuation judge
+  both now receive a `coverage` digest naming exactly which cells have no verdict, and the planner
+  finally sees its own remaining budget (it was told to "stop when the budget is near exhaustion"
+  while being shown no budget at all).
+- **A "Coverage" section in every report artifact.** The deliverable had no "what was tested"
+  statement at all, so a 0-finding report read exactly like a report on a target nobody visited —
+  the biggest credibility gap in the output. `Report.coverage` now freezes the matrix as plain JSON
+  (stats plus a per-asset verdict breakdown), markdown renders assets by kind, cells/covered%/
+  untested and an explicit **list of what was NOT tested** (asset → classes), the HTML gets the
+  same as a table and the SARIF run object carries the stats in `properties` (run-level, not
+  per-result). When the traffic circuit breaker tripped, the section repeats the blocked banner and
+  says outright that the percentage is a floor, not a measurement. The live TUI footer and the
+  final summary show covered% and the untested count for the same reason.
+
+- **An artifact store, and the ability to forget** (`a2pwn.artifacts`). Bulky tool output used to be
+  truncated at 200 000 characters straight into the transcript — the worst of both worlds: the model
+  pays for 200 kB of noise and still cannot see the part it needed, because the interesting string in
+  a minified bundle is almost never in the first 200 kB. Results past a threshold are now stored out
+  of band and replaced with a short envelope; the agent reaches in with `artifact_grep` /
+  `artifact_slice`, paying only for what it reads. `artifact_drop` is the other half: having
+  concluded a 3 MB blob is a vendor bundle with no app code, the agent replaces it with that one
+  sentence, so neither this turn nor a later retry round pays to rediscover it. The store is shared
+  across dispatches and keyed by content hash, so two sub-agents probing the same host do not each
+  pull the same bundle through the sandbox, and it spills next to the run's other evidence so a
+  bulky body stays inspectable after the run.
+- **SDK auto-compaction is now visible.** `compaction.py`'s `pre_model_hook` only ever applied to the
+  LangChain path; the default `claude-code` backend compacts inside the SDK, where a2pwn could not
+  see it. Compaction is the moment a long exploit leg loses detail — potentially including the task
+  statement itself, which lives in the compactable first user turn rather than the system prompt — so
+  a `compact_boundary` is logged, counted on the dispatch outcome and emitted to `run.jsonl`. When a
+  dispatch appears to have lost the plot, this is the event that explains it.
+
 ### Fixed (coverage: the executor was working almost blind)
 
 - **The executor was seeded with 1 skill out of 37.** `_seed_skills` built its FTS query from the

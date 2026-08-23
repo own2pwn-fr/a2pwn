@@ -150,6 +150,9 @@ class _Dashboard:
         self.findings: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.feed: deque[Text] = deque(maxlen=_MAX_FEED)
         self.logs: deque[str] = deque(maxlen=4)
+        # Latest coverage-matrix snapshot: {"covered_pct": float, "untested": int}. Empty until the
+        # first surface harvest, which is why the footer omits the segment rather than showing 0%.
+        self.coverage: dict[str, Any] = {}
 
         self._color_cycle = itertools.cycle(_DISPATCH_PALETTE)
         self._colors: dict[str, str] = {"master": _ACCENT_BRIGHT}
@@ -185,6 +188,27 @@ class _Dashboard:
         self.spent = int(ev.get("spent") or 0)
         self.max = int(ev.get("max") or 0)
         self.max_phases = int(ev.get("max_phases") or self.max_phases)
+        self._absorb_coverage(ev)
+
+    def _on_coverage(self, ev: dict[str, Any]) -> None:
+        self._absorb_coverage(ev)
+
+    def _absorb_coverage(self, ev: dict[str, Any]) -> None:
+        """Take matrix stats from either a dedicated event or a phase event carrying them.
+
+        Both shapes are accepted on purpose: the emitter lives in the graph, and a UI that silently
+        showed nothing because the producer picked the other shape would be worse than useless —
+        coverage is exactly the number a watching operator uses to decide whether to let a run
+        continue.
+        """
+        stats = ev.get("coverage") if isinstance(ev.get("coverage"), dict) else ev
+        if "covered_pct" not in stats and "untested" not in stats:
+            return
+        self.coverage = {
+            "covered_pct": float(stats.get("covered_pct") or 0.0),
+            "untested": int(stats.get("untested") or 0),
+            "cells": int(stats.get("cells") or 0),
+        }
 
     def _on_stopping(self, ev: dict[str, Any]) -> None:
         self.stopping = True
@@ -411,6 +435,10 @@ class _Dashboard:
             ("    severity", "dim"),
         )
         parts.append_text(sev_txt)
+        if self.coverage:
+            parts.append("    ▦ coverage ", style="dim")
+            parts.append(f"{self.coverage['covered_pct']:.0f}%", style="bold white")
+            parts.append(f" ({self.coverage['untested']} untested)", style="dim")
         if self.stopping:
             parts.append(
                 "    ⏸ arrêt propre demandé — finalisation du rapport (Ctrl-C encore pour forcer)",
@@ -491,6 +519,7 @@ def render_summary(report: Any, out_dir: str | None = None) -> None:
     cross_chains = list(getattr(report, "cross_chains", []) or [])
     stats = dict(getattr(report, "stats", {}) or {})
     har_paths = list(getattr(report, "har_paths", []) or [])
+    coverage = dict(getattr(report, "coverage", {}) or {})
 
     console.print()
     console.print(
@@ -547,6 +576,26 @@ def render_summary(report: Any, out_dir: str | None = None) -> None:
             if by_sev.get(sev):
                 tally.append(f" {sev} {by_sev[sev]} ", style=_SEVERITY_STYLE.get(sev, "white"))
         console.print(Text.assemble(("Count by severity:", "bold"), tally))
+
+    # Coverage — printed even (especially) when there are no findings: it is the difference between
+    # "we tested this and it held" and "we never got there", which the findings table cannot say.
+    if coverage:
+        untested = int(coverage.get("untested") or 0)
+        body = Text.assemble(
+            ("  ", ""),
+            (f"{coverage.get('covered_pct', 0.0)}%", "bold white"),
+            (f" of {coverage.get('cells', 0)} cells covered across "
+             f"{coverage.get('assets', 0)} discovered asset(s)", "dim"),
+        )
+        if untested:
+            body.append(
+                f"\n  {untested} cell(s) never probed — untested is not clean; "
+                "see the Coverage section of report.md.",
+                style="yellow",
+            )
+        console.print(
+            Panel(body, title="Coverage", title_align="left", border_style="grey37", box=ROUNDED)
+        )
 
     # Cross-chains
     if cross_chains:

@@ -25,16 +25,20 @@ from langgraph.types import Command
 
 from a2pwn import progress
 from a2pwn.agents import MasterFork
+from a2pwn.artifacts import ArtifactStore
 from a2pwn.budget import STOP, DispatchBudget, install_stop_handler
 from a2pwn.burpwn import BurpwnClient
 from a2pwn.catalog import all_cards, as_langchain_tools, load_skill
 from a2pwn.collaborator import Collaborator
 from a2pwn.config import A2pwnConfig
+from a2pwn.coverage import SurfaceMap
 from a2pwn.graph import build_master_graph, build_subagent_graph
 from a2pwn.identity import IdentityStore
 from a2pwn.report import Report, build_report
 from a2pwn.throttle import Throttle
 from a2pwn.tools import burpwn_tools, finding_tools, oracle_tools, recon_tools
+from a2pwn.tools.artifact_tools import artifact_tools
+from a2pwn.tools.coverage_tools import coverage_tools
 
 _log = logging.getLogger("a2pwn")
 
@@ -241,6 +245,12 @@ async def bootstrap(
     client._identities = identities  # for the report/summary to describe what was used
     client._throttle = throttle
 
+    # One artifact store per engagement, shared by every dispatch: two sub-agents probing the same
+    # host should not each pull the same three-megabyte bundle through the sandbox. Spilled next to
+    # the run's other evidence so a bulky body stays inspectable after the run.
+    artifacts = ArtifactStore(spill_dir=Path(run_out_dir(cfg, cfg.engagement.name)) / "artifacts")
+    client._artifacts = artifacts
+
     skills = _seed_skills(cfg)
     tools = (
         as_langchain_tools(skills, client, collab)
@@ -258,10 +268,20 @@ async def bootstrap(
         + oracle_tools(collab, client)
         + finding_tools(client)
         + recon_tools(cfg.engagement)
+        + coverage_tools()
+        + artifact_tools(artifacts)
     )
 
     subgraph = build_subagent_graph(
-        cfg, client, fork, tools, collab, skills, identities=identities, throttle=throttle
+        cfg,
+        client,
+        fork,
+        tools,
+        collab,
+        skills,
+        identities=identities,
+        throttle=throttle,
+        artifacts=artifacts,
     )
     graph = build_master_graph(cfg, subgraph, client, checkpointer)
     return client, graph, checkpointer
@@ -417,6 +437,9 @@ async def run_engagement(
             "findings": [],
             "verify_queue": [],
             "verify_attempts": {},
+            # The coverage matrix starts empty; bootstrap seeds it from the declared scope and
+            # `integrate` grows it from captured traffic.
+            "surface": SurfaceMap(),
             "phase": "recon",
             "round": 0,
             "continuations": 0,
