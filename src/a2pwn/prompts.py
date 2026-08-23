@@ -26,6 +26,12 @@ Your job each phase:
     * verify  — move ready candidate findings into the independent-verify queue when they are
                 `confirmed` but not yet `independently_verified`.
 - Prefer recon before exploitation; prefer cheap, high-signal probes first.
+- READ THE `coverage` BLOCK. It is the engagement's ledger: every asset discovered from CAPTURED
+  traffic, and for each one which vulnerability classes still have no verdict. It is the answer to
+  "what have we not tested", which the truncated history cannot give you. Plan against it — prefer
+  an untested cell on a real asset over another pass at something already covered. Cells you leave
+  untested are expanded into dispatches deterministically when you run dry, so proposing nothing
+  does not end the engagement; it just means the enumeration happens without your judgement.
 - Think in CROSS-CHAINS: a confirmed finding often enables the next (leaked secret -> auth,
   SSRF -> metadata -> creds, IDOR -> account takeover). Emit next-hop tasks that pursue chains,
   not just isolated bugs.
@@ -126,11 +132,28 @@ form with SQLi payloads, inject into every reflected parameter, fuzz with burpwn
 burpwn_req_replay. Keep going until you have either PROVEN a vulnerability or genuinely exhausted the
 in-scope surface for this task.
 
+MANAGE YOUR OWN CONTEXT. A tool result too large to inline comes back as an `[artifact art-NNNN …]`
+envelope instead of the content. Do not ask for it again — `artifact_grep` it for the strings you
+actually care about (endpoints, keys, `admin`, version banners), `artifact_slice` a window once grep
+tells you where to look. The moment you conclude a blob is a dead end, call `artifact_drop` with a
+one-line reason: that reason is what carries forward, and it stops you — or a later dispatch — paying
+to read the same vendor bundle twice. Your transcript is your only working memory; spend it on
+findings, not on bytes you have already judged irrelevant.
+
 READ EVERY RESPONSE. After each burpwn_exec, call burpwn_req_show on the captured flow id and judge the
 BODY, not just the status line — leaked file contents (e.g. `root:x:0:0:` from /etc/passwd), command
 output (e.g. `uid=0(root)`), a SQL/stack error, or your reflected marker are PROOF even under an
 unexpected status. Targets are flaky: a 5xx / timeout / rate-limit is not a verdict — RETRY the request
 and try encoding/depth variants before concluding a payload failed.
+
+DECLARING COVERAGE: a class you probed and found clean is worth almost as much as a finding — it is
+the difference between "this endpoint is safe against SQLi" and "nobody ever looked". Call
+`record_probe` for EVERY (asset, class) pair you actually test: verdict `probed` when you sent
+payloads and judged the responses, `not_applicable` when the class cannot apply here (say why),
+`blocked` when a WAF or auth wall stopped you. Unrecorded work is invisible: the engagement will
+re-dispatch that cell, spending budget the untested surface needed, and the report will be unable to
+state what was covered. You cannot declare `proven` here — only the oracle promotes a cell, so
+report the bug with `report_finding` instead.
 
 DECLARING A FINDING: the ONLY way a vulnerability counts is to call the `report_finding` tool once per
 proven bug, passing the exact `flow_ids` (the captured_request_ids from the burpwn_exec / fuzz / replay
@@ -213,6 +236,10 @@ findings so far, judge:
 - Do confirmed findings open CROSS-CHAINS (new creds/tokens/hosts/SSRF reach via `enables`) that were
   not followed?
 - Is there surface that was seen in recon but never exploited?
+- The `coverage` block is the ledger, derived from CAPTURED traffic and from what each dispatch
+  declared it tested. Untested cells there are facts, not impressions — weigh them above your
+  reading of the narrative. Conversely, do not manufacture work for cells already carrying a
+  verdict.
 
 Return complete=true ONLY when you are satisfied the in-scope surface has been meaningfully exercised
 and no high-value thread is left dangling. Otherwise return complete=false with `remaining_work`: a

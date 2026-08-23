@@ -6,8 +6,9 @@ from __future__ import annotations
 import json
 
 from a2pwn.config import EngagementSpec
+from a2pwn.coverage import Asset, Probe, SurfaceMap, applicable_classes
 from a2pwn.models import Finding, FlowBatchRef
-from a2pwn.report import build_report, render_markdown
+from a2pwn.report import Report, build_report, render_markdown
 
 
 def _finding(
@@ -374,3 +375,127 @@ async def test_format_selection_gates_sarif_and_html(fake_client, tmp_path):
     assert (tmp_path / "report.json").exists()
     assert not (tmp_path / "report.sarif").exists()
     assert not (tmp_path / "report.html").exists()
+
+
+def _surface(*, fully_covered: bool = False) -> SurfaceMap:
+    """A two-asset surface: one host, one query parameter, partially probed."""
+    surface = SurfaceMap()
+    host = Asset(kind="host", host="app.example.com", source="config")
+    param = Asset(
+        kind="param",
+        host="app.example.com",
+        path="/search",
+        method="GET",
+        param="q",
+        location="query",
+        source="flow:7",
+    )
+    surface.add_asset(host)
+    surface.add_asset(param)
+    for asset in (host, param):
+        classes = applicable_classes(asset)
+        probed = classes if fully_covered else classes[:2]
+        for vuln_class in probed:
+            surface.record(
+                Probe(asset_key=asset.key, vuln_class=vuln_class, verdict="probed", evidence_flow=7)
+            )
+    return surface
+
+
+async def test_coverage_section_lists_what_was_not_tested(fake_client, tmp_path):
+    _record_har(fake_client)
+    state = {
+        "engagement": _engagement(),
+        "findings": [],
+        "objective": "x",
+        "surface": _surface(),
+    }
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    assert report.coverage["assets"] == 2
+    assert report.coverage["assets_by_kind"] == {"host": 1, "param": 1}
+    assert report.coverage["untested"] == report.coverage["cells"] - 4
+    labels = {entry["label"] for entry in report.coverage["by_asset"]}
+    assert "app.example.com" in labels
+
+    md = render_markdown(report)
+    assert "## Coverage" in md
+    # placed after the findings tiers and before the evidence artifacts
+    assert md.index("## Findings") < md.index("## Coverage") < md.index("## Evidence artifacts")
+    assert "### Not tested" in md
+    assert "GET app.example.com/search [query:q]" in md
+    assert "path-traversal-lfi" in md  # an untested class on the parameter, named explicitly
+    assert "not evidence of security" in md.lower()
+
+    # HTML mirrors it, and the SARIF run (not any single result) carries the stats.
+    html_doc = (tmp_path / "report.html").read_text()
+    assert "<h2>Coverage</h2>" in html_doc
+    assert "app.example.com" in html_doc
+    sarif = json.loads((tmp_path / "report.sarif").read_text())
+    cov = sarif["runs"][0]["properties"]["coverage"]
+    assert cov["assets"] == 2
+    assert "by_asset" not in cov  # the full matrix stays in report.json
+
+
+async def test_full_coverage_renders_differently_from_partial(fake_client, tmp_path):
+    _record_har(fake_client)
+    base = {"engagement": _engagement(), "findings": [], "objective": "x"}
+
+    partial = await build_report({**base, "surface": _surface()}, fake_client, str(tmp_path / "a"))
+    full = await build_report(
+        {**base, "surface": _surface(fully_covered=True)}, fake_client, str(tmp_path / "b")
+    )
+
+    assert full.coverage["untested"] == 0
+    assert full.coverage["covered_pct"] == 100.0
+    partial_md, full_md = render_markdown(partial), render_markdown(full)
+    assert "### Not tested" in partial_md
+    assert "### Not tested" not in full_md
+    assert "every applicable class has a verdict" in full_md
+    assert partial_md != full_md
+
+
+async def test_blocked_run_marks_coverage_as_a_floor(fake_client, tmp_path):
+    _record_har(fake_client)
+    state = {"engagement": _engagement(), "findings": [], "objective": "x", "surface": _surface()}
+
+    report = await build_report(
+        state,
+        fake_client,
+        str(tmp_path),
+        traffic={"tripped": True, "trip_reason": "30 consecutive blocks", "blocked_responses": 30},
+    )
+
+    md = render_markdown(report)
+    coverage_section = md[md.index("## Coverage") :]
+    assert "TESTING WAS BLOCKED" in coverage_section
+    assert "floor, not a measurement" in coverage_section
+
+
+async def test_coverage_survives_a_json_round_trip(fake_client, tmp_path):
+    _record_har(fake_client)
+    state = {"engagement": _engagement(), "findings": [], "objective": "x", "surface": _surface()}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    data = json.loads((tmp_path / "report.json").read_text())
+    assert data["coverage"] == report.coverage
+    restored = Report.model_validate(data)
+    assert restored.coverage == report.coverage
+    # and the restored report renders the same section without the SurfaceMap object
+    assert "### Not tested" in render_markdown(restored)
+
+
+async def test_no_surface_means_no_coverage_section(fake_client, tmp_path):
+    # An engagement whose state never carried a surface (older checkpoint, retest of a bare
+    # baseline) must render exactly as before rather than an empty, misleading 0% section.
+    _record_har(fake_client)
+    state = {"engagement": _engagement(), "findings": [], "objective": "x"}
+
+    report = await build_report(state, fake_client, str(tmp_path))
+
+    assert report.coverage == {}
+    assert "## Coverage" not in render_markdown(report)
+    sarif = json.loads((tmp_path / "report.sarif").read_text())
+    assert "properties" not in sarif["runs"][0]

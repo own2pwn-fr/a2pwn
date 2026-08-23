@@ -80,7 +80,9 @@ async def test_recon_seed_dispatches_before_any_planner_call(monkeypatch, fake_c
 
     await _drive(graph, initial, config)
 
-    assert len(executor.prompts) == 1
+    # The seeded recon task is dispatched FIRST, before the planner is asked for anything. The run
+    # keeps going afterwards (the coverage matrix expands untested host-level cells), which is the
+    # point of the seed — it front-loads discovery, it does not cap the engagement at one dispatch.
     assert "subfinder" in executor.prompts[0]
     assert "example.com" in executor.prompts[0]
 
@@ -107,7 +109,9 @@ async def test_discovered_hosts_become_real_dispatched_tasks(monkeypatch, fake_c
 
     final = await _drive(graph, initial, config)
 
-    assert len(executor.prompts) == 2  # the recon dispatch, then the discovered host's own dispatch
+    # The recon dispatch runs first, then the discovered host gets its own dispatch. Coverage-cell
+    # expansion may add further work behind it, so assert the ordering, not the total.
+    assert "subfinder" in executor.prompts[0]
     assert any("discovered.example.com" in p for p in executor.prompts[1:])
     assert final["phase"] == "report"
     # the recon dispatch's outcome is legible in curated history (not silently dropped).

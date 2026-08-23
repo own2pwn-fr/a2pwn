@@ -31,6 +31,7 @@ from a2pwn import progress
 from a2pwn.agents import MasterFork, build_clarifier, build_executor, build_verifier
 from a2pwn.burpwn import BurpwnClient, FlowBatchManager
 from a2pwn.config import A2pwnConfig
+from a2pwn.coverage import Probe
 from a2pwn.models import (
     CleanResult,
     Finding,
@@ -66,6 +67,9 @@ class SubAgentState(TypedDict):
     # Recon-proposed follow-up targets (via the propose_targets tool) — mirrors candidate_findings'
     # merge-by-key accumulation, but keyed by target since a TaskSpec has no natural finding-style key.
     discovered_hosts: list[TaskSpec]
+    # Coverage declarations (via record_probe) — what this dispatch TESTED, including every class
+    # it cleared. Keyed by (asset, class) so a retry round restates rather than duplicates a cell.
+    probes: list[Probe]
     critique: VerifierReport | None
     verify_round: int
     clarify_round: int
@@ -140,16 +144,21 @@ def verify_gate(state: dict) -> Literal["execute", "distill"]:
     return "distill"
 
 
-def _harvest(messages: list[BaseMessage]) -> tuple[list[Finding], list[FlowBatchRef], list[TaskSpec]]:
-    """Pull ``Finding`` / ``FlowBatchRef`` / ``TaskSpec`` artifacts out of a ReAct transcript.
+def _harvest(
+    messages: list[BaseMessage],
+) -> tuple[list[Finding], list[FlowBatchRef], list[TaskSpec], list[Probe]]:
+    """Pull ``Finding`` / ``FlowBatchRef`` / ``TaskSpec`` / ``Probe`` artifacts out of a ReAct
+    transcript.
 
-    ``TaskSpec`` artifacts come from ``propose_targets`` (recon-discovered follow-up hosts) — the
-    LangChain path's only way to surface them, since (unlike the SDK path) its tool results aren't
-    threaded back through a dedicated return field.
+    ``TaskSpec`` artifacts come from ``propose_targets`` (recon-discovered follow-up hosts) and
+    ``Probe`` artifacts from ``record_probe`` (coverage declarations) — the LangChain path's only
+    way to surface them, since (unlike the SDK path) its tool results aren't threaded back through
+    a dedicated return field.
     """
     findings: list[Finding] = []
     batches: list[FlowBatchRef] = []
     discovered: list[TaskSpec] = []
+    probes: list[Probe] = []
     for m in messages:
         artifact = getattr(m, "artifact", None)
         if artifact is None:
@@ -164,7 +173,9 @@ def _harvest(messages: list[BaseMessage]) -> tuple[list[Finding], list[FlowBatch
                 batches.append(it)
             elif isinstance(it, TaskSpec):
                 discovered.append(it)
-    return findings, batches, discovered
+            elif isinstance(it, Probe):
+                probes.append(it)
+    return findings, batches, discovered, probes
 
 
 async def _invoke_agent(agent: Any, prompt: str) -> dict:
@@ -227,6 +238,7 @@ def build_subagent_graph(
     skills: list | None = None,
     identities: Any = None,
     throttle: Any = None,
+    artifacts: Any = None,
 ) -> CompiledStateGraph:
     """Compile the stateless sub-agent subgraph (``checkpointer=False`` HARD)."""
     clarifier = build_clarifier(cfg.models)
@@ -243,6 +255,7 @@ def build_subagent_graph(
         identities=identities,
         throttle=throttle,
         fuzz_cap=cfg.fuzz_max_requests,
+        artifacts=artifacts,
     )
     verifier = build_verifier(cfg.models, tools, cfg.compaction_token_threshold)
     fbm = FlowBatchManager(client)
@@ -333,13 +346,16 @@ def build_subagent_graph(
         findings = list(result.get("candidate_findings", []))
         batches = list(result.get("flow_batches", []))
         discovered = list(result.get("discovered_hosts", []))
-        if not findings or not discovered:
-            harvested_findings, harvested_batches, harvested_hosts = _harvest(messages)
+        probes = list(result.get("probes", []))
+        if not findings or not discovered or not probes:
+            harvested_findings, harvested_batches, harvested_hosts, harvested_probes = _harvest(messages)
             if not findings:
                 findings = harvested_findings
                 batches = batches or harvested_batches
             if not discovered:
                 discovered = harvested_hosts
+            if not probes:
+                probes = harvested_probes
         merged: dict[str, Finding] = {f.key: f for f in state.get("candidate_findings", [])}
         for f in findings:
             merged[f.key] = f
@@ -350,11 +366,17 @@ def build_subagent_graph(
         for t in discovered:
             if t.target:
                 merged_hosts[t.target] = t
+        # Coverage cells dedupe by (asset, class); a later round's verdict wins, which is right —
+        # a retry round is a better-informed statement about the same cell than the round before.
+        merged_probes: dict[str, Probe] = {p.key: p for p in state.get("probes", [])}
+        for probe in probes:
+            merged_probes[probe.key] = probe
         return {
             "messages": messages,
             "candidate_findings": list(merged.values()),
             "flow_batches": batches,
             "discovered_hosts": list(merged_hosts.values()),
+            "probes": list(merged_probes.values()),
             "cost_usd": float(result.get("cost_usd") or 0.0),
             "tokens": int(result.get("tokens") or 0),
         }
@@ -560,6 +582,7 @@ def build_subagent_graph(
             flow_batches=batches,
             residual_gaps=residual,
             next_hops=next_hops,
+            probes=list(state.get("probes", [])),
             summary=summary,
             cost_usd=float(state.get("cost_usd") or 0.0),
             tokens=int(state.get("tokens") or 0),

@@ -22,6 +22,7 @@ from a2pwn.oracles import VerificationOracle
 from a2pwn.scope import ScopeGuard
 from a2pwn.toolcore import ACTIVE_TOOL_NAMES, build_tool_specs, tool_names
 from a2pwn.tools import burpwn_tools
+from a2pwn.tools.coverage_tools import build_probe
 from a2pwn.tools.finding_tools import _ORACLES as LANGCHAIN_ORACLES
 
 
@@ -142,3 +143,20 @@ def test_report_finding_fields_all_exist_on_the_finding_model():
     constructor_only = {"flow_ids", "exec_ids", "workspace", "tag", "key_flow"}
     declared = set(sdk_agent.REPORT_FINDING_SCHEMA) - constructor_only
     assert declared <= set(Finding.model_fields)
+
+
+# --------------------------------------------------------------------------- record_probe parity
+def test_record_probe_exists_on_both_paths_with_the_same_schema():
+    # Coverage declarations are the only record a run keeps of NEGATIVE results. If the tool were
+    # registered on one executor path only, the default backend could sweep an endpoint clean and
+    # leave the matrix showing it as untested — re-dispatched forever, and unreportable.
+    from a2pwn.tools.coverage_tools import PROBE_SCHEMA, coverage_tools
+
+    tool = {t.name: t for t in coverage_tools()}["record_probe"]
+    langchain_fields = set(inspect.signature(tool.coroutine).parameters)
+    assert set(sdk_agent.PROBE_SCHEMA) == langchain_fields
+    # Same constants and same normaliser, not a hand-copied duplicate: the copies are what diverged
+    # last time. The SDK path registers the tool inside `run_sdk_agent`'s spec table.
+    assert sdk_agent.PROBE_SCHEMA is PROBE_SCHEMA
+    assert sdk_agent.build_probe is build_probe
+    assert '"record_probe"' in inspect.getsource(sdk_agent.run_sdk_agent)

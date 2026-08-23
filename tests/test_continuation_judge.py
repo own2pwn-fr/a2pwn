@@ -14,6 +14,7 @@ from _graphkit import (
     make_cfg,
     make_finding,
     make_master_state,
+    stub_judge,
 )
 from a2pwn.budget import STOP
 from a2pwn.models import ContinuationVerdict, TaskSpec
@@ -152,3 +153,37 @@ async def test_master_run_reopens_once_then_completes(monkeypatch, fake_client, 
     assert judge.calls == 2  # re-opened once, then completed
     assert final["continuations"] == 1
     assert final["phase"] == "report"
+
+
+async def test_untested_matrix_cells_are_dispatched_when_the_planner_runs_dry(
+    monkeypatch, fake_client, tmp_saver
+):
+    """The run may not stop while applicable classes have no verdict on known assets.
+
+    The planner is a good prioritiser and a poor enumerator — it sees eight history records and is
+    asked to remember every endpoint it has seen and every class it has not yet tried. When it
+    returns nothing, the matrix still knows, and `plan` expands it into concrete work. This is what
+    makes exhaustiveness structural instead of exhortative.
+    """
+    cfg = make_cfg(active=True, max_continuations=1, targets=["https://app.example.com"])
+    arm_differential(fake_client)
+
+    async def _no_tasks(planner, state):
+        return []
+
+    sub = build_sub(
+        monkeypatch, cfg, fake_client, clarifier=_NO_QUESTIONS, executor=FakeExecutor(exec_result([]))
+    )
+    monkeypatch.setattr(g, "propose_tasks", _no_tasks)
+    stub_judge(monkeypatch)
+
+    graph = g.build_master_graph(cfg, sub, fake_client, tmp_saver)
+    final = await graph.ainvoke(
+        make_master_state(cfg), {"configurable": {"thread_id": "coverage-expansion"}}
+    )
+
+    # Work was dispatched despite the planner producing nothing, and it is the matrix's work:
+    # concrete untested classes on a known asset, not a restatement of the objective.
+    hints = [h for rec in final["history"] if rec.result.spec for h in rec.result.spec.hints]
+    assert any(h.startswith("coverage-cell=") for h in hints)
+    assert any(h.startswith("classes=") for h in hints)
