@@ -513,6 +513,19 @@ def resume(
     max_phases: int = typer.Option(12, "--max-phases", help="Hard cap on master planning phases."),
     max_dispatches: int = typer.Option(200, "--max-dispatches", help="Global dispatch budget ceiling."),
     max_wall_secs: int | None = typer.Option(None, "--max-wall-secs", help="Wall-clock deadline (seconds)."),
+    max_usd: float | None = typer.Option(
+        None,
+        "--max-usd",
+        help="REAL cost ceiling in dollars for the resumed run. NOT inherited from the prior run — "
+        "spend caps are operator intent, not run metadata, so a resume that wants one must say so.",
+    ),
+    max_tokens: int | None = typer.Option(None, "--max-tokens", help="Real token ceiling for the run."),
+    max_rps: float | None = typer.Option(
+        None,
+        "--max-rps",
+        help="Throttle ALL target-facing traffic to this many requests per second (enforced in the "
+        "tool layer). NOT inherited from the prior run — pass it again to keep pacing the target.",
+    ),
     format: str = typer.Option("md,json,sarif,html", "--format", help="Report artifacts to write."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactively acknowledge authorization."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose telemetry logging."),
@@ -556,6 +569,21 @@ def resume(
             raise typer.Exit(2) from exc
     identities = list(file_values.get("identities") or [])
     prior_exclude += [x for x in (file_values.get("exclude") or []) if x not in prior_exclude]
+    # Budget/rate caps are NOT recorded in report.json, so a resume rebuilt them as None and
+    # silently dropped both the spend ceiling and the throttle — the run came back unpaced against
+    # a live target. An explicit flag wins; otherwise fall back to the engagement file.
+    if max_usd is None:
+        max_usd = file_values.get("max_usd")
+    if max_tokens is None:
+        max_tokens = file_values.get("max_tokens")
+    if max_rps is None:
+        max_rps = file_values.get("max_rps")
+    if max_rps is None:
+        typer.echo(
+            "WARNING: no --max-rps on this resume — target-facing traffic will be unthrottled. "
+            "Pass --max-rps (or set it in --config) to keep the prior run's pacing.",
+            err=True,
+        )
     prior_identity_names = list(prior.get("identity_names") or [])
     if prior_identity_names and not identities:
         typer.echo(
@@ -582,6 +610,9 @@ def resume(
             max_phases=max_phases,
             max_dispatches=max_dispatches,
             max_wall_secs=max_wall_secs,
+            max_usd=max_usd,
+            max_tokens=max_tokens,
+            max_rps=max_rps,
             checkpoint_uri=checkpoint_uri,
             disclaimer_ack=False,
             step_through=step_through,
