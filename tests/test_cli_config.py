@@ -225,3 +225,77 @@ def test_resume_restores_identities_from_the_engagement_file(captured, monkeypat
 
     assert result.exit_code == 0, result.output
     assert [i.name for i in captured["cfg"].engagement.identities] == ["alice"]
+
+
+def test_resume_accepts_the_spend_and_rate_caps(captured, monkeypatch):
+    """Regression: `resume` had no --max-usd/--max-tokens/--max-rps at all.
+
+    It rebuilt A2pwnConfig without them, so a resumed engagement came back with no spend ceiling
+    and — worse — no throttle, hammering a live target the original run had deliberately paced.
+    """
+    _prior_run(monkeypatch)
+
+    result = runner.invoke(
+        cli.app,
+        # fmt: off
+        [
+            "resume",
+            "--name",
+            "acme-run",
+            "--yes",
+            "--plain",
+            "--max-usd",
+            "50",
+            "--max-tokens",
+            "1000000",
+            "--max-rps",
+            "10",
+        ],
+        # fmt: on
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = captured["cfg"]
+    assert cfg.max_usd == 50.0
+    assert cfg.max_tokens == 1_000_000
+    assert cfg.max_rps == 10.0
+
+
+def test_resume_falls_back_to_the_engagement_file_for_caps(captured, monkeypatch, tmp_path):
+    """The caps are not in report.json, but they ARE in the engagement YAML — an operator who
+    resumes with the same --config should not have to restate them on the command line."""
+    _prior_run(monkeypatch)
+    path = _engagement_file(tmp_path, "max_usd: 25\nmax_rps: 4\nmax_tokens: 500000\n")
+
+    result = runner.invoke(cli.app, ["resume", "--name", "acme-run", "--config", path, "--yes", "--plain"])
+
+    assert result.exit_code == 0, result.output
+    cfg = captured["cfg"]
+    assert cfg.max_usd == 25.0
+    assert cfg.max_rps == 4.0
+    assert cfg.max_tokens == 500_000
+
+
+def test_resume_flag_overrides_the_engagement_file_cap(captured, monkeypatch, tmp_path):
+    _prior_run(monkeypatch)
+    path = _engagement_file(tmp_path, "max_rps: 4\n")
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "--name", "acme-run", "--config", path, "--max-rps", "1", "--yes", "--plain"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["cfg"].max_rps == 1.0
+
+
+def test_resume_warns_when_it_would_run_unthrottled(captured, monkeypatch):
+    """An unpaced resume against a live target is the failure this warning exists to prevent:
+    silence would look exactly like a throttled run."""
+    _prior_run(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", "--name", "acme-run", "--yes", "--plain"])
+
+    assert result.exit_code == 0, result.output
+    assert "--max-rps" in result.output
+    assert captured["cfg"].max_rps is None
